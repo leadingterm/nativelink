@@ -3624,6 +3624,8 @@ exit 0
             memory_property_name: "memory_kb".to_string(),
             memory_headroom_percent: 20,
             disk_headroom_percent: 20,
+            disk_pressure_free_percent: 5,
+            disk_pressure_kill_after_s: 5,
             memory_pressure_kill_percent: 0,
             memory_pressure_kill_after_s: 30,
         };
@@ -3651,6 +3653,45 @@ exit 0
         assert_eq!(memory.headroom_percent, 20);
         assert!(memory_only.disk_property_name.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn disk_pressure_config_and_ceiling_modes() {
+        use nativelink_worker::running_actions_manager::disk_ceiling_kb;
+        let config = |disk| ResourceEnforcementConfig {
+            memory: MemoryEnforcement::None,
+            disk,
+            disk_property_name: "disk_kb".into(),
+            memory_property_name: "memory_kb".into(),
+            memory_headroom_percent: 20,
+            disk_headroom_percent: 20,
+            memory_pressure_kill_percent: 0,
+            memory_pressure_kill_after_s: 30,
+            disk_pressure_free_percent: 5,
+            disk_pressure_kill_after_s: 5,
+        };
+        let pressure =
+            ResourceEnforcement::from_config(&config(DiskEnforcement::Pressure)).unwrap();
+        assert_eq!(disk_ceiling_kb(pressure.disk_soft, 100, 20), None);
+        assert!(pressure.disk_pressure_kill.is_some());
+        let soft = ResourceEnforcement::from_config(&config(DiskEnforcement::Soft)).unwrap();
+        assert_eq!(disk_ceiling_kb(soft.disk_soft, 100, 20), Some(120));
+        let mut disabled = config(DiskEnforcement::Pressure);
+        disabled.disk_pressure_free_percent = 0;
+        assert!(
+            ResourceEnforcement::from_config(&disabled)
+                .unwrap()
+                .disk_pressure_kill
+                .is_none()
+        );
+        disabled.disk_pressure_free_percent = 101;
+        disabled.disk_pressure_kill_after_s = 0;
+        let policy = ResourceEnforcement::from_config(&disabled)
+            .unwrap()
+            .disk_pressure_kill
+            .unwrap();
+        assert_eq!(policy.free_percent, 100);
+        assert_eq!(policy.after, Duration::from_secs(1));
     }
 
     /// The sampler reads `Pss` out of `smaps_rollup`, not a field that
@@ -3779,6 +3820,7 @@ exit 0
                     disk_soft: false,
                     disk_headroom_percent: 20,
                     pressure_kill: None,
+                    disk_pressure_kill: None,
                 }),
                 ..Default::default()
             },
@@ -3874,6 +3916,7 @@ exit 0
                 disk_soft: false,
                 disk_headroom_percent: 20,
                 pressure_kill: None,
+                disk_pressure_kill: None,
             }),
             None,
         ] {
@@ -3928,6 +3971,7 @@ exit 0
                         disk_soft: false,
                         disk_headroom_percent: 20,
                         pressure_kill: None,
+                        disk_pressure_kill: None,
                     }),
                     ..Default::default()
                 },
@@ -5829,6 +5873,7 @@ exit 0
                         disk_soft: true,
                         disk_headroom_percent: 20,
                         pressure_kill: None,
+                        disk_pressure_kill: None,
                     }),
                     ..Default::default()
                 },
@@ -7023,6 +7068,7 @@ exit 0
                         disk_soft: false,
                         disk_headroom_percent: 20,
                         pressure_kill: None,
+                        disk_pressure_kill: None,
                     }),
                     ..Default::default()
                 },
@@ -10896,6 +10942,32 @@ done
         }
     }
 
+    #[test]
+    fn disk_pressure_uses_available_blocks_and_a_continuous_window() {
+        use nativelink_worker::running_actions_manager::{
+            PressureWindow, disk_free_percent, disk_under_pressure,
+        };
+        let start = tokio::time::Instant::now();
+        let mut window = PressureWindow::new(1, Duration::from_secs(5));
+        let mut observe = |free, seconds| {
+            window.observe(
+                if disk_under_pressure(free, 1000, 5) {
+                    1.0
+                } else {
+                    0.0
+                },
+                start + Duration::from_secs(seconds),
+            )
+        };
+        assert_eq!(disk_free_percent(50, 1000), Some(5));
+        assert_eq!(disk_free_percent(0, 0), None);
+        assert!(!disk_under_pressure(0, 0, 5));
+        assert!(!observe(50, 0));
+        assert!(!observe(51, 4));
+        assert!(!observe(50, 5));
+        assert!(observe(0, 10));
+    }
+
     /// The kill lands on the action furthest over its reservation, or the
     /// largest when none is over, never on one without a sample, one
     /// already asked to die, or one that reserves the whole worker;
@@ -11024,7 +11096,7 @@ done
                             property_name: "memory_kb".to_string(),
                             headroom_percent: 20,
                         }),
-                        disk_property_name: None,
+                        disk_property_name: Some("disk_kb".into()),
                         disk_soft: false,
                         disk_headroom_percent: 20,
                         // Armed, but a threshold the host never reaches: the
@@ -11034,6 +11106,12 @@ done
                             after: Duration::from_hours(1),
                             largest_reservation_kb: None,
                         }),
+                        disk_pressure_kill: Some(
+                            nativelink_worker::running_actions_manager::DiskPressureKill {
+                                free_percent: 1,
+                                after: Duration::from_hours(1),
+                            },
+                        ),
                     }),
                     ..Default::default()
                 },
@@ -11162,6 +11240,35 @@ done
             "{usage:?}"
         );
         assert!(usage.enforced, "the worker ended it: {usage:?}");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[nativelink_test]
+    async fn action_killed_under_disk_pressure_is_a_disk_kill()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let action = pressure_armed_action(vec!["sleep".into(), "30".into()]).await?;
+        let started = std::time::Instant::now();
+        let run = tokio::spawn(run_action(action.clone()));
+        while action.last_memory_kb() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "sampler did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        action.request_disk_pressure_kill(3);
+        let result = run.await??;
+        let error = result
+            .error
+            .expect("disk pressure kill must report an error");
+        assert_eq!(error.code, Code::FailedPrecondition);
+        assert!(error.to_string().contains("worker disk pressure"));
+        assert!(error.to_string().contains("3%"));
+        assert!(started.elapsed() < Duration::from_secs(20));
+        let usage = action.resource_usage().expect("usage is reported");
+        assert_eq!(usage.outcome, ResourceOutcome::KilledDisk as i32);
+        assert!(usage.enforced);
         Ok(())
     }
 

@@ -1051,12 +1051,12 @@ pub struct ResourceEnforcementConfig {
     #[serde(default)]
     pub memory: MemoryEnforcement,
 
-    /// Whether to refuse an action whose disk reservation exceeds the free
-    /// space under the work directory, less what the actions already
-    /// admitted reserved, before its inputs are fetched. The
-    /// refusal is `ResourceExhausted`, which the scheduler requeues without
-    /// counting an attempt and holds off this worker until its next
-    /// keepalive.
+    /// Disk admission and enforcement mode. All modes except `none` refuse
+    /// an action whose disk reservation exceeds free space under the work
+    /// directory, less what already admitted actions reserved, before input
+    /// fetching. Refusals use `ResourceExhausted` and requeue without counting
+    /// an attempt. `soft` adds a per-action ceiling; `pressure` instead kills
+    /// a sampled action only under sustained low filesystem free space.
     /// Default: none
     #[serde(default)]
     pub disk: DiskEnforcement,
@@ -1097,6 +1097,29 @@ pub struct ResourceEnforcementConfig {
     )]
     pub disk_headroom_percent: u64,
 
+    /// Free space threshold for `disk: pressure`, as a whole percentage of
+    /// blocks on the filesystem holding the work directory. Uses blocks
+    /// available to an unprivileged process, not total free blocks. Linux only.
+    /// The action furthest over its disk reservation is killed, or the largest
+    /// sampled disk user if none is over. Pressure may come from other users
+    /// of the filesystem; this is not proof that the chosen action caused it.
+    /// Values above 100 are clamped; 0 disables disk pressure kills. Default: 5.
+    #[serde(
+        default = "default_disk_pressure_free_percent",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub disk_pressure_free_percent: u32,
+
+    /// Seconds free space must remain at or below the threshold with
+    /// `disk: pressure`. A recovery or failed sample resets the window;
+    /// another kill waits a full window again. 0 means 1.
+    /// Default: 5 seconds.
+    #[serde(
+        default = "default_disk_pressure_kill_after_s",
+        deserialize_with = "convert_duration_with_shellexpand"
+    )]
+    pub disk_pressure_kill_after_s: u64,
+
     /// Kill one running action once the worker's cgroup has spent at least
     /// this share of the last ten seconds, as a whole number from 0 to 100,
     /// with every task stalled on memory (`full avg10` in cgroup v2
@@ -1124,6 +1147,14 @@ pub struct ResourceEnforcementConfig {
         deserialize_with = "convert_duration_with_shellexpand"
     )]
     pub memory_pressure_kill_after_s: u64,
+}
+
+const fn default_disk_pressure_free_percent() -> u32 {
+    5
+}
+
+const fn default_disk_pressure_kill_after_s() -> u64 {
+    5
 }
 
 const fn default_memory_pressure_kill_after_s() -> u64 {
@@ -1158,6 +1189,10 @@ pub enum DiskEnforcement {
     /// files the action itself wrote (inputs are hard links into the CAS
     /// and are not counted).
     Soft,
+    /// `guard`, plus kill a sampled action only under sustained worker disk
+    /// pressure on Linux. Reservations are not per-action ceilings in this mode.
+    /// Other platforms retain the guard but do not perform pressure kills.
+    Pressure,
 }
 
 const fn default_memory_headroom_percent() -> u64 {

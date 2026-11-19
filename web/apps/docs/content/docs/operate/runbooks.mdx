@@ -210,6 +210,31 @@ applies to worker fast tiers rather than to a CAS server's store.
 Provision accordingly: if you want a 50 GB worker cache, give it a 100 GB
 volume.
 
+### Protect action work space under disk pressure [#protect-action-work-space-under-disk-pressure]
+
+On Linux, `resource_enforcement.disk: pressure` keeps the disk admission
+guard without treating an action's reservation as a per-action ceiling.
+Use it when reservations are estimates and actions may safely grow while
+the filesystem has space. `soft` still enforces the reservation plus
+headroom; `guard` still only checks admission.
+
+The pressure mode measures available blocks on the filesystem holding the
+worker's action directory. If free space stays at or below
+`disk_pressure_free_percent` for `disk_pressure_kill_after_s`, it kills
+the sampled action furthest over its reservation, or the largest sampled
+disk user if none is over. Recovery or a failed filesystem sample resets
+the window, and each kill starts another full window. Unsampled actions
+and actions already asked to stop are not selected.
+
+The result reports `KILLED_DISK` and names disk pressure. This is a
+worker safeguard, not filesystem-store eviction: pressure caused by other
+filesystem users can still kill an action, and this cannot guarantee that
+a full filesystem recovers. Keep the store limits above. Other platforms
+retain the admission guard without pressure kills.
+
+<SourceLink file="nativelink-config/src/cas_server.rs" symbol="DiskEnforcement" />
+<SourceLink file="nativelink-worker/src/running_actions_manager.rs" symbol="ResourceEnforcement" />
+
 ### Two layout footguns [#two-layout-footguns]
 
 `temp_path` must be on the **same block device** as `content_path`. If it is

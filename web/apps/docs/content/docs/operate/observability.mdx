@@ -538,6 +538,23 @@ counts actions using ordinary input setup despite configured mounts;
 mounts. These counters describe preparation, not successful command execution.
 These names use OTLP notation; see [Prometheus naming conventions](/reference/metrics#how-an-instrument-becomes-a-prometheus-series) for the conversion.
 
+## Worker disk pressure kills [#worker-disk-pressure-kills]
+
+For workers using `resource_enforcement.disk: pressure`, distinguish
+admission refusals from kills of running actions. The worker's component
+metrics declare separate `disk_guard_refusals`, `disk_reservation_kills`
+and `disk_pressure_kills` counters. The last counts sustained worker disk
+pressure kills, not every action that exceeds its estimated reservation.
+These are component counters, separate from the OTLP instrument inventory
+generated from `nativelink-util/src/metrics.rs`.
+
+The action error includes the observed free-space percentage and the
+sustained-pressure window. A pressure kill reports `KILLED_DISK`; it does
+not prove that the selected action caused the filesystem pressure.
+See [the disk-pressure runbook](/operate/runbooks#protect-action-work-space-under-disk-pressure).
+
+<SourceLink file="nativelink-worker/src/running_actions_manager.rs" symbol="Metrics" />
+
 ## What's next [#whats-next]
 
 <NextStep href="/reference/metrics" title="The metrics reference">
