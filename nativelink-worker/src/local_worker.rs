@@ -34,8 +34,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     ActionResourceUsage, ExecuteAccepted, ExecuteComplete, ExecuteDeclined, ExecuteResult,
-    GoingAwayRequest, KeepAliveRequest, OperationMemory, RunningOperations, StartExecute,
-    UpdateForWorker, WorkerLoad, execute_declined, execute_result,
+    GoingAwayRequest, KeepAliveRequest, OperationMemory, ResourceOutcome, RunningOperations,
+    StartExecute, UpdateForWorker, WorkerLoad, execute_declined, execute_result,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
@@ -177,6 +177,18 @@ const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 struct FinishedActionResult {
     action_result: ActionResult,
     resource_usage: Option<ActionResourceUsage>,
+}
+
+fn is_killed(usage: Option<&ActionResourceUsage>) -> bool {
+    usage.is_some_and(|usage| {
+        matches!(
+            ResourceOutcome::try_from(usage.outcome),
+            Ok(ResourceOutcome::KilledMemory
+                | ResourceOutcome::KilledDisk
+                | ResourceOutcome::KilledTimeout
+                | ResourceOutcome::KilledExternal)
+        )
+    })
 }
 
 struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> {
@@ -730,10 +742,34 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     resource_usage,
                                                 })
                                             })
-                                            // Note: We need ensure we run cleanup even if one of the other steps fail.
+                                            // Cleanup must run even if an earlier step failed.
                                             .then(|result| async move {
+                                                let result = match result {
+                                                    Err(err) => {
+                                                        let resource_usage = action.resource_usage();
+                                                        if is_killed(resource_usage.as_ref()) {
+                                                            match action.clone().get_finished_result().await {
+                                                                Ok(action_result) => {
+                                                                    warn!(?err, "Action transfer failed after a classified kill");
+                                                                    Ok(FinishedActionResult { action_result, resource_usage })
+                                                                }
+                                                                Err(result_err) => {
+                                                                    warn!(?result_err, "Could not recover killed action result");
+                                                                    Err(err)
+                                                                }
+                                                            }
+                                                        } else {
+                                                            Err(err)
+                                                        }
+                                                    }
+                                                    ok => ok,
+                                                };
                                                 if let Err(e) = action.cleanup().await {
-                                                    return Result::<FinishedActionResult, Error>::Err(e).merge(result);
+                                                    if result.as_ref().is_ok_and(|finished| is_killed(finished.resource_usage.as_ref())) {
+                                                        warn!(?e, "Action cleanup failed after a classified kill");
+                                                    } else {
+                                                        return Result::<FinishedActionResult, Error>::Err(e).merge(result);
+                                                    }
                                                 }
                                                 result
                                             })

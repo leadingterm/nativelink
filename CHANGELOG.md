@@ -3,6 +3,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Bug fixes
+
+- Preserve a worker-classified kill result and resource usage when output
+  upload or action cleanup fails. Upload and cleanup failures for actions
+  that were not killed still report errors.
+
 ## [1.8.6](https://github.com/TraceMachina/nativelink/compare/v1.8.5..v1.8.6) - 2026-11-16
 
 ### Upgrade and rollback
