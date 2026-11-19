@@ -66,6 +66,7 @@ fn capacity_serde_defaults_and_rejects_unknown_fields() {
 
 fn capacity(memory: u64, disk: u64, cpu: u64) -> ResourceCapacity {
     ResourceCapacity {
+        action_ceilings: BTreeMap::new(),
         minimum: BTreeMap::from([
             ("memory_kb".to_string(), memory),
             ("disk_kb".to_string(), disk),
@@ -468,6 +469,70 @@ async fn eligible_capacity_clamps_and_reserves_whole_cpu_then_kill_is_terminal()
         "whole-worker",
     )
     .await;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn policy_ceiling_retries_without_whole_cpu_then_stops() -> Result<(), Error> {
+    let mut limited = capacity(200_000, 100_000, 16);
+    limited
+        .action_ceilings
+        .insert("memory_kb".to_string(), 100_000);
+    limited.action_ceilings.insert("cpu_count".to_string(), 4);
+    let (scheduler, worker) = make_scheduler_with_capacities(vec![limited]);
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 50_000, 1_000).await?;
+    let first = next_dispatch(&mut rx).await;
+    kill(
+        worker.as_ref(),
+        &first.operation_id,
+        ResourceOutcome::KilledMemory,
+        50_000,
+        80_000,
+    )
+    .await?;
+    let second = next_dispatch(&mut rx).await;
+    assert_eq!(property(&second, "memory_kb"), 100_000);
+    assert_eq!(property(&second, "cpu_count"), 1);
+    kill(
+        worker.as_ref(),
+        &second.operation_id,
+        ResourceOutcome::KilledMemory,
+        100_000,
+        99_999,
+    )
+    .await?;
+    assert_terminal(
+        &mut listener,
+        &mut rx,
+        &second.operation_id,
+        99_999,
+        100_000,
+        "per-action",
+    )
+    .await;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn physical_resource_cap_reserves_only_allowed_cpu() -> Result<(), Error> {
+    let mut limited = capacity(100_000, 100_000, 16);
+    limited.action_ceilings.insert("cpu_count".to_string(), 4);
+    let (scheduler, worker) = make_scheduler_with_capacities(vec![limited]);
+    let mut rx = add_worker(&scheduler).await?;
+    let _listener = add_action(&scheduler, 50_000, 1_000).await?;
+    let first = next_dispatch(&mut rx).await;
+    kill(
+        worker.as_ref(),
+        &first.operation_id,
+        ResourceOutcome::KilledMemory,
+        50_000,
+        80_000,
+    )
+    .await?;
+    let second = next_dispatch(&mut rx).await;
+    assert_eq!(property(&second, "memory_kb"), 100_000);
+    assert_eq!(property(&second, "cpu_count"), 4);
     Ok(())
 }
 

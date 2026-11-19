@@ -657,6 +657,43 @@ async fn a_peer_schedulers_capable_worker_prevents_the_failure() -> Result<(), E
 }
 
 #[nativelink_test]
+async fn reconnect_and_peer_census_use_per_action_ceiling() -> Result<(), Error> {
+    let scheduler = make_scheduler(&make_spec(TIMEOUT_S));
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut worker = Worker::new(
+        WorkerId("limited".to_string()),
+        cpu_worker_properties(),
+        tx,
+        NOW_TIME,
+        0,
+    );
+    worker.set_action_ceilings(&HashMap::from([("cpu_count".to_string(), 4000)]));
+    scheduler.add_worker(worker).await?;
+    rx.recv().await.expect("connection result");
+    let peer_shapes = scheduler.fleet_shapes_for_test().await;
+    scheduler.set_peer_fleet_for_test(peer_shapes).await;
+    let action = add_action(&scheduler, 1, cpu_action_properties()).await?;
+    scheduler.do_try_match_quietly_for_test().await?;
+    assert_eq!(stage_of(action.as_ref()).await?, ActionStage::Queued);
+    MockClock::advance(Duration::from_secs(TIMEOUT_S));
+    scheduler.do_try_match_quietly_for_test().await?;
+    assert_failed_as_unsatisfiable(&stage_of(action.as_ref()).await?);
+    let action = add_action(&scheduler, 2, cpu_action_properties()).await?;
+    scheduler.do_try_match_quietly_for_test().await?;
+
+    // Reconnection with the same physical resources but a higher action limit
+    // invalidates the cached static verdict and makes the action runnable.
+    scheduler
+        .remove_worker(&WorkerId("limited".to_string()))
+        .await?;
+    let mut replacement = add_worker(&scheduler, "limited", cpu_worker_properties(), 0).await?;
+    replacement.recv().await.expect("connection result");
+    scheduler.do_try_match_quietly_for_test().await?;
+    assert_eq!(stage_of(action.as_ref()).await?, ActionStage::Executing);
+    Ok(())
+}
+
+#[nativelink_test]
 async fn unknown_peers_never_fail_an_action() -> Result<(), Error> {
     let scheduler = make_scheduler(&make_spec(TIMEOUT_S));
     let _worker_rx = add_worker(&scheduler, "cpu", cpu_worker_properties(), 0).await?;

@@ -116,6 +116,9 @@ pub struct Worker {
     /// reduced while actions run; this is what the worker offers when idle.
     pub total_platform_properties: PlatformProperties,
 
+    /// Effective per-action properties, distinct from the physical ledger.
+    pub action_platform_properties: PlatformProperties,
+
     /// Channel to send commands from scheduler to worker.
     pub tx: Sender<UpdateForWorker>,
 
@@ -234,6 +237,7 @@ impl Worker {
         Self {
             id,
             total_platform_properties: platform_properties.clone(),
+            action_platform_properties: platform_properties.clone(),
             platform_properties,
             tx,
             running_action_infos: HashMap::new(),
@@ -257,6 +261,17 @@ impl Worker {
                 kill_operation: CounterWithTime::default(),
                 keep_alives_dropped: CounterWithTime::default(),
             }),
+        }
+    }
+
+    /// Apply immutable per-action limits without changing physical capacity.
+    pub fn set_action_ceilings(&mut self, ceilings: &HashMap<String, u64>) {
+        for (name, ceiling) in ceilings {
+            if let Some(PlatformPropertyValue::Minimum(value)) =
+                self.action_platform_properties.properties.get_mut(name)
+            {
+                *value = (*value).min(*ceiling);
+            }
         }
     }
 

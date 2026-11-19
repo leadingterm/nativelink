@@ -219,6 +219,7 @@ impl WorkerApiServer {
                 (self.now_fn)()?.as_secs(),
                 connect_worker_request.max_inflight_tasks,
             );
+            worker.set_action_ceilings(&connect_worker_request.action_ceilings);
             worker.admits_when_idle = connect_worker_request.admits_when_idle;
             self.scheduler
                 .add_worker(worker)

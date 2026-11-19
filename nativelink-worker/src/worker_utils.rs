@@ -111,5 +111,6 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
         properties: try_join_all(futures).await?.into_iter().flatten().collect(),
         max_inflight_tasks,
         admits_when_idle,
+        action_ceilings: HashMap::new(),
     })
 }

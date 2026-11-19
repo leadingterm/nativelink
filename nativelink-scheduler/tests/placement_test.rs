@@ -243,3 +243,58 @@ async fn best_fit_prefers_the_worker_with_the_actions_priority_value() -> Result
     );
     Ok(())
 }
+
+#[nativelink_test]
+async fn per_action_ceilings_preserve_physical_packing_and_exact_properties() -> Result<(), Error> {
+    let scheduler = make_scheduler_with_spec(&SimpleSpec {
+        supported_platform_properties: Some(HashMap::from([
+            ("cpu".to_string(), PropertyType::Minimum),
+            ("memory_kb".to_string(), PropertyType::Minimum),
+            ("network".to_string(), PropertyType::Exact),
+        ])),
+        ..SimpleSpec::default()
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut worker = Worker::new(
+        WorkerId("limited".to_string()),
+        PlatformProperties::new(HashMap::from([
+            ("cpu".to_string(), PlatformPropertyValue::Minimum(16)),
+            (
+                "memory_kb".to_string(),
+                PlatformPropertyValue::Minimum(64 * 1024 * 1024),
+            ),
+            (
+                "network".to_string(),
+                PlatformPropertyValue::Exact("requested".to_string()),
+            ),
+        ])),
+        tx,
+        NOW_TIME,
+        4,
+    );
+    worker.set_action_ceilings(&HashMap::from([
+        ("cpu".to_string(), 4),
+        ("memory_kb".to_string(), 16 * 1024 * 1024),
+    ]));
+    scheduler.add_worker(worker).await?;
+    rx.recv().await.expect("connection result");
+    let action = |cpu: u64, memory: u64, network: &str| {
+        HashMap::from([
+            ("cpu".to_string(), cpu.to_string()),
+            ("memory_kb".to_string(), memory.to_string()),
+            ("network".to_string(), network.to_string()),
+        ])
+    };
+    add_action_with_properties(&scheduler, 1, action(5, 1, "requested")).await?;
+    add_action_with_properties(&scheduler, 2, action(1, 1, "denied")).await?;
+    add_action_with_properties(&scheduler, 3, action(1, 16 * 1024 * 1024 + 1, "requested")).await?;
+    scheduler.do_try_match_for_test().await?;
+    assert_eq!(dispatched(&mut rx), 0);
+    for id in 4..8 {
+        add_action_with_properties(&scheduler, id, action(4, 16 * 1024 * 1024, "requested"))
+            .await?;
+        scheduler.do_try_match_for_test().await?;
+    }
+    assert_eq!(dispatched(&mut rx), 4);
+    Ok(())
+}
