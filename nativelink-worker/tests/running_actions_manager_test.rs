@@ -3626,6 +3626,7 @@ exit 0
             memory_pressure_stall_percent: 7,
             memory_pressure_poll_interval_ms: 43,
             memory_pressure_kill_after_ms: 270,
+            memory_pressure_reserve_bytes: 1_073_741_824,
             memory_pool_path: None,
             disk_headroom_percent: 24,
             disk_soft_samples: 3,
@@ -3685,6 +3686,7 @@ exit 0
             memory_pressure_stall_percent: 7,
             memory_pressure_poll_interval_ms: 43,
             memory_pressure_kill_after_ms: 270,
+            memory_pressure_reserve_bytes: 1_073_741_824,
             memory_pool_path: None,
             disk_headroom_percent: 24,
             disk_soft_samples: 3,
@@ -11105,6 +11107,7 @@ done
                             stall_percent: 97,
                             poll_interval: Duration::from_millis(43),
                             after: Duration::from_hours(1),
+                            reserve_bytes: 1_048_576,
                         }),
                         disk_pressure_kill: Some(
                             nativelink_worker::running_actions_manager::DiskPressureKill {

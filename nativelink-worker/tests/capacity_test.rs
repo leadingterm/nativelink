@@ -58,6 +58,7 @@ fn enforcement(memory: MemoryEnforcement, headroom: u64) -> ResourceEnforcementC
         memory_pressure_stall_percent: 7,
         memory_pressure_poll_interval_ms: 43,
         memory_pressure_kill_after_ms: 270,
+        memory_pressure_reserve_bytes: 1024 * 1024 * 1024,
         memory_pool_path: None,
         disk_headroom_percent: 24,
         disk_soft_samples: 3,

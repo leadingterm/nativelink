@@ -228,13 +228,19 @@ the action pool's cgroup v2 `memory.pressure` at
 `memory_pressure_poll_interval_ms` and compares the `some total` stall-time
 delta (or `full total` if `some` is unavailable) to real elapsed time. An
 interval counts as pressure when `delta_stall * 100 >=
-memory_pressure_stall_percent * delta_elapsed`. After pressure persists for
-`memory_pressure_kill_after_ms`, the worker kills the running action furthest
-over its reservation, or the largest current user if none is over. Reserving
-the whole worker does not exempt an action. The first read establishes a
-baseline; a read error, counter decrease or non-monotonic clock resets it and
-the sustained window. Any memory or disk pressure kill resets both windows.
-Pressure can originate outside actions as well.
+memory_pressure_stall_percent * delta_elapsed` and the pool's available bytes
+are below `memory_pressure_reserve_bytes` (default 1073741824, nonzero). Available
+bytes are the pool-local minimum finite `memory.high` or `memory.max`, less
+`memory.current`, saturating at zero; at least one limit must be finite. After
+both conditions persist for `memory_pressure_kill_after_ms`, the worker kills
+the running action furthest over its reservation, or the largest current user
+if none is over. Reserving the whole worker does not exempt an action. The first
+PSI read establishes a baseline; missing or malformed required samples, read
+errors, counter decreases and non-monotonic clocks reset the baseline and
+sustained window. After any memory or disk pressure kill, neither monitor
+accumulates a window until the killed action has completed cleanup and left
+the running-action manager. Each monitor then re-reads available memory or free
+disk space and requires a fresh continuous pressure window before another kill.
 
 With validated Gang action-cgroup metadata, the worker reads `memory.current`
 and `memory.peak` and kills the action by writing `1` to its `cgroup.kill`.
@@ -243,9 +249,9 @@ and a hard wrapper-PID fallback. Without valid metadata, usage is sampled as
 process-tree proportional set size (PSS) and resource kills use process groups.
 The final kernel peak report takes precedence over a pre-kill or last kernel
 peak; PSS is used only when no kernel peak was available. Without
-`memory_pool_path`, pressure reads the nearest limited cgroup ancestor and
-usage falls back to PSS. Persistent worker processes outlive individual actions
-and are not covered by per-action enforcement.
+`memory_pool_path`, usage falls back to PSS and userspace memory pressure kills
+are disabled; pressure is never attributed to an ancestor. Persistent worker
+processes outlive individual actions and are not covered by per-action enforcement.
 
 Memory `soft` instead kills after `memory_soft_samples` consecutive samples
 above the reservation plus `memory_headroom_percent`, or immediately when a
@@ -264,6 +270,10 @@ sampling interval, headroom and number of consecutive breaches are configurable.
 configured threshold, poll interval and kill-after duration. The disk peak at a
 pressure kill is the last completed action-directory walk. Resource-kill
 outcomes can be requeued with larger reservations by `resource_escalation`.
+The scratch filesystem must be dedicated to the worker, with its fast CAS
+bounded by its budget. Sharing it with unrelated tenants voids the
+no-ambient-kill guarantee because free-space shortage cannot then be
+attributed to the worker.
 Each configured escalation capacity has a `minimum` map of numeric properties
 and an `exact` map of strings. A capacity is eligible only when its exact
 properties include and match those requested by the action, and its other
@@ -277,6 +287,8 @@ pressure kills; a soft disk ceiling is a hard failure, not a requeue.
   "memory_pressure_stall_percent": 10,
   "memory_pressure_poll_interval_ms": 250,
   "memory_pressure_kill_after_ms": 5000,
+  "memory_pressure_reserve_bytes": 1073741824,
+  "memory_pool_path": "/sys/fs/cgroup/actions",
   "disk": "pressure",
   "disk_property_name": "disk_kb",
   "disk_pressure_free_percent": 5,
