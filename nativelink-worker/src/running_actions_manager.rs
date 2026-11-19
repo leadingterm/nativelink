@@ -2877,7 +2877,6 @@ struct RunningActionImplExecutionResult {
     stdout: CapturedOutput,
     stderr: CapturedOutput,
     exit_code: i32,
-    resource_usage: Option<ActionResourceUsage>,
 }
 
 #[derive(Debug)]
@@ -3479,10 +3478,15 @@ impl RunningActionImpl {
             stdout: Bytes::new().into(),
             stderr: Bytes::new().into(),
             exit_code: EXIT_CODE_FOR_SIGNAL,
-            resource_usage: None,
         });
         state.execution_metadata.execution_completed_timestamp =
             (self.running_actions_manager.callbacks.now_fn)();
+        state.action_result = Some(ActionResult {
+            exit_code: EXIT_CODE_FOR_SIGNAL,
+            execution_metadata: state.execution_metadata.clone(),
+            error: state.error.clone(),
+            ..Default::default()
+        });
     }
 
     async fn inner_execute(self: Arc<Self>) -> Result<Arc<Self>, Error> {
@@ -3720,10 +3724,16 @@ impl RunningActionImpl {
                                     stdout: Bytes::new().into(),
                                     stderr: Bytes::from(response.output).into(),
                                     exit_code: response.exit_code,
-                                    resource_usage,
                                 });
                                 state.execution_metadata.execution_completed_timestamp =
                                     (self.running_actions_manager.callbacks.now_fn)();
+                                state.resource_usage = resource_usage;
+                                state.action_result = Some(ActionResult {
+                                    exit_code: response.exit_code,
+                                    execution_metadata: state.execution_metadata.clone(),
+                                    error: state.error.clone(),
+                                    ..Default::default()
+                                });
                             }
                             return Ok(self);
                         }
@@ -4333,9 +4343,15 @@ impl RunningActionImpl {
                             stdout,
                             stderr,
                             exit_code,
-                            resource_usage,
                         });
                         state.execution_metadata.execution_completed_timestamp = (self.running_actions_manager.callbacks.now_fn)();
+                        state.resource_usage = resource_usage;
+                        state.action_result = Some(ActionResult {
+                            exit_code,
+                            execution_metadata: state.execution_metadata.clone(),
+                            error: state.error.clone(),
+                            ..Default::default()
+                        });
                     }
                     return Ok(self);
                 },
@@ -4706,7 +4722,6 @@ impl RunningActionImpl {
             success = upload_result.is_ok(),
             "upload_results: all uploads completed",
         );
-        let resource_usage = execution_result.resource_usage.clone();
         let (stdout_digest, stderr_digest) = match upload_result {
             Ok((stdout_digest, stderr_digest, ())) => (stdout_digest, stderr_digest),
             Err(e) => return Err(e).err_tip(|| "Error while uploading results"),
@@ -4722,8 +4737,6 @@ impl RunningActionImpl {
         let num_output_folders = output_folders.len();
         {
             let mut state = self.state.lock();
-            execution_metadata.worker_completed_timestamp =
-                (self.running_actions_manager.callbacks.now_fn)();
             state.action_result = Some(ActionResult {
                 output_files,
                 output_folders,
@@ -4737,7 +4750,6 @@ impl RunningActionImpl {
                 error: state.error.clone(),
                 message: String::new(), // Will be filled in on cache_action_result if needed.
             });
-            state.resource_usage = resource_usage;
         }
         debug!(
             operation_id = ?self.operation_id,
@@ -4751,10 +4763,13 @@ impl RunningActionImpl {
 
     async fn inner_get_finished_result(self: Arc<Self>) -> Result<ActionResult, Error> {
         let mut state = self.state.lock();
-        state
+        let mut result = state
             .action_result
             .take()
-            .err_tip(|| "Expected action_result to exist in get_finished_result")
+            .err_tip(|| "Expected action_result to exist in get_finished_result")?;
+        result.execution_metadata.worker_completed_timestamp =
+            (self.running_actions_manager.callbacks.now_fn)();
+        Ok(result)
     }
 }
 

@@ -41,8 +41,9 @@ use nativelink_proto::build::bazel::remote::execution::v2::Platform;
 use nativelink_proto::build::bazel::remote::execution::v2::platform::Property;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ConnectWorkerRequest, ConnectionResult, ExecuteResult, KillOperationRequest, StartExecute,
-    UpdateForWorker, execute_declined, execute_result,
+    ActionResourceUsage, ConnectWorkerRequest, ConnectionResult, ExecuteResult,
+    KillOperationRequest, Reservation, ResourceOutcome, StartExecute, UpdateForWorker,
+    execute_declined, execute_result,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::FilesystemStore;
@@ -609,6 +610,150 @@ async fn start_action_lifecycle_test(single_use: bool) -> Result<(), Error> {
         assert_eq!(going_away.load(Ordering::Relaxed), 1);
     }
 
+    Ok(())
+}
+
+#[nativelink_test]
+async fn killed_action_reports_its_outcome_when_upload_fails() -> Result<(), Error> {
+    upload_failure_response_test(true, false).await
+}
+
+#[nativelink_test]
+async fn completed_action_reports_internal_error_when_upload_fails() -> Result<(), Error> {
+    upload_failure_response_test(false, false).await
+}
+
+#[nativelink_test]
+async fn killed_action_reports_its_outcome_when_upload_and_cleanup_fail() -> Result<(), Error> {
+    upload_failure_response_test(true, true).await
+}
+
+async fn upload_failure_response_test(killed: bool, cleanup_fails: bool) -> Result<(), Error> {
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+    test_context
+        .client
+        .expect_connect_worker(Ok(streaming_response))
+        .await;
+
+    let worker_id = "foobar".to_string();
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::ConnectionResult(ConnectionResult {
+                    worker_id: worker_id.clone(),
+                    dispatch_ack: false,
+                    memory_property: String::new(),
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            execution_scope: None,
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::StartAction(StartExecute {
+                    execute_request: Some((&action_info).into()),
+                    platform: Some(Platform::default()),
+                    worker_id: worker_id.clone(),
+                    ..Default::default()
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    let running_action = Arc::new(MockRunningAction::new());
+    let usage = ActionResourceUsage {
+        outcome: if killed {
+            ResourceOutcome::KilledMemory as i32
+        } else {
+            ResourceOutcome::Completed as i32
+        },
+        reserved: Some(Reservation {
+            memory_kb: 2048,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    running_action.set_resource_usage(Some(usage));
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+    running_action.expect_prepare_action(Ok(())).await?;
+    running_action.expect_execute(Ok(())).await?;
+    running_action
+        .upload_results(Err(make_err!(Code::Internal, "upload failed")))
+        .await?;
+
+    let action_result = ActionResult {
+        exit_code: 9,
+        error: Some(make_err!(
+            Code::FailedPrecondition,
+            "memory reservation exceeded"
+        )),
+        ..Default::default()
+    };
+    if killed {
+        running_action
+            .get_finished_result(Ok(action_result.clone()))
+            .await?;
+    }
+    let cleanup = if cleanup_fails {
+        Err(make_err!(Code::Internal, "cleanup failed"))
+    } else {
+        Ok(())
+    };
+    running_action.cleanup(cleanup).await?;
+
+    if killed {
+        let (stored_digest, stored_result, _) = test_context
+            .actions_manager
+            .expect_cache_action_result()
+            .await;
+        assert_eq!(stored_digest, action_digest);
+        assert_eq!(stored_result, action_result);
+    }
+    let response = test_context.client.expect_execution_response(Ok(())).await;
+    if killed {
+        assert_eq!(
+            response.result,
+            Some(execute_result::Result::ExecuteResponse(
+                ActionStage::Completed(action_result).into()
+            ))
+        );
+        let usage = response.resource_usage.expect("killed action usage");
+        assert_eq!(usage.outcome, ResourceOutcome::KilledMemory as i32);
+        assert_eq!(usage.reserved.unwrap().memory_kb, 2048);
+        assert_eq!(usage.worker_id, worker_id);
+    } else {
+        let Some(execute_result::Result::InternalError(status)) = response.result else {
+            panic!("ordinary upload failure must return an internal error");
+        };
+        assert_eq!(status.code, Code::Internal as i32);
+        assert_eq!(response.resource_usage, None);
+    }
     Ok(())
 }
 

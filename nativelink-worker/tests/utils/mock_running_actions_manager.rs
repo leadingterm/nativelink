@@ -226,6 +226,7 @@ pub(crate) struct MockRunningAction {
 
     rx_resp: Mutex<mpsc::UnboundedReceiver<RunningActionReturns>>,
     tx_resp: mpsc::UnboundedSender<RunningActionReturns>,
+    resource_usage: std::sync::Mutex<Option<ActionResourceUsage>>,
 }
 
 impl Default for MockRunningAction {
@@ -243,7 +244,12 @@ impl MockRunningAction {
             tx_call,
             rx_resp: Mutex::new(rx_resp),
             tx_resp,
+            resource_usage: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn set_resource_usage(&self, usage: Option<ActionResourceUsage>) {
+        *self.resource_usage.lock().unwrap() = usage;
     }
 
     pub(crate) async fn simple_expect_get_finished_result(
@@ -453,7 +459,7 @@ impl RunningAction for MockRunningAction {
     }
 
     fn resource_usage(&self) -> Option<ActionResourceUsage> {
-        None
+        self.resource_usage.lock().unwrap().clone()
     }
 
     fn get_work_directory(&self) -> &String {

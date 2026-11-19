@@ -6890,6 +6890,20 @@ exit 0
     #[nativelink_test]
     async fn action_over_its_memory_reservation_is_killed_by_the_worker()
     -> Result<(), Box<dyn core::error::Error>> {
+        memory_kill_test(false).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[nativelink_test]
+    async fn memory_kill_result_survives_output_upload_failure()
+    -> Result<(), Box<dyn core::error::Error>> {
+        memory_kill_test(true).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn memory_kill_test(fail_upload: bool) -> Result<(), Box<dyn core::error::Error>> {
+        use std::os::unix::ffi::OsStringExt;
+
         const WORKER_ID: &str = "foo_worker_id";
         let (_, _, cas_store, _ac_store) = setup_stores().await?;
         let root_action_directory = make_temp_path("root_action_directory");
@@ -6941,6 +6955,11 @@ exit 0
                     .to_string(),
             ],
             working_directory: ".".to_string(),
+            output_paths: if fail_upload {
+                vec!["bad-link".to_string()]
+            } else {
+                Vec::new()
+            },
             environment_variables: vec![EnvironmentVariable {
                 name: "PATH".to_string(),
                 value: env::var("PATH").unwrap(),
@@ -6998,7 +7017,36 @@ exit 0
             .await?;
 
         let started = std::time::Instant::now();
-        let result = run_action(running_action_impl.clone()).await?;
+        let result = if fail_upload {
+            let action = running_action_impl.clone().prepare_action().await?;
+            // Relative symlinks are uploaded as symlinks; a non-UTF-8 target
+            // cannot be represented in the output proto.
+            tokio::fs::symlink(
+                OsString::from_vec(vec![0xff]),
+                Path::new(action.get_work_directory()).join("bad-link"),
+            )
+            .await?;
+            let action = action.execute().await?;
+            assert_eq!(
+                action
+                    .resource_usage()
+                    .expect("usage before upload")
+                    .outcome,
+                ResourceOutcome::KilledMemory as i32
+            );
+            let upload_error = action
+                .clone()
+                .upload_results()
+                .await
+                .expect_err("non-UTF-8 symlink target must fail upload");
+            assert_eq!(upload_error.code, Code::Internal);
+            let result = action.clone().get_finished_result().await?;
+            action.cleanup().await?;
+            assert_eq!(result.exit_code, 9);
+            result
+        } else {
+            run_action(running_action_impl.clone()).await?
+        };
         let err = result
             .error
             .expect("an action over its reservation must fail with an error");
