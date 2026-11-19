@@ -2585,6 +2585,114 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn upload_nested_directory_rebases_absolute_internal_symlinks()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (_, slow_store, cas_store, _) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        // Keep shell $PWD and the manager's work-directory prefix identical
+        // even when the system temporary directory is itself a symlink.
+        let root_action_directory = Path::new(&root_action_directory)
+            .canonicalize()?
+            .to_str()
+            .expect("temporary action root must be UTF-8")
+            .to_string();
+        let manager = enforcing_manager(
+            &root_action_directory,
+            &cas_store,
+            ExecutionConfiguration::default(),
+        )
+        .await?;
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "set -eu; \
+                 mkdir -p out/nested; \
+                 printf %s payload > out/payload; \
+                 ln -s \"$PWD/out/payload\" out/nested/absolute; \
+                 ln -s \"$PWD/out/missing\" out/nested/dangling; \
+                 ln -s /outside-action/payload out/nested/exterior; \
+                 ln -s \"$PWD/out/nested/../payload\" out/nested/lexical; \
+                 ln -s ../payload out/nested/relative"
+                    .to_string(),
+            ],
+            output_paths: vec!["out".to_string()],
+            working_directory: ".".to_string(),
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH")?,
+            }],
+            ..Default::default()
+        };
+        let action_digest = upload_action(&cas_store, &command).await?;
+        let action = manager
+            .create_and_add_action(
+                "foo_worker_id".to_string(),
+                dispatch_with_properties(action_digest, &[]),
+            )
+            .await?;
+        let result = run_action(action).await?;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.error, None);
+        assert!(result.output_files.is_empty());
+        assert!(result.output_file_symlinks.is_empty());
+        assert!(result.output_directory_symlinks.is_empty());
+        assert_eq!(result.output_folders.len(), 1);
+        let folder = &result.output_folders[0];
+        assert_eq!(folder.path, "out");
+        let tree =
+            get_and_decode_digest::<Tree>(slow_store.as_ref(), folder.tree_digest.into()).await?;
+
+        // Check the nested Directory and its digest in the Tree, not only the
+        // action status. Missing and exterior targets must not be dereferenced.
+        let nested = Directory {
+            symlinks: [
+                ("absolute", "../payload"),
+                ("dangling", "../missing"),
+                ("exterior", "/outside-action/payload"),
+                ("lexical", "../payload"),
+                ("relative", "../payload"),
+            ]
+            .into_iter()
+            .map(|(name, target)| SymlinkNode {
+                name: name.to_string(),
+                target: target.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let nested_digest =
+            compute_buf_digest(&nested.encode_to_vec(), &mut DigestHasherFunc::Sha256.hasher());
+        let payload_digest = compute_buf_digest(b"payload", &mut DigestHasherFunc::Sha256.hasher());
+        let root = tree.root.expect("Tree must contain its root Directory");
+        assert_eq!(
+            root,
+            Directory {
+                files: vec![FileNode {
+                    name: "payload".to_string(),
+                    digest: Some(payload_digest.into()),
+                    ..Default::default()
+                }],
+                directories: vec![DirectoryNode {
+                    name: "nested".to_string(),
+                    digest: Some(nested_digest.into()),
+                }],
+                ..Default::default()
+            }
+        );
+        assert!(tree.children.contains(&nested));
+        let payload = slow_store
+            .as_ref()
+            .get_part_unchunked(payload_digest.into(), 0, None)
+            .await?;
+        assert_eq!(payload.as_ref(), b"payload");
+        Ok(())
+    }
+
     // The fixture is built with the `ln -s` shell builtin (matching the
     // convention used by `upload_dir_and_symlink_test` above), so this test
     // only runs on Unix-like platforms. Windows itself does support symlinks

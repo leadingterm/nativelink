@@ -215,10 +215,12 @@ Four behaviours in the upload path:
 `output_files` and does not produce them completes successfully with those
 outputs absent. Bazel will notice; a hand-rolled client may not.
 
-**Absolute symlinks are dereferenced and uploaded as content.** Only
-*relative* output symlinks are preserved as symlinks. An action that emits an
-absolute symlink gets a copy of the target instead, which is usually what
-you want across machines, and occasionally very much not.
+**Declared absolute symlink outputs are dereferenced and uploaded as content.**
+Declared relative symlink outputs are preserved. Inside an output directory,
+absolute targets within the action's working directory are instead rewritten
+relative to the symlink's parent directory, without reading the target, so
+dangling internal links are preserved too. Relative targets and absolute targets
+outside the action's working directory are kept unchanged in the uploaded Tree.
 
 **`node_properties` is `None`.** Output file modes and mtimes are dropped. A
 file that was executable in the action's output tree is not necessarily

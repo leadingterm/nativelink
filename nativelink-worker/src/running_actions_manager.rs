@@ -2427,14 +2427,29 @@ async fn upload_symlink(
         .await
         .err_tip(|| format!("Could not get read_link path of {full_path:?}"))?;
 
-    // Detect if our symlink is inside our work directory, if it is find the
-    // relative path otherwise use the absolute path.
+    // Targets are relative to the symlink's containing directory. Strip the
+    // work directory first because an absolute filesystem path is not a RelativePath.
     let target = if full_target_path.starts_with(full_work_directory_path.as_ref()) {
-        let full_target_path = RelativePath::from_path(&full_target_path)
+        let target_path = full_target_path
+            .strip_prefix(full_work_directory_path.as_ref())
+            .map_err(|e| make_err!(Code::Internal, "{e}"))
+            .err_tip(|| {
+                format!("Could not strip work directory from target {full_target_path:?}")
+            })?;
+        let target_path = RelativePath::from_path(target_path)
             .map_err(|v| make_err!(Code::Internal, "Could not convert {} to RelativePath", v))?;
-        RelativePath::from_path(full_work_directory_path.as_ref())
+        let parent_path = full_path
+            .as_ref()
+            .parent()
+            .err_tip(|| format!("Expected parent to exist on {full_path:?}"))?
+            .strip_prefix(full_work_directory_path.as_ref())
+            .map_err(|e| make_err!(Code::Internal, "{e}"))
+            .err_tip(|| {
+                format!("Could not strip work directory from symlink parent {full_path:?}")
+            })?;
+        RelativePath::from_path(parent_path)
             .map_err(|v| make_err!(Code::Internal, "Could not convert {} to RelativePath", v))?
-            .relative(full_target_path)
+            .relative(target_path)
             .normalize()
             .into_string()
     } else {
@@ -6562,6 +6577,33 @@ mod tests {
             ..missing
         };
         assert_eq!(tag_missing_input(other_error.clone()), other_error);
+    }
+
+    #[cfg(unix)]
+    #[nativelink_test]
+    async fn upload_symlink_rebases_internal_targets_from_its_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let nested = work.join("output/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(work.join("target"), "").unwrap();
+        let outside = temp.path().join("outside");
+        let cases = [
+            (work.join("target"), "../../target".to_string()),
+            (work.join("missing"), "../../missing".to_string()),
+            (
+                Path::new("../relative").to_path_buf(),
+                "../relative".to_string(),
+            ),
+            (outside.clone(), outside.to_str().unwrap().to_string()),
+        ];
+        for (index, (target, expected)) in cases.into_iter().enumerate() {
+            let link = nested.join(format!("link-{index}"));
+            symlink(target, &link).unwrap();
+            assert_eq!(upload_symlink(&link, &work).await.unwrap().target, expected);
+        }
     }
 
     fn test_digest(first_byte: u8) -> DigestInfo {
