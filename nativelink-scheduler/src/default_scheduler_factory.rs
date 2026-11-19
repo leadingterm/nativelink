@@ -231,6 +231,14 @@ async fn simple_scheduler_factory(
             policy.percent
         ));
     }
+    if let Some(policy) = &spec.memory_escalation
+        && !policy.disk_property.is_empty()
+        && (policy.disk_property == policy.property || policy.disk_property == policy.cpu_property)
+    {
+        return Err(make_input_err!(
+            "memory_escalation.disk_property must differ from property and cpu_property"
+        ));
+    }
     if let Some(hold) = &spec.reservation_hold
         && (hold.hold_after_s == 0 || hold.max_hold_s == 0)
     {

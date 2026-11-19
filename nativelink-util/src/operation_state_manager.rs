@@ -182,6 +182,8 @@ pub struct Decline {
 /// A reservation to raise before an action runs again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Escalation {
+    /// Resource whose kill triggered the escalation ("memory" or "disk").
+    pub resource: &'static str,
     /// The platform property carrying the reservation.
     pub property: String,
     /// The new value.

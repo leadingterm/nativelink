@@ -59,7 +59,22 @@ use tokio::sync::{Notify, mpsc};
 use tonic::async_trait;
 use tracing::{debug, error, info, trace, warn};
 
-/// The memory reservation an action was dispatched with, 0 without one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EscalationResource {
+    Memory,
+    Disk,
+}
+
+impl EscalationResource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+        }
+    }
+}
+
+/// The resource reservation an action was dispatched with, 0 without one.
 fn reservation_of(properties: &PlatformProperties, property: &str) -> u64 {
     match properties.properties.get(property) {
         Some(PlatformPropertyValue::Minimum(kb)) => *kb,
@@ -85,22 +100,21 @@ enum NextReservation {
 }
 
 /// The step after `base_kb`: the next ladder class above it, or `percent`
-/// of it, capped at the fleet's ceiling; at the ceiling the largest worker
-/// is reserved whole, its CPU too. A memory kill and a lost worker
-/// (RFC-0018) climb the same ladder through this.
+/// of it, capped at the fleet's ceiling. Memory's last step also reserves
+/// the worker's CPU; disk leaves memory and CPU unchanged.
 fn next_reservation(
     policy: &MemoryEscalationSpec,
+    resource: EscalationResource,
     properties: &PlatformProperties,
     reserved_kb: u64,
     base_kb: u64,
-    (fleet_memory_kb, fleet_cpu): (u64, Option<u64>),
+    (fleet_kb, fleet_cpu): (u64, Option<u64>),
 ) -> NextReservation {
-    // `max_kb` caps the fleet's ceiling; it cannot raise it past what a
-    // worker declares, or the escalation lands where nothing can run.
-    let ceiling_kb = if policy.max_kb > 0 {
-        fleet_memory_kb.min(policy.max_kb)
+    // max_kb only caps memory and cannot exceed the fleet's ceiling.
+    let ceiling_kb = if resource == EscalationResource::Memory && policy.max_kb > 0 {
+        fleet_kb.min(policy.max_kb)
     } else {
-        fleet_memory_kb
+        fleet_kb
     };
     if ceiling_kb == 0 {
         return NextReservation::NoCeiling;
@@ -150,7 +164,11 @@ fn attempt_end_reason(update: &UpdateOperationType) -> Option<(AttemptEndReason,
             Some((AttemptEndReason::WorkerLost, String::new()))
         }
         UpdateOperationType::UpdateWithEscalation(escalation) => Some((
-            AttemptEndReason::OutOfMemory,
+            if escalation.resource == "memory" {
+                AttemptEndReason::OutOfMemory
+            } else {
+                AttemptEndReason::WorkerError
+            },
             escalation.reason.message_string(),
         )),
         UpdateOperationType::UpdateWithDecline(_) => {
@@ -1820,6 +1838,7 @@ impl ApiWorkerSchedulerImpl {
         let sampled_over = reserved_kb > 0 && peak_kb > reserved_kb;
         let (value, cpu) = match next_reservation(
             policy,
+            EscalationResource::Memory,
             properties,
             reserved_kb,
             reserved_kb.max(peak_kb),
@@ -1843,6 +1862,7 @@ impl ApiWorkerSchedulerImpl {
         };
         Some(LossEscalation {
             escalation: Escalation {
+                resource: "memory",
                 property: policy.property.clone(),
                 value,
                 reason: make_err!(
@@ -1868,72 +1888,92 @@ impl ApiWorkerSchedulerImpl {
         }
     }
 
-    /// Turns a result that the worker's last usage report says was a memory
-    /// kill into a requeue with a larger reservation, when escalation is
-    /// configured and there is room to grow. Returns the update to apply
-    /// and whether it was escalated.
+    /// Requeues a resource-killed action with a larger reservation when
+    /// escalation is configured and there is room to grow.
     fn maybe_escalate(
         &self,
         worker_id: &WorkerId,
         operation_id: &OperationId,
         update: UpdateOperationType,
-    ) -> (UpdateOperationType, bool) {
+    ) -> (UpdateOperationType, Option<EscalationResource>) {
         let Some(policy) = &self.memory_escalation else {
-            return (update, false);
+            return (update, None);
         };
         let UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(result)) = &update
         else {
-            return (update, false);
+            return (update, None);
         };
         let Some(pending) = self
             .workers
             .peek(worker_id)
             .and_then(|worker| worker.running_action_infos.get(operation_id))
         else {
-            return (update, false);
+            return (update, None);
         };
         let Some(usage) = pending.last_usage.as_ref() else {
-            return (update, false);
+            return (update, None);
         };
-        if usage.outcome != ResourceOutcome::KilledMemory as i32 {
-            return (update, false);
-        }
+        let resource = match ResourceOutcome::try_from(usage.outcome) {
+            Ok(ResourceOutcome::KilledMemory) => EscalationResource::Memory,
+            Ok(ResourceOutcome::KilledDisk) if !policy.disk_property.is_empty() => {
+                EscalationResource::Disk
+            }
+            _ => return (update, None),
+        };
+        let (property, reserved, peak_kb) = match resource {
+            EscalationResource::Memory => (
+                &policy.property,
+                usage.reserved.map(|r| r.memory_kb),
+                usage.peak_memory_kb,
+            ),
+            EscalationResource::Disk => (
+                &policy.disk_property,
+                usage.reserved.map(|r| r.disk_kb),
+                usage.peak_disk_kb,
+            ),
+        };
+        let resource_name = resource.name();
         // What it ran under: the worker's echo, else what the scheduler sent.
-        let reserved_kb = usage
-            .reserved
-            .map(|r| r.memory_kb)
+        let reserved_kb = reserved
             .filter(|kb| *kb > 0)
             .unwrap_or_else(|| {
-                reservation_of(&pending.action_info.platform_properties, &policy.property)
+                reservation_of(&pending.action_info.platform_properties, property)
             });
         // Grow from what the action was seen to use, not only from what it
         // asked for: a kill sampled well past its reservation would
         // otherwise be given a size it was just observed to exceed.
-        let base_kb = reserved_kb.max(usage.peak_memory_kb);
-        let fleet = self.fleet_largest_worker(&policy.property, &policy.cpu_property);
+        let base_kb = reserved_kb.max(peak_kb);
+        let fleet = self.fleet_largest_worker(
+            property,
+            if resource == EscalationResource::Memory {
+                &policy.cpu_property
+            } else {
+                ""
+            },
+        );
         let (value, cpu, ceiling_kb) = match next_reservation(
             policy,
+            resource,
             &pending.action_info.platform_properties,
             reserved_kb,
             base_kb,
             fleet,
         ) {
-            NextReservation::NoCeiling => return (update, false),
+            NextReservation::NoCeiling => return (update, None),
             NextReservation::AlreadyWhole { ceiling_kb } => {
-                // A kill at the whole of the largest worker is the end: no
-                // worker in the fleet can run the action, and the client
-                // hears exactly that.
+                // No worker advertises a larger reservation for this resource.
                 warn!(
                     ?worker_id,
                     ?operation_id,
                     reserved_kb,
                     ceiling_kb,
-                    "Action killed for memory with the largest worker reserved whole; no worker in the fleet can run it"
+                    resource = resource_name,
+                    "Action killed at the fleet's largest reservation; no worker has more capacity"
                 );
                 let mut failed = result.clone();
                 let no_worker = make_err!(
                     Code::FailedPrecondition,
-                    "Action was killed for memory at {reserved_kb} KiB with the largest worker in the fleet ({ceiling_kb} KiB) reserved for it alone; no worker can run it. It needs a bigger worker or less memory"
+                    "Action was killed for {resource_name} at {reserved_kb} KiB with the largest worker in the fleet ({ceiling_kb} KiB) reserved for it; no worker can run it with a larger reservation. It needs a bigger worker or less {resource_name}"
                 );
                 failed.error = Some(match result.error.clone() {
                     Some(worker_error) => no_worker.merge(worker_error),
@@ -1941,7 +1981,7 @@ impl ApiWorkerSchedulerImpl {
                 });
                 return (
                     UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(failed)),
-                    false,
+                    None,
                 );
             }
             NextReservation::NoBase => {
@@ -1951,9 +1991,10 @@ impl ApiWorkerSchedulerImpl {
                 warn!(
                     ?worker_id,
                     ?operation_id,
-                    "Action killed for memory with no reservation and no sampled peak; not escalating"
+                    resource = resource_name,
+                    "Action killed with no reservation and no sampled peak; not escalating"
                 );
-                return (update, false);
+                return (update, None);
             }
             NextReservation::Step {
                 value,
@@ -1964,28 +2005,30 @@ impl ApiWorkerSchedulerImpl {
         let reason = result.error.clone().unwrap_or_else(|| {
             make_err!(
                 Code::FailedPrecondition,
-                "Action was killed for memory at {} KiB",
-                usage.peak_memory_kb
+                "Action was killed for {resource_name} at {} KiB",
+                peak_kb
             )
         });
         warn!(
             ?worker_id,
             ?operation_id,
             reserved_kb,
-            peak_memory_kb = usage.peak_memory_kb,
+            peak_kb,
             escalated_kb = value,
             ceiling_kb,
-            property = %policy.property,
-            "Action killed for memory; requeuing with a larger reservation"
+            property = %property,
+            resource = resource_name,
+            "Action killed; requeuing with a larger reservation"
         );
         (
             UpdateOperationType::UpdateWithEscalation(Escalation {
-                property: policy.property.clone(),
+                resource: resource_name,
+                property: property.clone(),
                 value,
                 reason,
                 cpu,
             }),
-            true,
+            Some(resource),
         )
     }
 
@@ -3260,8 +3303,11 @@ impl WorkerScheduler for ApiWorkerScheduler {
     ) -> Result<(), Error> {
         let mut inner = self.inner.lock().await;
         let (update, escalated) = inner.maybe_escalate(worker_id, operation_id, update);
-        if escalated {
-            record_dispatch_requeue("memory_escalation");
+        if let Some(resource) = escalated {
+            record_dispatch_requeue(match resource {
+                EscalationResource::Memory => "memory_escalation",
+                EscalationResource::Disk => "disk_escalation",
+            });
         }
         inner.update_action(worker_id, operation_id, update).await
     }

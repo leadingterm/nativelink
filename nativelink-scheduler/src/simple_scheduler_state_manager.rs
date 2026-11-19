@@ -469,14 +469,14 @@ where
 /// How often an action is queued again, by cause, before the scheduler
 /// completes it with `FailedPrecondition`. Each cause has its own budget:
 /// an action's own failures, the workers it lost through no fault of its
-/// own, and the memory escalations it was granted.
+/// own, and the resource escalations it was granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryLimits {
     /// Internal errors and timeouts the action produced.
     pub max_job_retries: usize,
     /// Workers lost while the action ran.
     pub max_worker_loss_retries: usize,
-    /// Memory escalations; 0 leaves only the fleet's ceiling to bound them.
+    /// Resource escalations; 0 leaves only the fleet's ceiling to bound them.
     pub max_escalations: usize,
     /// The worker loss from which a lost worker escalates the action's
     /// memory (RFC-0018); 0 never does.
@@ -534,7 +534,7 @@ where
     max_worker_loss_retries: usize,
 
     #[metric(
-        help = "Maximum number of memory escalations for a job; 0 leaves the ceiling to bound them"
+        help = "Maximum number of resource escalations for a job; 0 leaves the ceiling to bound them"
     )]
     max_escalations: usize,
 
@@ -1591,7 +1591,8 @@ where
                             error: Some(
                                 make_err!(
                                     Code::FailedPrecondition,
-                                    "Job cancelled after being killed for memory at every reservation tried ({} escalations, more than max_steps {}); the last reservation was {} {} {}",
+                                    "Job cancelled after being killed for {} ({} resource escalations, more than max_steps {}); the next reservation would have been {} {} {}",
+                                    escalation.resource,
                                     awaited_action.escalations,
                                     self.max_escalations,
                                     escalation.value,
@@ -1605,8 +1606,8 @@ where
                     } else {
                         // The same action, asking for more: the next
                         // dispatch carries the raised reservation and the
-                        // worker holds it to that. The last step also asks
-                        // for the worker's whole CPU, so it runs alone.
+                        // worker holds it to that. Memory's last step can
+                        // also reserve the worker's whole CPU.
                         raise_reservation(&mut awaited_action, escalation);
                         is_retry = true;
                         ActionStage::Queued

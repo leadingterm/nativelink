@@ -210,6 +210,7 @@ async fn setup_api_server_full(
     ));
     let memory_escalation = memory.map(|_| MemoryEscalationSpec {
         property: "memory_kb".to_string(),
+        disk_property: String::new(),
         percent: 200,
         max_kb: 0,
         ladder_kb: Vec::new(),

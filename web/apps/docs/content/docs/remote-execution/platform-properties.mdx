@@ -286,6 +286,28 @@ canonical use.
 <SourceLink file="nativelink-config/src/cas_server.rs" symbol="WorkerProperty" />
 <SourceLink file="nativelink-worker/src/worker_utils.rs" symbol="make_connect_worker_request" />
 
+## Retrying an action after a disk kill [#retrying-an-action-after-a-disk-kill]
+
+Declare the disk reservation property as `minimum` on the simple scheduler,
+and have workers advertise their disk capacity under that same property.
+Setting `memory_escalation.disk_property` to its name opts disk kills into
+reservation escalation; leaving it empty preserves the existing failure.
+
+The scheduler grows the larger of the dispatched reservation and sampled
+peak, using `percent` or the next `ladder_kb` class. It stops at the largest
+disk capacity advertised by a connected, non-draining worker. Disk and
+memory escalations share `max_steps`; disk does not use the memory-only
+`max_kb` cap and never raises memory or CPU reservations. Worker-loss
+escalation remains memory-only.
+
+This changes scheduling after a worker reports `KILLED_DISK`; it does not
+enable worker-side enforcement or change the meaning of a successful action.
+See the [generated configuration reference](/reference/nativelink-config)
+for the policy fields and defaults.
+
+<SourceLink file="nativelink-config/src/schedulers.rs" symbol="MemoryEscalationSpec" />
+<SourceLink file="nativelink-scheduler/src/api_worker_scheduler.rs" symbol="maybe_escalate" />
+
 ## About `container-image` [#about-container-image]
 
 It appears in nearly every example config and it is worth being precise about
