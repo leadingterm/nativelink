@@ -429,8 +429,6 @@ pub struct RetryLimits {
     pub max_job_retries: usize,
     /// Workers lost while the action ran.
     pub max_worker_loss_retries: usize,
-    /// Resource escalations; 0 leaves only the fleet's ceiling to bound them.
-    pub max_escalations: usize,
 }
 
 impl RetryLimits {
@@ -445,7 +443,6 @@ impl From<usize> for RetryLimits {
         Self {
             max_job_retries,
             max_worker_loss_retries: Self::DEFAULT_WORKER_LOSS_RETRIES,
-            max_escalations: 0,
         }
     }
 }
@@ -474,11 +471,6 @@ where
 
     #[metric(help = "Maximum number of times a job is queued again after losing its worker")]
     max_worker_loss_retries: usize,
-
-    #[metric(
-        help = "Maximum number of resource escalations for a job; 0 leaves the ceiling to bound them"
-    )]
-    max_escalations: usize,
 
     /// Duration after which an action is considered to be timed out if
     /// no event is received.
@@ -531,13 +523,11 @@ where
         let RetryLimits {
             max_job_retries,
             max_worker_loss_retries,
-            max_escalations,
         } = retry_limits.into();
         Arc::new_cyclic(|weak_self| Self {
             action_db,
             max_job_retries,
             max_worker_loss_retries,
-            max_escalations,
             no_event_action_timeout,
             client_action_timeout,
             max_executing_timeout,
@@ -1425,14 +1415,12 @@ where
                     }
                 }
                 UpdateOperationType::UpdateWithEscalation(escalation) => {
-                    // The scheduler's own sizing decision, not a failure of
-                    // the action: it has its own budget and does not spend
-                    // `max_job_retries`. The fleet's ceiling bounds it
-                    // anyway; the budget catches a fleet whose ceiling is
-                    // far above where the action started.
-                    awaited_action.escalations += 1;
-                    if self.max_escalations > 0 && awaited_action.escalations > self.max_escalations
-                    {
+                    let count = if escalation.resource == "memory" {
+                        &mut awaited_action.memory_escalations
+                    } else {
+                        &mut awaited_action.disk_escalations
+                    };
+                    if *count >= escalation.max_steps {
                         ActionStage::Completed(ActionResult {
                             execution_metadata: ExecutionMetadata {
                                 worker: maybe_worker_id
@@ -1442,19 +1430,18 @@ where
                             error: Some(
                                 make_err!(
                                     Code::FailedPrecondition,
-                                    "Job cancelled after being killed for {} ({} resource escalations, more than max_steps {}); the next reservation would have been {} {} {}",
+                                    "operation {operation_id} killed for {}: measured peak {} KiB, eligible capacity {} KiB; max_steps {} exhausted",
                                     escalation.resource,
-                                    awaited_action.escalations,
-                                    self.max_escalations,
-                                    escalation.value,
-                                    escalation.property,
-                                    format!("for operation_id: {operation_id}, maybe_worker_id: {maybe_worker_id:?}"),
+                                    escalation.peak_kb,
+                                    escalation.capacity_kb,
+                                    escalation.max_steps,
                                 )
                                 .merge(escalation.reason.clone()),
                             ),
                             ..ActionResult::default()
                         })
                     } else {
+                        *count += 1;
                         // The same action, asking for more: the next
                         // dispatch carries the raised reservation and the
                         // worker holds it to that. Memory's last step can

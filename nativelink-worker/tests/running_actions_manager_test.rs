@@ -3619,12 +3619,20 @@ exit 0
             disk,
             disk_property_name: "disk_kb".to_string(),
             memory_property_name: "memory_kb".to_string(),
-            memory_headroom_percent: 20,
-            disk_headroom_percent: 20,
-            disk_pressure_free_percent: 5,
-            disk_pressure_kill_after_s: 5,
-            memory_pressure_kill_percent: 0,
-            memory_pressure_kill_after_s: 30,
+            memory_headroom_percent: 24,
+            memory_soft_samples: 3,
+            memory_soft_spike_percent: 240,
+            memory_sample_interval_ms: 31,
+            memory_pressure_stall_percent: 7,
+            memory_pressure_poll_interval_ms: 43,
+            memory_pressure_kill_after_ms: 270,
+            memory_pool_path: None,
+            disk_headroom_percent: 24,
+            disk_soft_samples: 3,
+            disk_sample_interval_ms: 131,
+            disk_pressure_free_percent: 9,
+            disk_pressure_poll_interval_ms: 51,
+            disk_pressure_kill_after_ms: 380,
         };
         assert!(
             ResourceEnforcement::from_config(&config(
@@ -3647,8 +3655,18 @@ exit 0
         .expect("memory alone is enforcement");
         let memory = memory_only.memory.expect("the memory axis is on");
         assert_eq!(memory.property_name, "memory_kb");
-        assert_eq!(memory.headroom_percent, 20);
+        assert_eq!(memory.headroom_percent, 24);
         assert!(memory_only.disk_property_name.is_none());
+        let pressure = ResourceEnforcement::from_config(&config(
+            MemoryEnforcement::Pressure,
+            DiskEnforcement::None,
+        ))
+        .expect("pressure enforcement");
+        assert!(!pressure.memory.as_ref().unwrap().soft);
+        let policy = pressure.pressure_kill.expect("memory pressure policy");
+        assert_eq!(policy.stall_percent, 7);
+        assert_eq!(policy.poll_interval, Duration::from_millis(43));
+        assert_eq!(policy.after, Duration::from_millis(270));
         Ok(())
     }
 
@@ -3660,12 +3678,20 @@ exit 0
             disk,
             disk_property_name: "disk_kb".into(),
             memory_property_name: "memory_kb".into(),
-            memory_headroom_percent: 20,
-            disk_headroom_percent: 20,
-            memory_pressure_kill_percent: 0,
-            memory_pressure_kill_after_s: 30,
-            disk_pressure_free_percent: 5,
-            disk_pressure_kill_after_s: 5,
+            memory_headroom_percent: 24,
+            memory_soft_samples: 3,
+            memory_soft_spike_percent: 240,
+            memory_sample_interval_ms: 31,
+            memory_pressure_stall_percent: 7,
+            memory_pressure_poll_interval_ms: 43,
+            memory_pressure_kill_after_ms: 270,
+            memory_pool_path: None,
+            disk_headroom_percent: 24,
+            disk_soft_samples: 3,
+            disk_sample_interval_ms: 131,
+            disk_pressure_free_percent: 9,
+            disk_pressure_poll_interval_ms: 51,
+            disk_pressure_kill_after_ms: 380,
         };
         let pressure =
             ResourceEnforcement::from_config(&config(DiskEnforcement::Pressure)).unwrap();
@@ -3673,22 +3699,14 @@ exit 0
         assert!(pressure.disk_pressure_kill.is_some());
         let soft = ResourceEnforcement::from_config(&config(DiskEnforcement::Soft)).unwrap();
         assert_eq!(disk_ceiling_kb(soft.disk_soft, 100, 20), Some(120));
-        let mut disabled = config(DiskEnforcement::Pressure);
-        disabled.disk_pressure_free_percent = 0;
-        assert!(
-            ResourceEnforcement::from_config(&disabled)
-                .unwrap()
-                .disk_pressure_kill
-                .is_none()
-        );
-        disabled.disk_pressure_free_percent = 101;
-        disabled.disk_pressure_kill_after_s = 0;
-        let policy = ResourceEnforcement::from_config(&disabled)
-            .unwrap()
-            .disk_pressure_kill
-            .unwrap();
-        assert_eq!(policy.free_percent, 100);
-        assert_eq!(policy.after, Duration::from_secs(1));
+        let mut invalid = config(DiskEnforcement::Pressure);
+        invalid.disk_pressure_free_percent = 0;
+        assert!(invalid.validate().is_err());
+        invalid.disk_pressure_free_percent = 101;
+        assert!(invalid.validate().is_err());
+        invalid.disk_pressure_free_percent = 9;
+        invalid.disk_pressure_kill_after_ms = 0;
+        assert!(invalid.validate().is_err());
     }
 
     /// The sampler reads `Pss` out of `smaps_rollup`, not a field that
@@ -3816,6 +3834,10 @@ exit 0
                     disk_property_name: Some("disk_kb".to_string()),
                     disk_soft: false,
                     disk_headroom_percent: 20,
+                    memory_sample_interval: Duration::from_millis(31),
+                    disk_sample_interval: Duration::from_millis(131),
+                    disk_soft_samples: 1,
+                    memory_pool_path: None,
                     pressure_kill: None,
                     disk_pressure_kill: None,
                 }),
@@ -3912,6 +3934,10 @@ exit 0
                 disk_property_name: Some("disk_kb".to_string()),
                 disk_soft: false,
                 disk_headroom_percent: 20,
+                memory_sample_interval: Duration::from_millis(31),
+                disk_sample_interval: Duration::from_millis(131),
+                disk_soft_samples: 1,
+                memory_pool_path: None,
                 pressure_kill: None,
                 disk_pressure_kill: None,
             }),
@@ -3967,6 +3993,10 @@ exit 0
                         disk_property_name: Some("disk_kb".to_string()),
                         disk_soft: false,
                         disk_headroom_percent: 20,
+                        memory_sample_interval: Duration::from_millis(31),
+                        disk_sample_interval: Duration::from_millis(131),
+                        disk_soft_samples: 1,
+                        memory_pool_path: None,
                         pressure_kill: None,
                         disk_pressure_kill: None,
                     }),
@@ -5863,6 +5893,10 @@ exit 0
                         disk_property_name: Some("disk_kb".to_string()),
                         disk_soft: true,
                         disk_headroom_percent: 20,
+                        memory_sample_interval: Duration::from_millis(31),
+                        disk_sample_interval: Duration::from_millis(131),
+                        disk_soft_samples: 1,
+                        memory_pool_path: None,
                         pressure_kill: None,
                         disk_pressure_kill: None,
                     }),
@@ -6615,6 +6649,9 @@ exit 0
             })?);
         let operation_id = OperationId::from("mid-cleanup");
         fs::create_dir_all(format!("{root_action_directory}/{operation_id}")).await?;
+        let side_root = format!("{root_action_directory}/.side_channels");
+        let side_dir = format!("{side_root}/{operation_id}");
+        fs::create_dir_all(&side_dir).await?;
         let held = running_actions_manager
             .perform_cleanup(operation_id.clone())
             .expect("first mark is granted");
@@ -6646,12 +6683,21 @@ exit 0
             Path::new(&format!("{root_action_directory}/{operation_id}")).exists(),
             "the sweep must not remove a directory being cleaned"
         );
+        assert!(
+            Path::new(&side_dir).is_dir(),
+            "the marked side channel must remain"
+        );
         drop(held);
         assert_eq!(
             running_actions_manager.sweep_orphaned_directories().await?,
-            1,
+            2,
             "once the mark is released the settled directory is an orphan"
         );
+        assert!(
+            Path::new(&side_root).is_dir(),
+            "the side channel root must remain"
+        );
+        assert!(!Path::new(&side_dir).exists());
         Ok(())
     }
 
@@ -6856,12 +6902,24 @@ exit 0
         fs::create_dir_all(&stray).await?;
         let stray_file = format!("{root_action_directory}/not-a-directory");
         tokio::fs::write(&stray_file, b"x").await?;
+        let side_root = format!("{root_action_directory}/.side_channels");
+        let stale_side = format!("{side_root}/abandoned-action");
+        fs::create_dir_all(&stale_side).await?;
+        tokio::fs::write(format!("{stale_side}/report"), b"{}").await?;
 
         assert_eq!(
             running_actions_manager.sweep_orphaned_directories().await?,
-            1
+            2
         );
         assert!(!Path::new(&stray).exists(), "the orphan should be gone");
+        assert!(
+            !Path::new(&stale_side).exists(),
+            "the stale side channel should be gone"
+        );
+        assert!(
+            Path::new(&side_root).is_dir(),
+            "the side channel root must remain"
+        );
         assert!(
             Path::new(&stray_file).exists(),
             "files are not the sweep's business"
@@ -6962,10 +7020,17 @@ exit 0
                         memory: Some(MemoryLimit {
                             property_name: "memory_kb".to_string(),
                             headroom_percent: 20,
+                            soft: true,
+                            soft_samples: 3,
+                            soft_spike_percent: 240,
                         }),
                         disk_property_name: None,
                         disk_soft: false,
                         disk_headroom_percent: 20,
+                        memory_sample_interval: Duration::from_millis(31),
+                        disk_sample_interval: Duration::from_millis(131),
+                        disk_soft_samples: 1,
+                        memory_pool_path: None,
                         pressure_kill: None,
                         disk_pressure_kill: None,
                     }),
@@ -7133,12 +7198,15 @@ exit 0
         let (_, _, cas_store, _ac_store) = setup_stores().await?;
         let root_action_directory = make_temp_path("root_action_directory");
         fs::create_dir_all(&root_action_directory).await?;
+        let side_root = format!("{root_action_directory}/.side_channels");
+        fs::create_dir_all(&side_root).await?;
+        tokio::fs::set_permissions(&side_root, std::fs::Permissions::from_mode(0o700)).await?;
         let wrapper_dir = make_temp_path("side_channel_wrapper");
         fs::create_dir_all(&wrapper_dir).await?;
         let wrapper = format!("{wrapper_dir}/wrapper.sh");
         // The entrypoint protocol is exercised through the same shell-script seam as the timeout test.
         let script = if report_memory {
-            "#!/bin/bash\nprintf '%s' '{\"failure\":\"memory\"}' > \"$SIDE_CHANNEL_FILE\"\nexit 137\n"
+            "#!/bin/bash\nprintf '%s' '{\"failure\":\"memory\",\"peak_memory_kb\":37}' > \"$SIDE_CHANNEL_FILE\"\nexit 137\n"
         } else {
             "#!/bin/bash\nexit 137\n"
         };
@@ -7157,10 +7225,17 @@ exit 0
                     memory: Some(MemoryLimit {
                         property_name: "memory_kb".to_string(),
                         headroom_percent: 20,
+                        soft: true,
+                        soft_samples: 3,
+                        soft_spike_percent: 240,
                     }),
                     disk_property_name: None,
                     disk_soft: false,
                     disk_headroom_percent: 20,
+                    memory_sample_interval: Duration::from_millis(31),
+                    disk_sample_interval: Duration::from_millis(131),
+                    disk_soft_samples: 1,
+                    memory_pool_path: None,
                     pressure_kill: None,
                     disk_pressure_kill: None,
                 }),
@@ -7182,7 +7257,7 @@ exit 0
             active_input_leases: false,
             readonly_input_mounts: Vec::new(),
             directory_cache: None,
-            use_namespaces: use_namespaces(),
+            use_namespaces: nativelink_worker::running_actions_manager::UseNamespaces::No,
         })?);
         let command = Command {
             arguments: vec!["unused".to_string()],
@@ -7239,6 +7314,7 @@ exit 0
         let usage = running_action.resource_usage().expect("action usage");
         assert_eq!(usage.reserved.map(|r| r.memory_kb), Some(RESERVED_KB));
         if report_memory {
+            assert_eq!(usage.peak_memory_kb, 37);
             let error = result.error.expect("memory kill must report an error");
             assert_eq!(error.code, Code::FailedPrecondition);
             assert!(
@@ -7290,6 +7366,10 @@ exit 1
         let (_, _, cas_store, ac_store) = setup_stores().await?;
         let root_action_directory = make_temp_path("root_action_directory");
         fs::create_dir_all(&root_action_directory).await?;
+        let side_root = format!("{root_action_directory}/.side_channels");
+        fs::create_dir_all(&side_root).await?;
+        #[cfg(target_family = "unix")]
+        tokio::fs::set_permissions(&side_root, std::fs::Permissions::from_mode(0o700)).await?;
 
         let test_wrapper_script = {
             let test_wrapper_dir = make_temp_path("wrapper_dir");
@@ -7357,7 +7437,7 @@ exit 1
                 readonly_input_mounts: Vec::new(),
                 directory_cache: None,
                 #[cfg(target_os = "linux")]
-                use_namespaces: use_namespaces(),
+                use_namespaces: nativelink_worker::running_actions_manager::UseNamespaces::No,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -10930,42 +11010,16 @@ done
         );
     }
 
-    /// A kill needs the pressure to hold for the whole window; a dip starts
-    /// over, and so does a kill, so the next one waits a full window.
-    #[test]
-    fn pressure_window_kills_only_after_sustained_pressure() {
-        use nativelink_worker::running_actions_manager::PressureWindow;
-        use tokio::time::Instant;
-        let t0 = Instant::now();
-        let at = |secs| t0 + Duration::from_secs(secs);
-        let mut window = PressureWindow::new(40, Duration::from_secs(30));
-        assert!(!window.observe(55.0, at(0)));
-        assert!(!window.observe(55.0, at(29)));
-        assert!(
-            window.observe(40.0, at(30)),
-            "at the threshold, for the window: kill"
-        );
-        assert!(
-            !window.observe(55.0, at(31)),
-            "a kill starts the window over"
-        );
-        assert!(!window.observe(55.0, at(60)));
-        assert!(!window.observe(10.0, at(61)), "a dip starts over");
-        assert!(!window.observe(55.0, at(62)));
-        assert!(!window.observe(55.0, at(91)));
-        assert!(window.observe(55.0, at(92)));
-    }
-
     #[test]
     fn disk_pressure_uses_available_blocks_and_a_continuous_window() {
         use nativelink_worker::running_actions_manager::{
             PressureWindow, disk_free_percent, disk_under_pressure,
         };
         let start = tokio::time::Instant::now();
-        let mut window = PressureWindow::new(1, Duration::from_secs(5));
+        let mut window = PressureWindow::new(1, Duration::from_secs(7));
         let mut observe = |free, seconds| {
             window.observe(
-                if disk_under_pressure(free, 1000, 5) {
+                if disk_under_pressure(free, 1000, 9) {
                     1.0
                 } else {
                     0.0
@@ -10973,119 +11027,44 @@ done
                 start + Duration::from_secs(seconds),
             )
         };
-        assert_eq!(disk_free_percent(50, 1000), Some(5));
+        assert_eq!(disk_free_percent(90, 1000), Some(9));
         assert_eq!(disk_free_percent(0, 0), None);
-        assert!(!disk_under_pressure(0, 0, 5));
-        assert!(!observe(50, 0));
-        assert!(!observe(51, 4));
-        assert!(!observe(50, 5));
-        assert!(observe(0, 10));
+        assert!(!disk_under_pressure(0, 0, 9));
+        assert!(!observe(90, 0));
+        assert!(!observe(91, 4));
+        assert!(!observe(90, 5));
+        assert!(observe(0, 12));
     }
 
-    /// The kill lands on the action furthest over its reservation, or the
-    /// largest when none is over, never on one without a sample, one
-    /// already asked to die, or one that reserves the whole worker;
-    /// nothing qualifying means no kill.
+    /// Pressure selects excess usage first and never exempts a whole-worker reservation.
     #[test]
     fn pressure_victim_is_the_furthest_over_its_reservation() {
         use nativelink_worker::running_actions_manager::{PressureCandidate, pick_pressure_victim};
-        const GIB: u64 = 1024 * 1024;
         let c = |item, last_kb, reserved_kb, kill_requested| PressureCandidate {
             item,
             last_kb,
             reserved_kb,
             kill_requested,
         };
-        // A uses more but is within its reservation; B is 4 GiB over.
         assert_eq!(
-            pick_pressure_victim(
-                [
-                    c("a", 15 * GIB, 16 * GIB, false),
-                    c("b", 6 * GIB, 2 * GIB, false)
-                ],
-                None
-            ),
-            Some("b")
-        );
-        // Nobody over: the largest.
-        assert_eq!(
-            pick_pressure_victim(
-                [
-                    c("a", 500, 1_000, false),
-                    c("c", 7_000, 8_000, false),
-                    c("d", 0, 0, false)
-                ],
-                None
-            ),
-            Some("c")
-        );
-        // Already asked, or unsampled: never.
-        assert_eq!(
-            pick_pressure_victim([c("a", 0, 0, false), c("b", 9_000, 0, true)], None),
-            None
-        );
-        // Reserving the whole worker: never, even when furthest over.
-        assert_eq!(
-            pick_pressure_victim(
-                [
-                    c("a", 40 * GIB, 32 * GIB, false),
-                    c("b", 3 * GIB, 2 * GIB, false)
-                ],
-                Some(32 * GIB)
-            ),
-            Some("b")
+            pick_pressure_victim([
+                c("larger", 7100, 8000, false),
+                c("excess", 3200, 1100, false),
+            ]),
+            Some("excess")
         );
         assert_eq!(
-            pick_pressure_victim([c("a", 40 * GIB, 32 * GIB, false)], Some(32 * GIB)),
-            None
+            pick_pressure_victim([c("small", 600, 1000, false), c("large", 7100, 8000, false),]),
+            Some("large")
         );
         assert_eq!(
-            pick_pressure_victim(Vec::<PressureCandidate<&str>>::new(), None),
-            None
-        );
-    }
-
-    /// With 20% headroom a 52 GiB pod advertises 40 GiB, so the largest
-    /// reservation it is ever given is 40 GiB, well under its cgroup limit.
-    /// An action holding that whole figure is still never the victim.
-    #[test]
-    fn pressure_victim_skips_an_action_reserving_the_advertised_memory() {
-        use nativelink_config::cas_server::{CapacityConfig, CpuUnit, WorkerProperty};
-        use nativelink_worker::capacity::{ObservedCapacity, advertised_memory_kb};
-        use nativelink_worker::running_actions_manager::{PressureCandidate, pick_pressure_victim};
-        const GIB: u64 = 1024 * 1024;
-        let capacity = CapacityConfig {
-            cpu_property_name: "cpu_count".to_string(),
-            memory_property_name: "memory_kb".to_string(),
-            cpu_unit: CpuUnit::Cores,
-            overhead_cpu_millicores: 1000,
-            overhead_memory_kb: 4 * GIB,
-            memory_headroom_percent: None,
-        };
-        let largest = advertised_memory_kb(
-            Some(&capacity),
-            20,
-            Some(ObservedCapacity {
-                cpu_millicores: 14_000,
-                memory_kb: 52 * GIB,
-            }),
-            &HashMap::<String, WorkerProperty>::new(),
-            "memory_kb",
-        );
-        assert_eq!(largest, Some(40 * GIB));
-        let candidates = || {
-            [PressureCandidate {
-                item: "whole",
-                last_kb: 45 * GIB,
-                reserved_kb: 40 * GIB,
-                kill_requested: false,
-            }]
-        };
-        assert_eq!(
-            pick_pressure_victim(candidates(), Some(52 * GIB)),
+            pick_pressure_victim([c("whole", 9000, 8000, false), c("other", 2100, 2000, false),]),
             Some("whole")
         );
-        assert_eq!(pick_pressure_victim(candidates(), largest), None);
+        assert_eq!(
+            pick_pressure_victim([c("unsampled", 0, 0, false), c("killing", 9100, 1000, true),]),
+            None
+        );
     }
 
     /// An action running `arguments` on a manager with `memory: soft` and
@@ -11109,21 +11088,29 @@ done
                         memory: Some(MemoryLimit {
                             property_name: "memory_kb".to_string(),
                             headroom_percent: 20,
+                            soft: true,
+                            soft_samples: 3,
+                            soft_spike_percent: 240,
                         }),
                         disk_property_name: Some("disk_kb".into()),
                         disk_soft: false,
                         disk_headroom_percent: 20,
+                        memory_sample_interval: Duration::from_millis(31),
+                        disk_sample_interval: Duration::from_millis(131),
+                        disk_soft_samples: 1,
+                        memory_pool_path: None,
                         // Armed, but a threshold the host never reaches: the
                         // test asks for the kill itself.
                         pressure_kill: Some(PressureKill {
-                            full_avg10_percent: 100,
+                            stall_percent: 97,
+                            poll_interval: Duration::from_millis(43),
                             after: Duration::from_hours(1),
-                            largest_reservation_kb: None,
                         }),
                         disk_pressure_kill: Some(
                             nativelink_worker::running_actions_manager::DiskPressureKill {
                                 free_percent: 1,
                                 after: Duration::from_hours(1),
+                                poll_interval: Duration::from_millis(51),
                             },
                         ),
                     }),

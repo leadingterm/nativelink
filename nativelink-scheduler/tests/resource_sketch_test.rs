@@ -44,6 +44,11 @@ const fn policy(headroom_percent: u64, classes: Vec<SizeClassSpec>) -> Policy {
 /// (seconds 1 to a few thousand, or NOW itself) sits inside the window.
 const NOW: u64 = 7 * 86_400;
 
+#[test]
+fn sampler_generation_identifies_peak_floor_format() {
+    assert_eq!(SAMPLER_GENERATION, 2);
+}
+
 /// One shard, so the eviction order is the one LRU order of each family;
 /// the scheduler uses `SHARDS`.
 fn sketch(policy: Policy, budget: Budget) -> ResourceSketch {
@@ -140,8 +145,7 @@ fn shape_caps_the_bucket_by_the_exact_maximum() {
     );
 }
 
-/// The kill floor: a hint never sits at or below a reservation the action
-/// was killed at, and a class whose memory would be killed again is passed.
+/// Killed peaks shape the next reservation, including class selection.
 #[test]
 fn shape_sits_above_the_kill() {
     let ladder = vec![
@@ -149,27 +153,26 @@ fn shape_sits_above_the_kill() {
         class("m", 2000, 6_000_000, 0),
         class("l", 4000, 12_000_000, 0),
     ];
-    let sketch = sketch(policy(0, ladder), small_budget());
+    let sketch = sketch(policy(25, ladder), small_budget());
     let key = target("//a", "Test");
     sketch.observe(
         key.clone(),
         &Observation {
             peak_memory_kb: 1_500_000,
-            killed_at_kb: Some(2_000_000),
+            killed_peak_memory_kb: Some(1_500_000),
             killed: true,
             now_s: 1,
             ..Observation::default()
         },
     );
     let shaped = sketch.shape(&sketch.lookup(&key, NOW).unwrap());
-    assert_eq!(shaped.class.as_deref(), Some("m"), "s was killed at");
-    assert_eq!(shaped.memory_kb, 6_000_000);
-    // Killed at the top: no class sits above it, the raw number stands.
+    assert_eq!(shaped.class.as_deref(), Some("s"));
+    assert_eq!(shaped.memory_kb, 2_000_000);
     sketch.observe(
         key.clone(),
         &Observation {
             peak_memory_kb: 11_000_000,
-            killed_at_kb: Some(12_000_000),
+            killed_peak_memory_kb: Some(11_000_000),
             killed: true,
             now_s: 2,
             ..Observation::default()
@@ -177,7 +180,75 @@ fn shape_sits_above_the_kill() {
     );
     let shaped = sketch.shape(&sketch.lookup(&key, NOW).unwrap());
     assert!(shaped.class.is_none(), "{shaped:?}");
-    assert_eq!(shaped.memory_kb, 12_000_001);
+    assert_eq!(shaped.memory_kb, 13_750_000);
+}
+
+#[test]
+fn killed_peaks_override_p95_for_both_resources_and_expire() {
+    let sketch = sketch(policy(25, vec![]), small_budget());
+    let key = target("//peak", "Test");
+    let day = 86_400;
+    let now = 20 * day;
+    for _ in 0..30 {
+        sketch.observe(
+            key.clone(),
+            &Observation {
+                peak_memory_kb: 1_000,
+                peak_disk_kb: 2_000,
+                now_s: now,
+                ..Observation::default()
+            },
+        );
+    }
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            peak_memory_kb: 8_001,
+            peak_disk_kb: 12_001,
+            killed_peak_memory_kb: Some(8_001),
+            killed_peak_disk_kb: Some(12_001),
+            killed: true,
+            now_s: now,
+            ..Observation::default()
+        },
+    );
+    let shaped = sketch.shape(&sketch.lookup(&key, now).unwrap());
+    assert_eq!(shaped.memory_kb, 10_002);
+    assert_eq!(shaped.disk_kb, 15_002);
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            peak_memory_kb: 1_000,
+            peak_disk_kb: 2_000,
+            now_s: now + 6 * day,
+            ..Observation::default()
+        },
+    );
+    let entry = sketch.lookup(&key, now + 8 * day).unwrap();
+    assert_eq!(entry.killed_peak_memory_kb, 0);
+    assert_eq!(entry.killed_peak_disk_kb, 0);
+    assert_eq!(sketch.shape(&entry).memory_kb, 1_250);
+    assert_eq!(sketch.shape(&entry).disk_kb, 2_500);
+}
+
+#[test]
+fn clear_then_load_restores_entries_and_clears_probation() {
+    let sketch = sketch(policy(17, vec![]), small_budget());
+    let key = target("//saved", "Compile");
+    sketch.observe(key.clone(), &memory(4_321, NOW));
+    let snapshot = sketch.snapshot(NOW);
+    sketch.observe(command("probation"), &memory(2_345, NOW));
+    let samples = sketch.stats().samples;
+    sketch.clear();
+    assert_eq!(sketch.stats().entries, [0, 0, 0]);
+    assert_eq!(sketch.stats().probation, 0);
+    assert_eq!(sketch.stats().samples, samples);
+    assert_eq!(sketch.load(snapshot, NOW).unwrap(), 2);
+    assert_eq!(
+        sketch.shape(&sketch.lookup(&key, NOW).unwrap()).memory_kb,
+        5_056
+    );
+    assert!(!sketch.observe(command("probation"), &memory(2_345, NOW)));
 }
 
 /// A dimension the ladder does not reserve is dropped before anything is
@@ -271,7 +342,8 @@ fn a_snapshot_round_trips_and_ages_out() {
             peak_memory_kb: 123_456,
             cpu_millicores: Some(2500),
             peak_disk_kb: 77,
-            killed_at_kb: Some(100_000),
+            killed_peak_memory_kb: Some(123_456),
+            killed_peak_disk_kb: Some(77),
             killed: true,
             now_s: now,
         },
@@ -301,8 +373,10 @@ fn a_snapshot_round_trips_and_ages_out() {
     assert_eq!(entry.current.max_cpu_millicores, 2500);
     assert_eq!(entry.current.max_disk_kb, 77);
     assert_eq!(entry.previous, Half::default());
-    assert_eq!(entry.killed_at_kb, 100_000);
-    assert_eq!(entry.killed_at_s, now);
+    assert_eq!(entry.killed_peak_memory_kb, 123_456);
+    assert_eq!(entry.killed_memory_s, now);
+    assert_eq!(entry.killed_peak_disk_kb, 77);
+    assert_eq!(entry.killed_disk_s, now);
     assert_eq!(entry.last_seen_s, now);
     assert_eq!(entry.period, now / (7 * 86_400 / 2));
     assert!(!entry.seeded);
@@ -421,14 +495,14 @@ fn samples_leave_with_the_window_and_the_kill_floor_expires() {
         key.clone(),
         &Observation {
             peak_memory_kb: 7_500_000,
-            killed_at_kb: Some(8_000_000),
+            killed_peak_memory_kb: Some(7_500_000),
             killed: true,
             now_s: start,
             ..Observation::default()
         },
     );
     let entry = sketch.lookup(&key, start).unwrap();
-    assert_eq!(sketch.shape(&entry).memory_kb, 8_000_001, "above the kill");
+    assert_eq!(sketch.shape(&entry).memory_kb, 7_500_000);
     // Three days on, the next half-window: a few small samples, and the
     // big ones still count.
     for i in 0..3u64 {
@@ -439,7 +513,7 @@ fn samples_leave_with_the_window_and_the_kill_floor_expires() {
     assert_eq!(entry.previous.memory.total(), 101);
     assert_eq!(
         sketch.shape(&entry).memory_kb,
-        8_000_001,
+        7_500_000,
         "the kill still holds"
     );
     // Eight days on: two half-windows past the big samples and a window
@@ -447,7 +521,7 @@ fn samples_leave_with_the_window_and_the_kill_floor_expires() {
     // left, and the maximum left with the big ones.
     assert_eq!(sketch.age_out(start + 8 * day), 0);
     let entry = sketch.lookup(&key, start + 8 * day).unwrap();
-    assert_eq!(entry.killed_at_kb, 0, "the floor expired");
+    assert_eq!(entry.killed_peak_memory_kb, 0, "the floor expired");
     assert_eq!(entry.previous.memory.total(), 3);
     assert_eq!(entry.current, Half::default());
     assert_eq!(entry.max_memory_kb(), 1_000_000);

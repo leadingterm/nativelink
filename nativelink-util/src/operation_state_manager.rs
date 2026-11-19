@@ -165,6 +165,11 @@ pub struct Escalation {
     pub property: String,
     /// The new value.
     pub value: u64,
+    /// Measured peak and eligible capacity, for terminal diagnostics.
+    pub peak_kb: u64,
+    pub capacity_kb: u64,
+    /// Per-resource requeue budget.
+    pub max_steps: usize,
     /// Why: the error the kill produced, kept for the client if the cap
     /// ends the escalation.
     pub reason: Error,

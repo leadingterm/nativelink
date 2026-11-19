@@ -85,7 +85,6 @@ use tokio::time::Instant;
 use tokio_stream::wrappers::ReadDirStream;
 use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
-use uuid::Uuid;
 
 use crate::buck2_file_capture::Buck2FileCapture;
 use crate::input_mounts::InputMounts;
@@ -209,6 +208,33 @@ async fn hard_kill(child: &mut SpawnedChild, watch: &ActionMemoryWatch, why: &st
     }
 }
 
+/// Kill a validated action cgroup without signalling the wrapper's process group.
+async fn resource_kill(
+    child: &mut SpawnedChild,
+    watch: &ActionMemoryWatch,
+    grace: Duration,
+    cgroup_killed: &AtomicBool,
+    why: &str,
+) -> (bool, Fuse<BoxFuture<'static, ()>>) {
+    watch.finished_or_killing.store(true, Ordering::Release);
+    #[cfg(target_os = "linux")]
+    if let Some(scope) = watch.cgroup_scope() {
+        cgroup_killed.store(true, Ordering::Release);
+        if let Some(peak) = crate::action_cgroup::read_kib(&scope, "memory.peak") {
+            *watch.kernel_peak_kb.lock() = Some(peak);
+        }
+        if let Err(err) = tokio::fs::write(scope.join("cgroup.kill"), b"1").await {
+            error!(?err, path = %scope.display(), why, "could not kill action cgroup");
+        }
+        return (true, tokio::time::sleep(grace).boxed().fuse());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cgroup_killed;
+    let _ = grace;
+    hard_kill(child, watch, why).await;
+    (false, Fuse::terminated())
+}
+
 /// Starts stopping an action. With a grace period the process group gets
 /// SIGTERM and the returned future fires when SIGKILL is due; without one
 /// SIGKILL goes out now and the future never fires.
@@ -218,6 +244,7 @@ async fn stop_action(
     grace: Duration,
     why: &str,
 ) -> Fuse<BoxFuture<'static, ()>> {
+    watch.finished_or_killing.store(true, Ordering::Release);
     debug!(grace_ms = grace.as_millis(), why, "Stopping action");
     #[cfg(target_os = "linux")]
     if !grace.is_zero()
@@ -278,7 +305,7 @@ enum OverLimit {
     /// sample and the pressure that chose it.
     MemoryPressure {
         observed_kb: u64,
-        full_avg10_percent: u64,
+        stall_percent: u64,
     },
     DiskPressure {
         observed_kb: u64,
@@ -302,6 +329,11 @@ pub struct ActionMemoryWatch {
     // Encoded as free percent + 1, since zero free space is meaningful.
     disk_kill_requested: AtomicU64,
     kill_requested_percent: AtomicU64,
+    finished_or_killing: AtomicBool,
+    #[cfg(target_os = "linux")]
+    cgroup: Mutex<Option<crate::action_cgroup::Source>>,
+    #[cfg(target_os = "linux")]
+    kernel_peak_kb: Mutex<Option<u64>>,
     /// Every process group the sampler last found holding the action's
     /// processes. A test that `set -m` put in a group of its own keeps
     /// nothing linking it to the action once its wrapper exits; this is
@@ -312,6 +344,20 @@ pub struct ActionMemoryWatch {
 }
 
 impl ActionMemoryWatch {
+    #[cfg(target_os = "linux")]
+    fn cgroup_scope(&self) -> Option<PathBuf> {
+        self.cgroup.lock().as_mut()?.scope().map(Path::to_path_buf)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sample_cgroup(&self) -> Option<u64> {
+        let scope = self.cgroup_scope()?;
+        if let Some(peak) = crate::action_cgroup::read_kib(&scope, "memory.peak") {
+            *self.kernel_peak_kb.lock() = Some(peak);
+        }
+        crate::action_cgroup::read_kib(&scope, "memory.current")
+    }
+
     pub fn last_memory_kb(&self) -> u64 {
         self.last_memory_kb.load(Ordering::Relaxed)
     }
@@ -321,7 +367,8 @@ impl ActionMemoryWatch {
     }
 
     pub fn kill_requested(&self) -> bool {
-        self.kill_requested_percent.load(Ordering::Relaxed) > 0
+        self.finished_or_killing.load(Ordering::Acquire)
+            || self.kill_requested_percent.load(Ordering::Relaxed) > 0
             || self.disk_kill_requested.load(Ordering::Relaxed) > 0
     }
 }
@@ -338,47 +385,23 @@ pub struct PressureCandidate<T> {
     pub kill_requested: bool,
 }
 
-/// Picks the action a memory pressure kill lands on, among those with a
-/// sample and no kill already asked: the one furthest over its
-/// reservation, or, when none is over, the one whose last sample is
-/// largest. An action that reserves `whole_worker_kb` or more is never
-/// picked: it already has the worker to itself, and a memory kill there
-/// would leave the scheduler nothing larger to requeue it on. `None` when
-/// nothing qualifies, so a worker under pressure from something other than
-/// its actions kills nothing.
+/// Selects the furthest over reservation, or the largest sampled action if
+/// none is over. Already-killing and unsampled actions are excluded.
 pub fn pick_pressure_victim<T>(
     candidates: impl IntoIterator<Item = PressureCandidate<T>>,
-    whole_worker_kb: Option<u64>,
 ) -> Option<T> {
-    let eligible: Vec<PressureCandidate<T>> = candidates
+    candidates
         .into_iter()
         .filter(|c| c.last_kb > 0 && !c.kill_requested)
-        .filter(|c| {
-            !whole_worker_kb.is_some_and(|whole_kb| whole_kb > 0 && c.reserved_kb >= whole_kb)
+        .max_by_key(|c| {
+            let excess = c.last_kb.saturating_sub(c.reserved_kb);
+            (excess > 0, if excess > 0 { excess } else { c.last_kb })
         })
-        .collect();
-    let furthest_over = eligible
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.last_kb > c.reserved_kb)
-        .max_by_key(|(_, c)| c.last_kb - c.reserved_kb)
-        .map(|(index, _)| index);
-    let index = furthest_over.or_else(|| {
-        eligible
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, c)| c.last_kb)
-            .map(|(index, _)| index)
-    })?;
-    eligible.into_iter().nth(index).map(|c| c.item)
+        .map(|c| c.item)
 }
 
-/// Decides when sustained memory pressure becomes a kill: `observe` is
-/// handed each `memory.pressure` `full avg10` reading and answers true
-/// once the reading has stayed at or above the threshold for `after`.
-/// A reading under the threshold starts over, and so does a kill, so the
-/// next one waits a whole window again while the freed memory takes
-/// effect.
+/// Tracks a continuous interval above a threshold, resetting after a kill
+/// or a reading below the threshold.
 #[derive(Debug, Clone, Copy)]
 pub struct PressureWindow {
     threshold_percent: f64,
@@ -395,8 +418,8 @@ impl PressureWindow {
         }
     }
 
-    pub fn observe(&mut self, full_avg10_percent: f64, now: Instant) -> bool {
-        if full_avg10_percent < self.threshold_percent {
+    pub fn observe(&mut self, value: f64, now: Instant) -> bool {
+        if value < self.threshold_percent {
             self.over_since = None;
             return false;
         }
@@ -409,39 +432,22 @@ impl PressureWindow {
     }
 }
 
-/// How often the worker reads its cgroup's `memory.pressure`.
-#[cfg(target_os = "linux")]
-const MEMORY_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
-
-/// A PSI percentage as a whole number for the kill's message: clamped to
-/// 0 to 100 first, so the cast cannot truncate or lose a sign.
-#[cfg(target_os = "linux")]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-const fn whole_percent(value: f64) -> u64 {
-    value.clamp(0.0, 100.0).round() as u64
-}
-
-/// The ceilings the sampler enforces. Memory: two consecutive samples over
-/// `memory_limit_kb`, or one at twice it. Disk: one sample of the action's
-/// own files over `disk_limit_kb`. The first breach is sent on
-/// `over_limit_tx` and the caller kills the action; nothing is sent when no
-/// ceiling is set, and the caller keeps the sender alive so the receiver
-/// stays pending.
+/// Per-action soft ceilings and sampling intervals. The first breach is sent
+/// on `over_limit_tx`; without a ceiling its sender remains pending.
 #[cfg(target_os = "linux")]
 struct Ceilings {
     memory_limit_kb: Option<u64>,
     disk_limit_kb: Option<u64>,
     disk_pressure_sampling: bool,
+    memory_soft_samples: u32,
+    memory_soft_spike_percent: u64,
+    disk_soft_samples: u32,
+    memory_sample_interval: Duration,
+    disk_sample_interval: Duration,
     over_limit_tx: Option<oneshot::Sender<OverLimit>>,
     /// Where each sample is published and where a pressure kill arrives.
     watch: Arc<ActionMemoryWatch>,
 }
-
-/// One disk sample every this many memory samples: a walk of the action
-/// directory is a stat per file, so it runs every ten seconds, not four
-/// times a second.
-#[cfg(target_os = "linux")]
-const DISK_SAMPLE_EVERY: u32 = 40;
 
 #[cfg(target_os = "linux")]
 fn start_action_resource_usage_sampler(
@@ -603,7 +609,9 @@ async fn sample_action_resource_usage(
     let mut last_memory_kb = 0;
     let mut peak_disk_kb = 0;
     let mut samples_over_limit = 0u32;
-    let mut samples_since_disk = DISK_SAMPLE_EVERY;
+    let mut disk_samples_over_limit = 0u32;
+    let mut next_disk_sample = Instant::now();
+    let mut next_memory_sample = Instant::now();
     // The walk in flight, if one is; polled, never awaited, from the loop.
     let mut disk_sample: Option<JoinHandleDropGuard<u64>> = None;
     // CPU time is cumulative per process and a process that exits stops
@@ -617,7 +625,9 @@ async fn sample_action_resource_usage(
     let mut baseline_ticks: Option<u64> = None;
 
     let sample = |peak_memory_kb: &mut u64, cpu_ticks_by_pid: &mut HashMap<u32, u64>| {
-        let observed = sample_process_group(pgid, &ceilings.watch, cpu_ticks_by_pid);
+        let exact = ceilings.watch.sample_cgroup();
+        let pss = sample_process_group(pgid, &ceilings.watch, cpu_ticks_by_pid, exact.is_none());
+        let observed = exact.or(pss);
         if let Some(memory_kb) = observed {
             *peak_memory_kb = (*peak_memory_kb).max(memory_kb);
         }
@@ -625,7 +635,14 @@ async fn sample_action_resource_usage(
     };
 
     loop {
-        let observed = sample(&mut peak_memory_kb, &mut cpu_ticks_by_pid);
+        let now = Instant::now();
+        let sample_memory = now >= next_memory_sample;
+        let observed = if sample_memory {
+            next_memory_sample = now + ceilings.memory_sample_interval;
+            sample(&mut peak_memory_kb, &mut cpu_ticks_by_pid)
+        } else {
+            None
+        };
         if baseline_ticks.is_none() {
             baseline_ticks = Some(cpu_ticks_by_pid.values().sum());
         }
@@ -636,24 +653,21 @@ async fn sample_action_resource_usage(
                 .last_memory_kb
                 .store(memory_kb, Ordering::Relaxed);
         }
-        if observed.is_none() && !Path::new(&format!("/proc/{pgid}")).exists() {
+        if sample_memory && observed.is_none() && !Path::new(&format!("/proc/{pgid}")).exists() {
             // The group leader has been reaped and no member process remains,
             // so the action is finished.
             break;
         }
-        // Two consecutive samples over the ceiling, so one spike between
-        // reads is not a kill; one sample at twice the ceiling is, because
-        // an allocation that fast reaches the pod's limit before the next
-        // read (observed: twelve 20 GiB allocators filled a 52 GiB pod in
-        // under a second).
+        // Soft enforcement uses its own configured sample and spike thresholds.
         if let (Some(observed_kb), Some(limit_kb)) = (observed, ceilings.memory_limit_kb) {
             if observed_kb > limit_kb {
-                samples_over_limit += 1;
+                samples_over_limit = samples_over_limit.saturating_add(1);
             } else {
                 samples_over_limit = 0;
             }
-            let gross = observed_kb >= limit_kb.saturating_mul(2);
-            if (samples_over_limit >= 2 || gross)
+            let gross = u128::from(observed_kb) * 100
+                > u128::from(limit_kb) * u128::from(ceilings.memory_soft_spike_percent);
+            if (samples_over_limit >= ceilings.memory_soft_samples || gross)
                 && let Some(over_limit_tx) = ceilings.over_limit_tx.take()
                 && over_limit_tx.send(OverLimit::Memory(observed_kb)).is_err()
             {
@@ -663,16 +677,16 @@ async fn sample_action_resource_usage(
         }
         // The worker-wide monitor chose this action under sustained memory
         // pressure; the kill goes the way a ceiling breach does.
-        let full_avg10_percent = ceilings
+        let stall_percent = ceilings
             .watch
             .kill_requested_percent
             .load(Ordering::Relaxed);
-        if full_avg10_percent > 0
+        if stall_percent > 0
             && let Some(over_limit_tx) = ceilings.over_limit_tx.take()
             && over_limit_tx
                 .send(OverLimit::MemoryPressure {
                     observed_kb: last_memory_kb,
-                    full_avg10_percent,
+                    stall_percent,
                 })
                 .is_err()
         {
@@ -706,8 +720,12 @@ async fn sample_action_resource_usage(
                     .watch
                     .last_disk_kb
                     .store(disk_kb, Ordering::Relaxed);
-                if let Some(limit_kb) = ceilings.disk_limit_kb
-                    && disk_kb > limit_kb
+                if ceilings.disk_limit_kb.is_some_and(|limit| disk_kb > limit) {
+                    disk_samples_over_limit = disk_samples_over_limit.saturating_add(1);
+                } else {
+                    disk_samples_over_limit = 0;
+                }
+                if disk_samples_over_limit >= ceilings.disk_soft_samples
                     && let Some(over_limit_tx) = ceilings.over_limit_tx.take()
                     && over_limit_tx.send(OverLimit::Disk(disk_kb)).is_err()
                 {
@@ -717,12 +735,11 @@ async fn sample_action_resource_usage(
         }
         // The periodic walk belongs to the soft limit; the guard alone
         // measures once, at the end, and pays no walk while running.
-        samples_since_disk += 1;
         if (ceilings.disk_limit_kb.is_some() || ceilings.disk_pressure_sampling)
-            && samples_since_disk >= DISK_SAMPLE_EVERY
+            && now >= next_disk_sample
             && disk_sample.is_none()
         {
-            samples_since_disk = 0;
+            next_disk_sample = now + ceilings.disk_sample_interval;
             disk_sample = start_disk_sample(disk_directory.as_ref());
         }
 
@@ -739,7 +756,7 @@ async fn sample_action_resource_usage(
                     break;
                 }
             }
-            () = tokio::time::sleep(RESOURCE_USAGE_SAMPLE_INTERVAL) => {}
+            () = tokio::time::sleep(ceilings.memory_sample_interval.min(ceilings.disk_sample_interval)) => {}
         }
     }
     // What the action left on disk at the end is the figure that matters
@@ -910,6 +927,7 @@ fn sample_process_group(
     pgid: u32,
     watch: &ActionMemoryWatch,
     cpu_ticks_by_pid: &mut HashMap<u32, u64>,
+    sample_memory: bool,
 ) -> Option<u64> {
     let table = live_process_table();
     let entries: Vec<ProcEntry> = table.iter().map(|(entry, _)| *entry).collect();
@@ -932,7 +950,7 @@ fn sample_process_group(
             let slot = cpu_ticks_by_pid.entry(entry.pid).or_insert(0);
             *slot = (*slot).max(ticks);
         }
-        if let Some(memory_kb) = read_process_memory_kb(entry.pid) {
+        if sample_memory && let Some(memory_kb) = read_process_memory_kb(entry.pid) {
             total_kb += memory_kb;
             found_any_process = true;
         }
@@ -1029,6 +1047,8 @@ enum SideChannelFailureReason {
 struct SideChannelInfo {
     /// If the task should be considered a failure and why.
     failure: Option<SideChannelFailureReason>,
+    /// Kernel high-water mark, in KiB, when available.
+    peak_memory_kb: Option<u64>,
 }
 
 enum SideChannelReport {
@@ -2623,7 +2643,7 @@ async fn process_side_channel_file(
     side_channel_file: Cow<'_, OsStr>,
     args: &[&OsStr],
     timeout: Duration,
-) -> Result<Option<SideChannelReport>, Error> {
+) -> Result<(Option<SideChannelReport>, Option<u64>), Error> {
     let mut json_contents = String::new();
     {
         // Note: Scoping `file_slot` allows the file_slot semaphore to be released faster.
@@ -2634,7 +2654,7 @@ async fn process_side_channel_file(
                     return Err(e).err_tip(|| "Error opening side channel file");
                 }
                 // Note: If file does not exist, it's ok. Users are not required to create this file.
-                return Ok(None);
+                return Ok((None, None));
             }
         };
         file_slot
@@ -2646,7 +2666,7 @@ async fn process_side_channel_file(
     let side_channel_info: SideChannelInfo = serde_json5::from_str(&json_contents)
         .map_err(Error::from)
         .err_tip(|| "Could not convert contents of side channel file (json) to SideChannelInfo")?;
-    Ok(side_channel_info.failure.map(|failure| match failure {
+    let report = side_channel_info.failure.map(|failure| match failure {
         SideChannelFailureReason::Timeout => {
             let join_args = args.join(OsStr::new(" "));
             let command = join_args.to_string_lossy();
@@ -2661,7 +2681,8 @@ async fn process_side_channel_file(
             ))
         }
         SideChannelFailureReason::Memory => SideChannelReport::Memory,
-    }))
+    });
+    Ok((report, side_channel_info.peak_memory_kb))
 }
 
 async fn do_cleanup(
@@ -2717,6 +2738,20 @@ async fn do_cleanup(
             }
         }
     };
+    let side_dir = Path::new(&running_actions_manager.root_action_directory)
+        .join(".side_channels")
+        .join(operation_id.to_string());
+    let side_result = match tokio::fs::remove_dir_all(&side_dir).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::from(err)).err_tip(|| {
+            format!(
+                "Could not remove side channel directory {}",
+                side_dir.display()
+            )
+        }),
+    };
+    let remove_dir_result = remove_dir_result.merge(side_result);
 
     if let Err(err) = running_actions_manager.cleanup_action(operation_id) {
         error!(%operation_id, ?err, "Error cleaning up action");
@@ -2985,12 +3020,12 @@ impl RunningActionImpl {
     }
 
     /// Asks the action's sampler to end it for worker memory pressure,
-    /// naming the `full avg10` percent that chose it (never 0). Takes
+    /// naming the configured interval stall threshold (never 0). Takes
     /// effect on the sampler's next pass; a second request changes nothing.
-    pub fn request_memory_pressure_kill(&self, full_avg10_percent: u64) {
+    pub fn request_memory_pressure_kill(&self, stall_percent: u64) {
         self.memory_watch
             .kill_requested_percent
-            .store(full_avg10_percent.max(1), Ordering::Relaxed);
+            .store(stall_percent.max(1), Ordering::Relaxed);
     }
 
     /// Ask the sampler to kill this action under worker disk pressure.
@@ -3466,7 +3501,7 @@ impl RunningActionImpl {
         command_proto: &ProtoCommand,
         requested_timeout: Duration,
         mut per_action: Option<&mut Option<Cow<'_, OsStr>>>,
-    ) -> BTreeMap<String, String> {
+    ) -> Result<BTreeMap<String, String>, Error> {
         let mut env = BTreeMap::new();
         if let Some(additional_environment) = &self
             .running_actions_manager
@@ -3493,8 +3528,18 @@ impl RunningActionImpl {
                         let Some(side_channel_file) = per_action.as_mut() else {
                             continue;
                         };
-                        let file = format!("{}/{}", self.action_directory, Uuid::new_v4().simple());
-                        **side_channel_file = Some(Cow::Owned(file.clone().into()));
+                        let root = Path::new(&self.running_actions_manager.root_action_directory)
+                            .canonicalize()
+                            .err_tip(|| "Canonicalizing side channel root")?;
+                        let path = root
+                            .join(".side_channels")
+                            .join(self.operation_id.to_string())
+                            .join("report");
+                        let file = path
+                            .to_str()
+                            .err_tip(|| "Side channel path is not UTF-8")?
+                            .to_owned();
+                        **side_channel_file = Some(Cow::Owned(path.into_os_string()));
                         file
                     }
                     EnvironmentSource::ActionDirectory => {
@@ -3521,7 +3566,7 @@ impl RunningActionImpl {
                 env.insert("PATH".to_string(), "C:\\Windows\\System32".to_string());
             }
         }
-        env
+        Ok(env)
     }
 
     /// What the scheduler's kill leaves behind for a pooled action, whether
@@ -3620,7 +3665,7 @@ impl RunningActionImpl {
                     // belong to one action: a process that serves many
                     // cannot carry a timeout, a side channel file or an
                     // action directory.
-                    let env = self.action_environment(&command_proto, requested_timeout, None);
+                    let env = self.action_environment(&command_proto, requested_timeout, None)?;
                     let key = WorkerKey::from_argv(&command_argv, wire_format)?
                         .with_env(env.into_iter().collect());
                     let request = WorkRequest {
@@ -3685,6 +3730,18 @@ impl RunningActionImpl {
                                         memory_limit_kb: None,
                                         disk_limit_kb: None,
                                         disk_pressure_sampling: false,
+                                        memory_soft_samples: 2,
+                                        memory_soft_spike_percent: 200,
+                                        disk_soft_samples: 1,
+                                        memory_sample_interval: self
+                                            .running_actions_manager
+                                            .execution_configuration
+                                            .resource_enforcement
+                                            .as_ref()
+                                            .map_or(RESOURCE_USAGE_SAMPLE_INTERVAL, |e| {
+                                                e.memory_sample_interval
+                                            }),
+                                        disk_sample_interval: Duration::from_secs(10),
                                         over_limit_tx: None,
                                         // A detached watch: the process
                                         // outlives this action and serves
@@ -3852,8 +3909,43 @@ impl RunningActionImpl {
             &command_proto,
             requested_timeout,
             Some(&mut maybe_side_channel_file),
-        ) {
+        )? {
             command_builder.env(name, value);
+        }
+        if let Some(side_channel_file) = &maybe_side_channel_file {
+            let report = Path::new(&**side_channel_file);
+            let side_dir = report
+                .parent()
+                .err_tip(|| "Side channel report has no parent")?;
+            let side_root = side_dir
+                .parent()
+                .err_tip(|| "Side channel directory has no parent")?;
+            let metadata = tokio::fs::symlink_metadata(side_root)
+                .await
+                .err_tip(|| format!("Reading side channel root {}", side_root.display()))?;
+            if !metadata.is_dir() {
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "side channel root is not a directory"
+                ));
+            }
+            #[cfg(target_family = "unix")]
+            if metadata.permissions().mode() & 0o777 != 0o700 {
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "side channel root must have mode 0700"
+                ));
+            }
+            #[cfg(target_family = "unix")]
+            let mut builder = tokio::fs::DirBuilder::new();
+            #[cfg(not(target_family = "unix"))]
+            let builder = tokio::fs::DirBuilder::new();
+            #[cfg(target_family = "unix")]
+            builder.mode(0o700);
+            builder
+                .create(side_dir)
+                .await
+                .err_tip(|| format!("Creating side channel directory {}", side_dir.display()))?;
         }
 
         // Sandboxing of the command if we are running on Linux, this resolves issues where
@@ -3923,6 +4015,27 @@ impl RunningActionImpl {
             .err_tip(|| format!("Could not execute command {args:?}"))?;
         // Ours until the wait below collects it; the reaper leaves it alone.
         let _owned_child = crate::reaper::OwnedChild::new(child_process.id());
+        #[cfg(target_os = "linux")]
+        if let (Some(pid), Some(report), Some(pool)) = (
+            child_process.id(),
+            maybe_side_channel_file.as_ref(),
+            self.running_actions_manager
+                .execution_configuration
+                .resource_enforcement
+                .as_ref()
+                .and_then(|enforcement| enforcement.memory_pool_path.as_ref()),
+        ) && let Some(start) = crate::action_cgroup::process_start(pid)
+        {
+            let mut metadata = report.to_os_string();
+            metadata.push(".cgroup");
+            *self.memory_watch.cgroup.lock() = Some(crate::action_cgroup::Source {
+                metadata: PathBuf::from(metadata),
+                pool: pool.clone(),
+                pid,
+                start,
+                scope: None,
+            });
+        }
         let stdout_reader = child_process
             .stdout
             .take()
@@ -3999,7 +4112,15 @@ impl RunningActionImpl {
         let mut over_limit_keepalive = Some(over_limit_tx);
         #[cfg(target_os = "linux")]
         let mut maybe_resource_usage_sampler = child_process.id().map(|pgid| {
-            let memory_limit_kb = memory_reservation.map(|(_, limit_kb)| limit_kb);
+            let enforcement = self
+                .running_actions_manager
+                .execution_configuration
+                .resource_enforcement
+                .as_ref();
+            let memory = enforcement.and_then(|e| e.memory.as_ref());
+            let memory_limit_kb = memory
+                .filter(|m| m.soft)
+                .and(memory_reservation.map(|(_, limit)| limit));
             let disk_limit_kb = disk_enforcement.and_then(|(_, limit_kb)| limit_kb);
             let pressure_kill_armed = self
                 .running_actions_manager
@@ -4032,6 +4153,13 @@ impl RunningActionImpl {
                         .resource_enforcement
                         .as_ref()
                         .is_some_and(|e| e.disk_pressure_kill.is_some()),
+                    memory_soft_samples: memory.map_or(2, |m| m.soft_samples),
+                    memory_soft_spike_percent: memory.map_or(200, |m| m.soft_spike_percent),
+                    disk_soft_samples: enforcement.map_or(1, |e| e.disk_soft_samples),
+                    memory_sample_interval: enforcement
+                        .map_or(RESOURCE_USAGE_SAMPLE_INTERVAL, |e| e.memory_sample_interval),
+                    disk_sample_interval: enforcement
+                        .map_or(Duration::from_secs(10), |e| e.disk_sample_interval),
                     over_limit_tx,
                     watch: self.memory_watch.clone(),
                 },
@@ -4046,7 +4174,9 @@ impl RunningActionImpl {
         // before the guard owns the child.
         #[cfg(target_family = "unix")]
         let action_pgid = child_process.id();
-        let mut child_process_guard = guard(child_process, |mut child_process| {
+        let cgroup_killed = Arc::new(AtomicBool::new(false));
+        let guard_cgroup_killed = cgroup_killed.clone();
+        let mut child_process_guard = guard(child_process, move |mut child_process| {
             let result: Result<Option<std::process::ExitStatus>, std::io::Error> =
                 child_process.try_wait();
             match result {
@@ -4059,6 +4189,13 @@ impl RunningActionImpl {
                         "Child process was not cleaned up before dropping the call to execute(), killing in background spawn."
                     );
                     background_spawn!("running_actions_manager_kill_child_process", async move {
+                        #[cfg(target_os = "linux")]
+                        if guard_cgroup_killed.load(Ordering::Acquire) {
+                            drop(child_process.kill_pid().await);
+                            return;
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = guard_cgroup_killed;
                         drop(child_process.kill().await);
                     });
                 }
@@ -4096,6 +4233,7 @@ impl RunningActionImpl {
             .await
         });
         let mut kill_reason: Option<KillReason> = None;
+        let mut disk_peak_at_kill = None;
         let kill_grace = self
             .running_actions_manager
             .execution_configuration
@@ -4109,7 +4247,7 @@ impl RunningActionImpl {
         let mut sleep_fut = (self.running_actions_manager.callbacks.sleep_fn)(self.timeout).fuse();
         loop {
             tokio::select! {
-                () = &mut sleep_fut => {
+                () = &mut sleep_fut, if kill_reason.is_none() => {
                     self.running_actions_manager.metrics.task_timeouts.inc();
                     kill_reason = Some(KillReason::Timeout);
                     grace_fut = stop_action(&mut child_process_guard, &self.memory_watch, kill_grace, "action timeout").await;
@@ -4139,14 +4277,25 @@ impl RunningActionImpl {
                         grace_ms = kill_grace.as_millis(),
                         "Action did not leave on SIGTERM within its grace period, sending SIGKILL"
                     );
+                    #[cfg(target_os = "linux")]
+                    if cgroup_killed.load(Ordering::Acquire) {
+                        if let Err(err) = child_process_guard.kill_pid().await {
+                            error!(?err, "could not kill stuck wrapper");
+                        }
+                    } else {
+                        hard_kill(&mut child_process_guard, &self.memory_watch, "grace period expired").await;
+                    }
+                    #[cfg(not(target_os = "linux"))]
                     hard_kill(&mut child_process_guard, &self.memory_watch, "grace period expired").await;
                 },
                 Ok(over_limit) = &mut over_limit_fut => match over_limit {
                     OverLimit::Disk(observed_kb) => {
                         self.running_actions_manager.metrics.disk_reservation_kills.inc();
                         kill_reason = Some(KillReason::Disk);
-                        // The files are still being written; no grace here.
-                        hard_kill(&mut child_process_guard, &self.memory_watch, "disk reservation").await;
+                        disk_peak_at_kill = Some(observed_kb);
+                        let (used_cgroup, grace) = resource_kill(&mut child_process_guard, &self.memory_watch, kill_grace, &cgroup_killed, "disk reservation").await;
+                        cgroup_killed.store(used_cgroup, Ordering::Release);
+                        grace_fut = grace;
                         let (reserved_kb, limit_kb) = disk_enforcement
                             .map_or((0, 0), |(reserved_kb, limit_kb)| {
                                 (reserved_kb, limit_kb.unwrap_or(0))
@@ -4178,7 +4327,10 @@ impl RunningActionImpl {
                     OverLimit::DiskPressure { observed_kb, free_percent } => {
                         self.running_actions_manager.metrics.disk_pressure_kills.inc();
                         kill_reason = Some(KillReason::Disk);
-                        hard_kill(&mut child_process_guard, &self.memory_watch, "disk pressure").await;
+                        disk_peak_at_kill = Some(observed_kb);
+                        let (used_cgroup, grace) = resource_kill(&mut child_process_guard, &self.memory_watch, kill_grace, &cgroup_killed, "disk pressure").await;
+                        cgroup_killed.store(used_cgroup, Ordering::Release);
+                        grace_fut = grace;
                         let reserved_kb = disk_enforcement.map_or(0, |(reserved_kb, _)| reserved_kb);
                         let after_s = self.running_actions_manager.execution_configuration.resource_enforcement.as_ref()
                             .and_then(|e| e.disk_pressure_kill).map_or(0, |p| p.after.as_secs());
@@ -4196,8 +4348,9 @@ impl RunningActionImpl {
                     OverLimit::Memory(observed_kb) => {
                         self.running_actions_manager.metrics.memory_reservation_kills.inc();
                         kill_reason = Some(KillReason::Memory);
-                        // Memory is still growing; no grace here.
-                        hard_kill(&mut child_process_guard, &self.memory_watch, "memory reservation").await;
+                        let (used_cgroup, grace) = resource_kill(&mut child_process_guard, &self.memory_watch, kill_grace, &cgroup_killed, "memory reservation").await;
+                        cgroup_killed.store(used_cgroup, Ordering::Release);
+                        grace_fut = grace;
                         let (reserved_kb, limit_kb) = memory_reservation.unwrap_or((0, 0));
                         let (property, headroom) = self
                             .running_actions_manager
@@ -4224,11 +4377,12 @@ impl RunningActionImpl {
                         )));
 
                     }
-                    OverLimit::MemoryPressure { observed_kb, full_avg10_percent } => {
+                    OverLimit::MemoryPressure { observed_kb, stall_percent } => {
                         self.running_actions_manager.metrics.memory_pressure_kills.inc();
                         kill_reason = Some(KillReason::Memory);
-                        // The worker is thrashing; no grace here either.
-                        hard_kill(&mut child_process_guard, &self.memory_watch, "memory pressure").await;
+                        let (used_cgroup, grace) = resource_kill(&mut child_process_guard, &self.memory_watch, kill_grace, &cgroup_killed, "memory pressure").await;
+                        cgroup_killed.store(used_cgroup, Ordering::Release);
+                        grace_fut = grace;
                         let reserved_kb = memory_reservation.map_or(0, |(reserved_kb, _)| reserved_kb);
                         let after_s = self
                             .running_actions_manager
@@ -4241,7 +4395,7 @@ impl RunningActionImpl {
                             operation_id = ?self.operation_id,
                             reserved_kb,
                             observed_kb,
-                            full_avg10_percent,
+                            stall_percent,
                             "Action killed under sustained worker memory pressure"
                         );
                         let why = if observed_kb > reserved_kb {
@@ -4259,14 +4413,15 @@ impl RunningActionImpl {
                         state.error = Error::merge_option(state.error.take(), Some(Error::new(
                             Code::FailedPrecondition,
                             format!(
-                                "Action was killed under worker memory pressure: the worker's cgroup spent \
-                                 {full_avg10_percent}% of the last 10 s with every task stalled on memory for {after_s} s, \
+                                "Action was killed under worker memory pressure: stall exceeded \
+                                 {stall_percent}% for {after_s} s, \
                                  and {why}"
                             ),
                         )));
                     }
                 },
                 maybe_exit_status = child_process_guard.wait() => {
+                    self.memory_watch.finished_or_killing.store(true, Ordering::Release);
                     // Defuse our guard so it does not try to cleanup and make senseless logs.
                     drop(ScopeGuard::<_, _>::into_inner(child_process_guard));
                     drop(over_limit_keepalive.take());
@@ -4285,7 +4440,7 @@ impl RunningActionImpl {
                     // the action would sit here until its timeout. The
                     // sandboxes Bazel runs locally end them the same way.
                     #[cfg(target_family = "unix")]
-                    let had_stragglers = action_pgid
+                    let had_stragglers = !cgroup_killed.load(Ordering::Acquire) && action_pgid
                         .is_some_and(|pgid| signal_action(pgid, &self.memory_watch, libc::SIGKILL));
                     #[cfg(not(target_family = "unix"))]
                     let had_stragglers = false;
@@ -4331,12 +4486,16 @@ impl RunningActionImpl {
                     #[cfg(not(target_os = "linux"))]
                     let sampled_usage = SampledResourceUsage::default();
 
-                    let side_channel_report = if let Some(side_channel_file) = maybe_side_channel_file {
+                    let (side_channel_report, reported_peak_memory_kb) = if let Some(side_channel_file) = maybe_side_channel_file {
                         process_side_channel_file(side_channel_file.clone(), &args, requested_timeout).await
                             .err_tip(|| format!("Error processing side channel file: {}", side_channel_file.display()))?
                     } else {
-                        None
+                        (None, None)
                     };
+                    #[cfg(target_os = "linux")]
+                    let kernel_peak_memory_kb = *self.memory_watch.kernel_peak_kb.lock();
+                    #[cfg(not(target_os = "linux"))]
+                    let kernel_peak_memory_kb: Option<u64> = None;
 
                     let memory_limit_kb = memory_reservation
                         .map(|(_, limit_kb)| limit_kb)
@@ -4406,17 +4565,17 @@ impl RunningActionImpl {
                         });
                     let fetched_input = self.state.lock().input_bytes;
                     let resource_usage = Some(ActionResourceUsage {
-                        peak_memory_kb: sampled_usage.peak_memory_kb,
+                        peak_memory_kb: reported_peak_memory_kb.or(kernel_peak_memory_kb).unwrap_or(sampled_usage.peak_memory_kb),
                         cpu_time_ms: sampled_usage.cpu_time_ms,
                         // An action too short to catch a sample leaves both at
                         // zero; say so rather than report a misleading zero.
-                        sampled: sampled_usage.peak_memory_kb > 0
+                        sampled: reported_peak_memory_kb.is_some() || kernel_peak_memory_kb.is_some() || sampled_usage.peak_memory_kb > 0
                             || sampled_usage.cpu_time_ms > 0
                             || sampled_usage.peak_disk_kb > 0,
                         operation_id: String::new(),
                         worker_id: String::new(),
                         wall_time_ms: u64::try_from(execution_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        peak_disk_kb: sampled_usage.peak_disk_kb,
+                        peak_disk_kb: disk_peak_at_kill.unwrap_or(sampled_usage.peak_disk_kb),
                         outcome: outcome.into(),
                         enforced,
                         reserved: reservation_of(
@@ -4455,7 +4614,7 @@ impl RunningActionImpl {
                     }
                     return Ok(self);
                 },
-                _ = &mut kill_channel_rx => {
+                _ = &mut kill_channel_rx, if kill_reason.is_none() => {
                     kill_reason = Some(KillReason::External);
                     grace_fut = stop_action(&mut child_process_guard, &self.memory_watch, kill_grace, "scheduler kill").await;
                     {
@@ -5182,12 +5341,8 @@ impl Debug for Callbacks {
 /// axis is on or off on its own; the value exists when at least one is on.
 #[derive(Debug, Clone)]
 pub struct ResourceEnforcement {
-    /// Soft memory enforcement: the worker kills an action whose process
-    /// group grows past its reservation plus headroom. Linux only; the
-    /// sampler that measures it does not exist elsewhere. An action run
-    /// through a persistent worker is not covered: that process outlives
-    /// the action and serves others, so its memory is no one action's
-    /// reservation, and only the pod's limit bounds it.
+    /// Memory reservation and optional soft ceiling. Pressure mode retains
+    /// the reservation for victim selection without enforcing a ceiling.
     pub memory: Option<MemoryLimit>,
     /// Refuse an action whose disk reservation, under this property, is
     /// more than the free space under the work directory less what the
@@ -5198,6 +5353,14 @@ pub struct ResourceEnforcement {
     /// `disk_headroom_percent`.
     pub disk_soft: bool,
     pub disk_headroom_percent: u64,
+    /// Per-action memory sampling interval.
+    pub memory_sample_interval: Duration,
+    /// Per-action disk walk interval.
+    pub disk_sample_interval: Duration,
+    /// Consecutive disk soft-ceiling violations required for a kill.
+    pub disk_soft_samples: u32,
+    /// Absolute cgroup path for the worker's action pool, when available.
+    pub memory_pool_path: Option<PathBuf>,
     /// Kill the action holding the most memory when the worker's cgroup
     /// stays under memory pressure; `None` leaves a thrashing worker alone.
     pub pressure_kill: Option<PressureKill>,
@@ -5208,90 +5371,77 @@ pub struct ResourceEnforcement {
 /// When sustained memory pressure on the worker's cgroup kills an action.
 #[derive(Debug, Clone, Copy)]
 pub struct PressureKill {
-    /// `memory.pressure` `full avg10` at or above this value (0 to 100) counts.
-    pub full_avg10_percent: u64,
+    /// Share of elapsed time stalled on memory.
+    pub stall_percent: u32,
+    /// Delay between PSI reads.
+    pub poll_interval: Duration,
     /// For this long without a break.
     pub after: Duration,
-    /// The largest memory reservation the worker advertises; an action
-    /// holding it is never the victim. `None` falls back to the cgroup limit.
-    pub largest_reservation_kb: Option<u64>,
 }
 
 /// When sustained low free space kills an action.
 #[derive(Debug, Clone, Copy)]
 pub struct DiskPressureKill {
+    /// Free-space threshold in percent.
     pub free_percent: u32,
+    /// Sustained pressure duration.
     pub after: Duration,
+    /// Delay between filesystem checks.
+    pub poll_interval: Duration,
 }
 
-/// The reservation a memory ceiling is built from.
+/// Memory reservation and its optional soft-ceiling policy.
 #[derive(Debug, Clone)]
 pub struct MemoryLimit {
     /// Platform property carrying the reservation in KiB.
     pub property_name: String,
     /// Percent above the reservation the action may reach.
     pub headroom_percent: u64,
+    /// Whether the soft ceiling is enforced.
+    pub soft: bool,
+    /// Consecutive over-ceiling samples required.
+    pub soft_samples: u32,
+    /// Percentage of the ceiling at which a single sample triggers a kill.
+    pub soft_spike_percent: u64,
 }
 
 impl ResourceEnforcement {
-    /// From the worker's configuration. `None` when neither axis is on;
-    /// `disk: guard` alone is honoured as much as `memory: soft` alone.
+    /// Construct runtime enforcement from validated worker configuration.
     pub fn from_config(config: &ResourceEnforcementConfig) -> Option<Self> {
-        let memory = match config.memory {
-            MemoryEnforcement::None => None,
-            MemoryEnforcement::Soft => Some(MemoryLimit {
-                property_name: config.memory_property_name.clone(),
-                headroom_percent: config.memory_headroom_percent,
-            }),
-        };
+        let memory = (config.memory != MemoryEnforcement::None).then(|| MemoryLimit {
+            property_name: config.memory_property_name.clone(),
+            headroom_percent: config.memory_headroom_percent,
+            soft: config.memory == MemoryEnforcement::Soft,
+            soft_samples: config.memory_soft_samples,
+            soft_spike_percent: config.memory_soft_spike_percent,
+        });
         let disk_property_name =
             (config.disk != DiskEnforcement::None).then(|| config.disk_property_name.clone());
-        if config.memory_pressure_kill_percent > 100 {
-            warn!(
-                memory_pressure_kill_percent = config.memory_pressure_kill_percent,
-                "memory_pressure_kill_percent is over 100; using 100"
-            );
-        }
-        if config.memory_pressure_kill_percent > 0 && config.memory_pressure_kill_after_s == 0 {
-            warn!("memory_pressure_kill_after_s is 0; using 1");
-        }
-        let pressure_kill = (config.memory_pressure_kill_percent > 0).then(|| PressureKill {
-            full_avg10_percent: config.memory_pressure_kill_percent.min(100),
-            after: Duration::from_secs(config.memory_pressure_kill_after_s.max(1)),
-            largest_reservation_kb: None,
-        });
-        if pressure_kill.is_some() && memory.is_none() {
-            warn!(
-                "memory_pressure_kill_percent is set with memory: none; the pressure kill needs memory: soft and stays off"
-            );
-        }
-        let pressure_kill = pressure_kill.filter(|_| memory.is_some());
-        if config.disk_pressure_free_percent > 100 {
-            warn!("disk_pressure_free_percent is over 100; using 100");
-        }
-        if config.disk == DiskEnforcement::Pressure && config.disk_pressure_free_percent == 0 {
-            warn!("disk_pressure_free_percent is 0; disk pressure kill stays off");
-        }
-        if config.disk == DiskEnforcement::None && config.disk_pressure_free_percent > 0 {
-            warn!("disk pressure kill requires disk: pressure; it stays off");
-        }
-        if config.disk == DiskEnforcement::Pressure && config.disk_pressure_kill_after_s == 0 {
-            warn!("disk_pressure_kill_after_s is 0; using 1");
-        }
-        let disk_pressure_kill = (config.disk == DiskEnforcement::Pressure
-            && config.disk_pressure_free_percent > 0)
-            .then(|| DiskPressureKill {
-                free_percent: config.disk_pressure_free_percent.min(100),
-                after: Duration::from_secs(config.disk_pressure_kill_after_s.max(1)),
+        let pressure_kill =
+            (config.memory == MemoryEnforcement::Pressure).then_some(PressureKill {
+                stall_percent: config.memory_pressure_stall_percent,
+                poll_interval: Duration::from_millis(config.memory_pressure_poll_interval_ms),
+                after: Duration::from_millis(config.memory_pressure_kill_after_ms),
             });
-        (memory.is_some() || disk_property_name.is_some()).then_some(Self {
-            memory,
-            disk_property_name,
-            disk_soft: config.disk == DiskEnforcement::Soft,
-            disk_headroom_percent: config.disk_headroom_percent,
-            pressure_kill,
-            disk_pressure_kill,
-        })
+        let disk_pressure_kill =
+            (config.disk == DiskEnforcement::Pressure).then_some(DiskPressureKill {
+                free_percent: config.disk_pressure_free_percent,
+                poll_interval: Duration::from_millis(config.disk_pressure_poll_interval_ms),
+                after: Duration::from_millis(config.disk_pressure_kill_after_ms),
+            });
+        (memory.is_some() || disk_property_name.is_some() || config.memory_pool_path.is_some())
+            .then_some(Self {
+                memory,
+                disk_property_name,
+                disk_soft: config.disk == DiskEnforcement::Soft,
+                disk_headroom_percent: config.disk_headroom_percent,
+                memory_sample_interval: Duration::from_millis(config.memory_sample_interval_ms),
+                disk_sample_interval: Duration::from_millis(config.disk_sample_interval_ms),
+                disk_soft_samples: config.disk_soft_samples,
+                memory_pool_path: config.memory_pool_path.as_ref().map(PathBuf::from),
+                pressure_kill,
+                disk_pressure_kill,
+            })
     }
 }
 
@@ -5724,6 +5874,7 @@ pub struct RunningActionsManagerImpl {
     /// reads the cgroup.
     pressure_monitor_started: AtomicBool,
     disk_pressure_monitor_started: AtomicBool,
+    pressure_kill_generation: AtomicU64,
     // Note: We don't use Notify because we need to support a .wait_for()-like function, which
     // Notify does not support.
     action_done_tx: watch::Sender<()>,
@@ -5845,6 +5996,7 @@ impl RunningActionsManagerImpl {
             running_actions: Mutex::new(HashMap::new()),
             pressure_monitor_started: AtomicBool::new(false),
             disk_pressure_monitor_started: AtomicBool::new(false),
+            pressure_kill_generation: AtomicU64::new(0),
             action_done_tx,
             callbacks,
             metrics: Arc::new(Metrics {
@@ -5907,6 +6059,27 @@ impl RunningActionsManagerImpl {
                         "Action with operation_id {} is already running",
                         operation_id
                     ));
+                }
+                if operation_id.to_string() == ".side_channels" {
+                    return Err(make_err!(
+                        Code::InvalidArgument,
+                        "reserved action directory name"
+                    ));
+                }
+                let side_dir = Path::new(&self.root_action_directory)
+                    .join(".side_channels")
+                    .join(operation_id.to_string());
+                match tokio::fs::remove_dir_all(&side_dir).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(Error::from(err)).err_tip(|| {
+                            format!(
+                                "Removing stale side channel directory {}",
+                                side_dir.display()
+                            )
+                        });
+                    }
                 }
 
                 let dir_path =
@@ -6128,9 +6301,26 @@ impl RunningActionsManagerImpl {
     /// ownership and age under it; a mark already held is the action's own
     /// cleanup, which finishes the job.
     pub async fn sweep_orphaned_directories(self: &Arc<Self>) -> Result<usize, Error> {
-        let (_permit, dir_handle) = fs::read_dir(&self.root_action_directory)
+        let root = Path::new(&self.root_action_directory);
+        let mut removed = self.sweep_orphans_in(root, true).await?;
+        let side_root = root.join(".side_channels");
+        if tokio::fs::symlink_metadata(&side_root)
             .await
-            .err_tip(|| format!("Reading {} for orphans", self.root_action_directory))?
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            removed += self.sweep_orphans_in(&side_root, false).await?;
+        }
+        Ok(removed)
+    }
+
+    async fn sweep_orphans_in(
+        self: &Arc<Self>,
+        root: &Path,
+        action_root: bool,
+    ) -> Result<usize, Error> {
+        let (_permit, dir_handle) = fs::read_dir(root)
+            .await
+            .err_tip(|| format!("Reading {} for orphans", root.display()))?
             .into_inner();
         let mut dir_stream = ReadDirStream::new(dir_handle);
         let now = SystemTime::now();
@@ -6140,6 +6330,9 @@ impl RunningActionsManagerImpl {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            if action_root && name == ".side_channels" {
+                continue;
+            }
             // A running action's directory is not the sweep's to touch, and
             // its cleanup waits on the mark, so the mark is taken only for
             // an unowned directory and given back at once if the directory
@@ -6279,6 +6472,15 @@ impl RunningActionsManagerImpl {
 }
 
 impl RunningActionsManagerImpl {
+    /// Reserve the monitor slot for an injected PSI reader and clock before
+    /// creating actions. Returns false if a monitor has already started.
+    #[cfg(target_os = "linux")]
+    pub fn reserve_memory_pressure_monitor(&self) -> bool {
+        self.pressure_monitor_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Starts the memory pressure monitor once, when a pressure kill is
     /// configured. It holds a weak reference, so it ends with the manager.
     fn ensure_memory_pressure_monitor(self: &Arc<Self>) {
@@ -6308,48 +6510,67 @@ impl RunningActionsManagerImpl {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = policy;
-            warn!(
-                "memory_pressure_kill_percent is set, but memory.pressure is a Linux cgroup v2 file; the pressure kill stays off"
-            );
+            warn!("memory pressure monitoring requires Linux cgroup v2");
         }
     }
 }
 
-/// Reads the worker cgroup's `memory.pressure` every few seconds and, once
-/// its `full avg10` has stayed at or above the policy's percent for the
-/// policy's duration, asks the running action with the largest last sample
-/// to end (see [`PressureWindow`] and [`pick_pressure_victim`]). The kill
-/// reaches the scheduler as a memory kill, so the action comes back with a
-/// larger reservation instead of thrashing this worker until it is evicted.
-/// Ends when the manager is dropped, or at once when no `memory.pressure`
-/// is readable.
+/// Polls cumulative PSI totals and chooses an action only after sustained stalls.
 #[cfg(target_os = "linux")]
 async fn memory_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy: PressureKill) {
-    let Some(path) = crate::capacity::memory_pressure_file() else {
-        warn!(
-            "no readable memory.pressure for this worker's cgroup (cgroup v2 only); the memory pressure kill stays off"
-        );
+    memory_pressure_monitor_with(
+        manager,
+        policy,
+        |path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| crate::resource_pressure::psi_total(&text))
+        },
+        std::time::Instant::now,
+    )
+    .await;
+}
+
+/// Run the production pressure monitor with a supplied cumulative PSI reader
+/// and monotonic clock. Call `reserve_memory_pressure_monitor` before adding actions.
+#[cfg(target_os = "linux")]
+pub async fn memory_pressure_monitor_with(
+    manager: Weak<RunningActionsManagerImpl>,
+    policy: PressureKill,
+    read_total: impl Fn(&Path) -> Option<u64>,
+    now: impl Fn() -> std::time::Instant,
+) {
+    let Some(owner) = manager.upgrade() else {
         return;
     };
-    info!(
-        path = %path.display(),
-        full_avg10_percent = policy.full_avg10_percent,
-        after_s = policy.after.as_secs(),
-        "Memory pressure kill armed"
-    );
-    let mut window = PressureWindow::new(policy.full_avg10_percent, policy.after);
+    let path = owner
+        .execution_configuration
+        .resource_enforcement
+        .as_ref()
+        .and_then(|e| {
+            e.memory_pool_path
+                .as_ref()
+                .map(|p| p.join("memory.pressure"))
+        })
+        .or_else(crate::capacity::memory_pressure_file);
+    let Some(path) = path else {
+        warn!("no readable memory.pressure for this worker's cgroup");
+        return;
+    };
+    let mut generation = owner.pressure_kill_generation.load(Ordering::Acquire);
+    drop(owner);
+    let mut window = crate::resource_pressure::PsiWindow::new(policy.stall_percent, policy.after);
     loop {
-        tokio::time::sleep(MEMORY_PRESSURE_SAMPLE_INTERVAL).await;
+        tokio::time::sleep(policy.poll_interval).await;
         let Some(manager) = manager.upgrade() else {
             return;
         };
-        let Some(full_avg10) = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| crate::capacity::parse_pressure_full_avg10(&text))
-        else {
-            continue;
-        };
-        if !window.observe(full_avg10, Instant::now()) {
+        let current_generation = manager.pressure_kill_generation.load(Ordering::Acquire);
+        if generation != current_generation {
+            window.reset();
+            generation = current_generation;
+        }
+        if !window.observe(read_total(&path), now()) {
             continue;
         }
         let running: Vec<Arc<RunningActionImpl>> = manager
@@ -6358,33 +6579,35 @@ async fn memory_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, polic
             .values()
             .filter_map(Weak::upgrade)
             .collect();
-        let Some(victim) = pick_pressure_victim(
-            running.iter().map(|action| PressureCandidate {
-                item: action,
-                last_kb: action.memory_watch.last_memory_kb(),
-                reserved_kb: action.memory_watch.reserved_memory_kb(),
-                kill_requested: action.memory_watch.kill_requested(),
-            }),
-            policy
-                .largest_reservation_kb
-                .or(manager.pod_memory_limit_kb),
-        ) else {
+        let Some(victim) = pick_pressure_victim(running.iter().map(|action| PressureCandidate {
+            item: action,
+            last_kb: action.memory_watch.last_memory_kb(),
+            reserved_kb: action.memory_watch.reserved_memory_kb(),
+            kill_requested: action.memory_watch.kill_requested(),
+        })) else {
             warn!(
-                full_avg10,
                 running = running.len(),
-                "Worker under sustained memory pressure with no sampled action to kill"
+                "worker under sustained memory pressure with no sampled action to kill"
             );
             continue;
         };
-        warn!(
-            operation_id = ?victim.operation_id,
-            full_avg10,
-            observed_kb = victim.memory_watch.last_memory_kb(),
-            reserved_kb = victim.memory_watch.reserved_memory_kb(),
-            running = running.len(),
-            "Worker under sustained memory pressure; killing the action furthest over its reservation, or holding the most memory"
-        );
-        victim.request_memory_pressure_kill(whole_percent(full_avg10));
+        let next_generation = generation.wrapping_add(1);
+        if manager
+            .pressure_kill_generation
+            .compare_exchange(
+                generation,
+                next_generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            window.reset();
+            continue;
+        }
+        generation = next_generation;
+        victim.request_memory_pressure_kill(u64::from(policy.stall_percent));
+        window.reset();
     }
 }
 
@@ -6423,11 +6646,19 @@ impl RunningActionsManagerImpl {
 #[cfg(target_os = "linux")]
 async fn disk_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy: DiskPressureKill) {
     let mut window = PressureWindow::new(1, policy.after);
+    let mut generation = manager.upgrade().map_or(0, |owner| {
+        owner.pressure_kill_generation.load(Ordering::Acquire)
+    });
     loop {
-        tokio::time::sleep(MEMORY_PRESSURE_SAMPLE_INTERVAL).await;
+        tokio::time::sleep(policy.poll_interval).await;
         let Some(manager) = manager.upgrade() else {
             return;
         };
+        let current_generation = manager.pressure_kill_generation.load(Ordering::Acquire);
+        if generation != current_generation {
+            window.observe(0.0, Instant::now());
+            generation = current_generation;
+        }
         let path = manager.root_action_directory.clone();
         let sample = spawn_blocking!("disk_pressure_statvfs", move || disk_blocks(&path))
             .await
@@ -6448,24 +6679,37 @@ async fn disk_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy:
             .values()
             .filter_map(Weak::upgrade)
             .collect();
-        let Some(victim) = pick_pressure_victim(
-            running.iter().map(|action| PressureCandidate {
-                item: action,
-                last_kb: action.memory_watch.last_disk_kb.load(Ordering::Relaxed),
-                reserved_kb: action.memory_watch.reserved_disk_kb.load(Ordering::Relaxed),
-                kill_requested: action.memory_watch.kill_requested(),
-            }),
-            None,
-        ) else {
+        let Some(victim) = pick_pressure_victim(running.iter().map(|action| PressureCandidate {
+            item: action,
+            last_kb: action.memory_watch.last_disk_kb.load(Ordering::Relaxed),
+            reserved_kb: action.memory_watch.reserved_disk_kb.load(Ordering::Relaxed),
+            kill_requested: action.memory_watch.kill_requested(),
+        })) else {
             warn!(
                 running = running.len(),
                 "Worker under sustained disk pressure with no sampled action to kill"
             );
             continue;
         };
+        let next_generation = generation.wrapping_add(1);
+        if manager
+            .pressure_kill_generation
+            .compare_exchange(
+                generation,
+                next_generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            window.observe(0.0, Instant::now());
+            continue;
+        }
+        generation = next_generation;
         let free_percent = disk_free_percent(available, blocks).unwrap_or(0).min(100);
         warn!(operation_id = ?victim.operation_id, free_percent, "Worker under sustained disk pressure; killing the action furthest over its reservation, or using the most disk");
         victim.request_disk_pressure_kill(free_percent);
+        window.observe(0.0, Instant::now());
     }
 }
 
@@ -6733,6 +6977,138 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_kill_child() {
+        if env::var_os("NATIVELINK_CGROUP_KILL_CHILD").is_some() {
+            use std::io::Read;
+            let mut byte = [0];
+            drop(std::io::stdin().read(&mut byte));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[nativelink_test]
+    async fn resource_kill_preserves_wrapper_only_for_valid_scope() {
+        // Spawn this test executable itself so the child is provided by the build.
+        let spawn_child = || {
+            let mut command = process::Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "running_actions_manager::tests::cgroup_kill_child",
+                ])
+                .env("NATIVELINK_CGROUP_KILL_CHILD", "1")
+                .stdin(Stdio::piped())
+                .kill_on_drop(true)
+                .process_group(0);
+            crate::namespace_utils::MaybeNamespacedChild::new(false, command.spawn().unwrap())
+        };
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("memory.peak"), "49153").unwrap();
+        std::fs::write(temp.path().join("cgroup.kill"), "").unwrap();
+        let watch = ActionMemoryWatch::default();
+        *watch.cgroup.lock() = Some(crate::action_cgroup::Source {
+            metadata: temp.path().join("report.cgroup"),
+            pool: temp.path().to_path_buf(),
+            pid: 71,
+            start: 983,
+            scope: Some(temp.path().to_path_buf()),
+        });
+        let mut child = spawn_child();
+        let flag = AtomicBool::new(false);
+        let (used_cgroup, _) = resource_kill(
+            &mut child,
+            &watch,
+            Duration::from_millis(370),
+            &flag,
+            "test",
+        )
+        .await;
+        assert!(used_cgroup && flag.load(Ordering::Acquire));
+        assert_eq!(
+            std::fs::read(temp.path().join("cgroup.kill")).unwrap(),
+            b"1"
+        );
+        assert_eq!(*watch.kernel_peak_kb.lock(), Some(49));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "wrapper must remain alive"
+        );
+        tokio::time::timeout(Duration::from_secs(3), child.kill_pid())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut child = spawn_child();
+        let watch = ActionMemoryWatch::default();
+        let flag = AtomicBool::new(false);
+        let (used_cgroup, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            resource_kill(
+                &mut child,
+                &watch,
+                Duration::from_millis(370),
+                &flag,
+                "test",
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(!used_cgroup && !flag.load(Ordering::Acquire));
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "generic process group must be killed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sampling_uses_kernel_current_and_records_exact_peak() {
+        let temp = tempfile::tempdir().unwrap();
+        let watch = ActionMemoryWatch::default();
+        *watch.cgroup.lock() = Some(crate::action_cgroup::Source {
+            metadata: temp.path().join("report.cgroup"),
+            pool: temp.path().to_path_buf(),
+            pid: 71,
+            start: 983,
+            scope: Some(temp.path().to_path_buf()),
+        });
+        std::fs::write(temp.path().join("memory.current"), "9217").unwrap();
+        assert_eq!(watch.sample_cgroup(), Some(10));
+        assert_eq!(*watch.kernel_peak_kb.lock(), None);
+        std::fs::write(temp.path().join("memory.peak"), "17409").unwrap();
+        assert_eq!(watch.sample_cgroup(), Some(10));
+        assert_eq!(*watch.kernel_peak_kb.lock(), Some(18));
+    }
+
+    #[nativelink_test]
+    async fn side_channel_reports_exact_peak_without_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let report_path = temp.path().join("report");
+        std::fs::write(&report_path, r#"{"peak_memory_kb":37}"#).unwrap();
+        let (failure, peak) = process_side_channel_file(
+            Cow::Borrowed(report_path.as_os_str()),
+            &[],
+            Duration::from_millis(137),
+        )
+        .await
+        .unwrap();
+        assert!(failure.is_none());
+        assert_eq!(peak, Some(37));
+
+        std::fs::write(&report_path, r#"{"failure":"memory","peak_memory_kb":23}"#).unwrap();
+        let (failure, peak) = process_side_channel_file(
+            Cow::Borrowed(report_path.as_os_str()),
+            &[],
+            Duration::from_millis(137),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(failure, Some(SideChannelReport::Memory)));
+        assert_eq!(peak, Some(23));
+    }
 
     #[test]
     fn worker_kill_takes_precedence_over_side_channel_memory() {

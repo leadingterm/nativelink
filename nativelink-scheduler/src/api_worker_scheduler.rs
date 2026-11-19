@@ -26,7 +26,7 @@ use async_lock::Mutex;
 use futures::{StreamExt, future};
 use lru::LruCache;
 use nativelink_config::schedulers::{
-    MemoryEscalationSpec, ReservationHoldSpec, WorkerAllocationStrategy,
+    ReservationHoldSpec, ResourceEscalationSpec, WorkerAllocationStrategy,
 };
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::{
@@ -430,9 +430,8 @@ struct ApiWorkerSchedulerImpl {
     /// The `minimum` property compared against each worker's reported free
     /// memory before placement; unset means no veto.
     live_memory_veto: Option<String>,
-    /// How a memory kill is turned into a retry with a larger reservation;
-    /// unset means the kill fails the action.
-    memory_escalation: Option<MemoryEscalationSpec>,
+    /// Resource kill retry policy and declared capacities.
+    resource_escalation: Option<ResourceEscalationSpec>,
     /// How a queued action that keeps finding no room gets a worker held
     /// for it; unset means never.
     reservation_hold: Option<ReservationHoldSpec>,
@@ -1461,37 +1460,39 @@ impl ApiWorkerSchedulerImpl {
         MatchOutcome::WaitingForCapacity
     }
 
-    /// The largest memory reservation any connected worker could hold.
-    /// The largest memory any connected worker advertises under `property`,
-    /// and that worker's whole CPU under `cpu_property` (`None` when the
-    /// property is empty or the worker does not advertise it). Reserving
-    /// both is what runs an action alone there.
-    fn fleet_largest_worker(&self, property: &str, cpu_property: &str) -> (u64, Option<u64>) {
-        let minimum = |worker: &Worker, name: &str| match worker
-            .total_platform_properties
-            .properties
-            .get(name)
-        {
-            Some(PlatformPropertyValue::Minimum(value)) => Some(*value),
-            _ => None,
-        };
-        // A draining worker is leaving: escalating to it would strand the
-        // action at a size the remaining fleet cannot serve.
-        self.workers
+    /// Largest capacity matching requested exact and other minimum properties.
+    fn eligible_capacity(
+        policy: &ResourceEscalationSpec,
+        properties: &PlatformProperties,
+        property: &str,
+    ) -> Option<(u64, u64)> {
+        policy
+            .capacities
             .iter()
-            .filter(|(_, worker)| !worker.is_draining)
-            .filter_map(|(_, worker)| {
-                minimum(worker, property).map(|memory_kb| {
-                    let cpu = if cpu_property.is_empty() {
-                        None
-                    } else {
-                        minimum(worker, cpu_property)
-                    };
-                    (memory_kb, cpu)
-                })
+            .filter(|capacity| {
+                properties
+                    .properties
+                    .iter()
+                    .all(|(name, value)| match value {
+                        PlatformPropertyValue::Minimum(_) if name == property => true,
+                        PlatformPropertyValue::Minimum(needed) => capacity
+                            .minimum
+                            .get(name)
+                            .is_some_and(|available| available >= needed),
+                        PlatformPropertyValue::Exact(needed) => capacity
+                            .exact
+                            .get(name)
+                            .is_some_and(|available| available == needed),
+                        _ => true,
+                    })
             })
-            .max_by_key(|(memory_kb, _)| *memory_kb)
-            .unwrap_or((0, None))
+            .filter_map(|capacity| {
+                Some((
+                    *capacity.minimum.get(property)?,
+                    *capacity.minimum.get(&policy.cpu_property)?,
+                ))
+            })
+            .max()
     }
 
     /// Requeues a resource-killed action with a larger reservation when
@@ -1502,7 +1503,7 @@ impl ApiWorkerSchedulerImpl {
         operation_id: &OperationId,
         update: UpdateOperationType,
     ) -> (UpdateOperationType, Option<EscalationResource>) {
-        let Some(policy) = &self.memory_escalation else {
+        let Some(policy) = &self.resource_escalation else {
             return (update, None);
         };
         let UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(result)) = &update
@@ -1519,25 +1520,28 @@ impl ApiWorkerSchedulerImpl {
         let Some(usage) = pending.last_usage.as_ref() else {
             return (update, None);
         };
-        let resource = match ResourceOutcome::try_from(usage.outcome) {
-            Ok(ResourceOutcome::KilledMemory) => EscalationResource::Memory,
-            Ok(ResourceOutcome::KilledDisk) if !policy.disk_property.is_empty() => {
-                EscalationResource::Disk
-            }
-            _ => return (update, None),
-        };
-        let (property, reserved, peak_kb) = match resource {
-            EscalationResource::Memory => (
-                &policy.property,
-                usage.reserved.map(|r| r.memory_kb),
-                usage.peak_memory_kb,
-            ),
-            EscalationResource::Disk => (
-                &policy.disk_property,
-                usage.reserved.map(|r| r.disk_kb),
-                usage.peak_disk_kb,
-            ),
-        };
+        let (resource, dimension, reserved, peak_kb) =
+            match ResourceOutcome::try_from(usage.outcome) {
+                Ok(ResourceOutcome::KilledMemory) => (
+                    EscalationResource::Memory,
+                    &policy.memory,
+                    usage.reserved.map(|r| r.memory_kb),
+                    usage.peak_memory_kb,
+                ),
+                Ok(ResourceOutcome::KilledDisk) => {
+                    let Some(disk) = policy.disk.as_ref() else {
+                        return (update, None);
+                    };
+                    (
+                        EscalationResource::Disk,
+                        disk,
+                        usage.reserved.map(|r| r.disk_kb),
+                        usage.peak_disk_kb,
+                    )
+                }
+                _ => return (update, None),
+            };
+        let property = &dimension.property;
         let resource_name = resource.name();
         // What it ran under: the worker's echo, else what the scheduler sent.
         let reserved_kb = reserved
@@ -1554,27 +1558,20 @@ impl ApiWorkerSchedulerImpl {
                 }
             })
             .unwrap_or(0);
-        let (fleet_kb, fleet_cpu) = self.fleet_largest_worker(
-            property,
-            if resource == EscalationResource::Memory {
-                &policy.cpu_property
-            } else {
-                ""
-            },
-        );
-        // max_kb only caps memory and cannot exceed the fleet's ceiling.
-        let ceiling_kb = if resource == EscalationResource::Memory && policy.max_kb > 0 {
-            fleet_kb.min(policy.max_kb)
-        } else {
-            fleet_kb
+        let Some((ceiling_kb, fleet_cpu)) =
+            Self::eligible_capacity(policy, &pending.action_info.platform_properties, property)
+        else {
+            let mut failed = result.clone();
+            failed.error = Some(make_err!(
+                Code::FailedPrecondition,
+                "operation {operation_id} killed for {resource_name}: measured peak {peak_kb} KiB, eligible capacity 0 KiB; no eligible configured capacity"
+            ));
+            return (
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(failed)),
+                None,
+            );
         };
-        if ceiling_kb == 0 {
-            return (update, None);
-        }
-        // The last step reserves the largest worker whole: its memory and,
-        // when the fleet advertises one, its CPU, so nothing shares the
-        // worker with the action. A kill there is the end: no worker in
-        // the fleet can run the action, and the client hears exactly that.
+        // At capacity, hold the selected worker's whole CPU as well.
         let cpu_held = match pending
             .action_info
             .platform_properties
@@ -1584,73 +1581,33 @@ impl ApiWorkerSchedulerImpl {
             Some(PlatformPropertyValue::Minimum(cores)) => *cores,
             _ => 0,
         };
-        let whole_worker_cpu = fleet_cpu.filter(|cores| *cores > 0);
-        let already_whole =
-            reserved_kb >= ceiling_kb && whole_worker_cpu.is_none_or(|cores| cpu_held >= cores);
-        if already_whole {
-            warn!(
-                ?worker_id,
-                ?operation_id,
-                reserved_kb,
-                ceiling_kb,
-                resource = resource_name,
-                "Action killed at the fleet's largest reservation; no worker in the fleet can run it"
-            );
+        let already_whole = reserved_kb >= ceiling_kb && cpu_held >= fleet_cpu;
+        if peak_kb > ceiling_kb || already_whole {
+            let reason = if peak_kb > ceiling_kb {
+                "measured peak exceeds capacity"
+            } else {
+                "killed at whole-worker capacity"
+            };
             let mut failed = result.clone();
-            let no_worker = make_err!(
+            failed.error = Some(make_err!(
                 Code::FailedPrecondition,
-                "Action was killed for {resource_name} at {reserved_kb} KiB with the largest worker in the fleet ({ceiling_kb} KiB) reserved for it; no worker can run it. It needs a bigger worker or less {resource_name}"
-            );
-            failed.error = Some(match result.error.clone() {
-                Some(worker_error) => no_worker.merge(worker_error),
-                None => no_worker,
-            });
+                "operation {operation_id} killed for {resource_name}: measured peak {peak_kb} KiB, eligible capacity {ceiling_kb} KiB; {reason}"
+            ));
             return (
                 UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(failed)),
                 None,
             );
         }
-        let base_kb = if reserved_kb > 0 {
-            reserved_kb
-        } else {
-            peak_kb
+        let scaled = |value: u64, percent: u128| {
+            u64::try_from(u128::from(value).saturating_mul(percent).div_ceil(100))
+                .unwrap_or(u64::MAX)
         };
-        if base_kb == 0 {
-            // Nothing to grow from: no reservation and an unsampled kill.
-            // Scaling zero would hand out the smallest steps the ladder or
-            // the percent allow and burn the budget on them.
-            warn!(
-                ?worker_id,
-                ?operation_id,
-                resource = resource_name,
-                "Action killed with no reservation and no sampled peak; not escalating"
-            );
-            return (update, None);
-        }
-        // With a ladder the next class up; without one, scale. Past the
-        // top class or the ceiling, the whole worker.
-        let next = if policy.ladder_kb.is_empty() {
-            Some(
-                base_kb
-                    .saturating_mul(policy.percent)
-                    .checked_div(100)
-                    .unwrap_or(base_kb)
-                    .max(base_kb.saturating_add(1)),
-            )
-        } else {
-            policy
-                .ladder_kb
-                .iter()
-                .copied()
-                .filter(|kb| *kb > base_kb)
-                .min()
-        };
-        let value = next.map_or(ceiling_kb, |kb| kb.min(ceiling_kb));
-        let cpu = if value >= ceiling_kb {
-            whole_worker_cpu.map(|cores| (policy.cpu_property.clone(), cores))
-        } else {
-            None
-        };
+        let value = ceiling_kb.min(
+            scaled(peak_kb, 100 + u128::from(policy.headroom_percent))
+                .max(scaled(reserved_kb, u128::from(dimension.percent)))
+                .max(reserved_kb.saturating_add(1)),
+        );
+        let cpu = (value == ceiling_kb).then(|| (policy.cpu_property.clone(), fleet_cpu));
         let reason = result.error.clone().unwrap_or_else(|| {
             make_err!(
                 Code::FailedPrecondition,
@@ -1674,6 +1631,9 @@ impl ApiWorkerSchedulerImpl {
                 resource: resource_name,
                 property: property.clone(),
                 value,
+                peak_kb,
+                capacity_kb: ceiling_kb,
+                max_steps: usize::try_from(dimension.max_steps).unwrap_or(usize::MAX),
                 reason,
                 cpu,
             }),
@@ -2315,6 +2275,7 @@ pub struct ApiWorkerScheduler {
     /// The memory property the escalation policy reads, so a kill at a
     /// reservation the worker did not echo can still be filed at it.
     memory_property: Option<String>,
+    disk_property: Option<String>,
 
     /// Woken when a worker joins or leaves this scheduler.
     local_fleet_change_notify: Arc<Notify>,
@@ -2371,7 +2332,7 @@ impl ApiWorkerScheduler {
         platform_property_manager: Arc<PlatformPropertyManager>,
         allocation_strategy: WorkerAllocationStrategy,
         live_memory_veto: Option<String>,
-        memory_escalation: Option<MemoryEscalationSpec>,
+        resource_escalation: Option<ResourceEscalationSpec>,
         reservation_hold: Option<ReservationHoldSpec>,
         worker_change_notify: Arc<Notify>,
         worker_timeout_s: u64,
@@ -2394,16 +2355,19 @@ impl ApiWorkerScheduler {
         );
         let local_fleet_change_notify = Arc::new(Notify::new());
         let capacity_generation = Arc::new(AtomicU64::new(0));
-        let memory_property = memory_escalation
+        let memory_property = resource_escalation
             .as_ref()
-            .map(|policy| policy.property.clone());
+            .map(|policy| policy.memory.property.clone());
+        let disk_property = resource_escalation
+            .as_ref()
+            .and_then(|policy| policy.disk.as_ref().map(|disk| disk.property.clone()));
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
                 worker_state_manager,
                 allocation_strategy,
                 live_memory_veto,
-                memory_escalation,
+                resource_escalation,
                 reservation_hold,
                 attempt_events: maybe_origin_event_tx.clone(),
                 lost_results: LostResults::default(),
@@ -2438,6 +2402,7 @@ impl ApiWorkerScheduler {
             maybe_origin_event_tx,
             resource_sketch,
             memory_property,
+            disk_property,
             local_fleet_change_notify,
             capacity_generation,
             scheduler_id,
@@ -2772,7 +2737,11 @@ impl WorkerScheduler for ApiWorkerScheduler {
         if let (Some(sketch), Some(action_info), true) = (
             self.resource_sketch.as_ref(),
             maybe_action_info.as_ref(),
-            resource_usage.sampled,
+            resource_usage.sampled
+                || matches!(
+                    outcome,
+                    ResourceOutcome::KilledMemory | ResourceOutcome::KilledDisk
+                ),
         ) {
             let metadata = action_info.origin_metadata.bazel_metadata.as_ref();
             let key = SketchKey::for_attempt(
@@ -2780,21 +2749,35 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 metadata.map(|m| m.action_mnemonic.as_str()),
                 &action_info.inner.command_digest.to_string(),
             );
-            let killed = outcome == ResourceOutcome::KilledMemory;
-            // What it ran under: the worker's echo, else what the scheduler
-            // sent, the same two sources the escalation reads.
-            let killed_at_kb = killed
+            let reservation = |property: Option<&str>, echoed: Option<u64>| {
+                echoed.filter(|value| *value > 0).or_else(|| {
+                    match action_info.platform_properties.properties.get(property?) {
+                        Some(PlatformPropertyValue::Minimum(value)) if *value > 0 => Some(*value),
+                        _ => None,
+                    }
+                })
+            };
+            let memory_floor = (outcome == ResourceOutcome::KilledMemory)
                 .then(|| {
-                    resource_usage
-                        .reserved
-                        .map(|r| r.memory_kb)
-                        .filter(|kb| *kb > 0)
+                    (resource_usage.peak_memory_kb > 0)
+                        .then_some(resource_usage.peak_memory_kb)
                         .or_else(|| {
-                            let property = self.memory_property.as_deref()?;
-                            match action_info.platform_properties.properties.get(property) {
-                                Some(PlatformPropertyValue::Minimum(kb)) => Some(*kb),
-                                _ => None,
-                            }
+                            reservation(
+                                self.memory_property.as_deref(),
+                                resource_usage.reserved.map(|r| r.memory_kb),
+                            )
+                        })
+                })
+                .flatten();
+            let disk_floor = (outcome == ResourceOutcome::KilledDisk)
+                .then(|| {
+                    (resource_usage.peak_disk_kb > 0)
+                        .then_some(resource_usage.peak_disk_kb)
+                        .or_else(|| {
+                            reservation(
+                                self.disk_property.as_deref(),
+                                resource_usage.reserved.map(|r| r.disk_kb),
+                            )
                         })
                 })
                 .flatten();
@@ -2804,7 +2787,8 @@ impl WorkerScheduler for ApiWorkerScheduler {
                     resource_usage.cpu_time_ms.saturating_mul(1000) / resource_usage.wall_time_ms
                 }),
                 peak_disk_kb: resource_usage.peak_disk_kb,
-                killed_at_kb,
+                killed_peak_memory_kb: memory_floor,
+                killed_peak_disk_kb: disk_floor,
                 killed: !matches!(
                     outcome,
                     ResourceOutcome::Unknown | ResourceOutcome::Completed

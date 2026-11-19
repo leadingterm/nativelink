@@ -74,6 +74,11 @@ impl MaybeNamespacedChild {
         self.child.kill().await
     }
 
+    /// Kill only the wrapper, without signalling its process group.
+    pub async fn kill_pid(&mut self) -> Result<(), Error> {
+        self.child.kill().await
+    }
+
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, Error> {
         self.child.try_wait()
     }

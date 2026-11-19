@@ -26,7 +26,11 @@ rust_library(
         "src/worker_api_client_wrapper.rs",
         "src/worker_utils.rs",
     ] + select({
-        "@platforms//os:linux": ["src/namespace_utils.rs"],
+        "@platforms//os:linux": [
+            "src/action_cgroup.rs",
+            "src/namespace_utils.rs",
+            "src/resource_pressure.rs",
+        ],
         "//conditions:default": [],
     }),
     proc_macro_deps = [
@@ -76,6 +80,7 @@ rust_test_suite(
         "tests/local_worker_test.rs",
         "tests/namespace_utils_test.rs",
         "tests/reaper_test.rs",
+        "tests/resource_pressure_test.rs",
         "tests/running_actions_manager_test.rs",
         "tests/worker_utils_test.rs",
     ],

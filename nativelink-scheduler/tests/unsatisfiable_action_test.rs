@@ -1151,7 +1151,7 @@ async fn learned_large_class_waits_for_pool_when_timeout_allows_cold_start() -> 
             &Observation {
                 peak_memory_kb: 32_000_000,
                 killed: true,
-                killed_at_kb: Some(31_457_280),
+                killed_peak_memory_kb: Some(32_000_000),
                 now_s: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()

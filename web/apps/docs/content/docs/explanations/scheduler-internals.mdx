@@ -217,20 +217,27 @@ for it fleet-wide. `scheduler.worker.holds` counts holds by outcome and
 connected worker would fit even idle gets no hold; that is the unsatisfiable
 path, or a sizing class larger than the workers less their overhead.
 
-When a worker reports an action killed for memory, by its own reservation
-enforcement or by the kernel near the limit, **`memory_escalation`** requeues
-the action with the reservation multiplied by `percent` (default 200) instead
-of failing it. With `ladder_kb` set to the memory values of the fleet's size
-classes, a kill steps the reservation to the next class up instead of
-scaling it. The next dispatch carries the raised value, so the worker holds
-the action to that. The reservation grows to the largest memory any connected
-worker advertises (or `max_kb`); the last step reserves that worker whole,
-its memory and, through `cpu_property`, its CPU, so the action runs alone.
-Only a kill there fails the action, with a message saying no worker in the
-fleet can run it. Escalations have their own budget (`max_steps`, default 8)
-and do not spend `max_job_retries`. The execution histograms carry an
-`execution.outcome` attribute so the killed samples can be told from the
-completed ones.
+When a worker reports a memory or disk kill, **`resource_escalation`** can
+requeue the action with a larger reservation. For the killed dimension:
+
+```text
+next = min(cap, max(ceil(peak * (100 + headroom_percent) / 100),
+                    ceil(reservation * percent / 100), reservation + 1))
+```
+
+`capacities` contains one entry per worker type, with a `minimum` map of
+numeric capacities and an `exact` map of string properties such as ISA,
+fleet, and sandbox. Both maps default to empty. `cap` is the largest entry
+that satisfies every requested `Exact` property (a missing key is ineligible)
+and every other requested `Minimum` property, ignoring the dimension being
+escalated. At a clamped cap the scheduler reserves that capacity's whole
+`cpu_property` so the action runs alone.
+Headroom or multiplier overshoot alone is clamped, not impossible demand.
+A measured peak above the cap, another kill while already holding the cap
+whole-worker, or exhaustion of that resource's `max_steps` ends the current
+operation with one failure naming the action, peak, capacity and reason.
+Memory and disk have separate counters, independent of `max_job_retries`.
+The execution histograms carry an `execution.outcome` attribute.
 
 The `historical_resource` scheduler uses `hints_file` by default. It loads the
 file at startup and refreshes it in the background at `refresh_interval_s`
@@ -241,8 +248,8 @@ Set `learn_from_workers: true` to size actions from worker measurements.
 In this mode the file is only a seed for an empty sketch, and its first real
 sample replaces each seeded entry. Every sampled usage report a worker
 sends lands in a bounded sketch: one entry per key with 25-bucket log2
-histograms of peak memory, CPU and disk, the exact maxima, the reservation
-the action was last killed at, and when it was last seen. The key is the
+histograms of peak memory, CPU and disk, exact maxima, separate memory and
+disk killed-peak floors, and when each was last seen. The key is the
 `(target_id, action_mnemonic)` the client sent, the mnemonic alone when it
 sent no target, or the action's `command_digest` when it sent neither (the
 same program with the same arguments, whatever its inputs, so one key
@@ -252,19 +259,19 @@ that names both is recorded under its mnemonic as well, so a target the
 sketch has never seen is sized from its kind of action rather than the cold
 start. A lookup walks that ladder most specific first and reserves the 95th
 percentile bucket's upper bound, capped by the exact maximum, plus
-`headroom_percent`, never at or below the kill. Two half-window histograms
-retain samples for between half and one full `window_days` window, and a
-kill floor expires with the window. Wide histogram counters preserve the
-relative weights of common and rare observations. **`classes`** on the same scheduler defines the
-fleet's size ladder: named points with `cpu_count`, `memory_kb` and
-`disk_kb`, listed ascending, and a hint takes the smallest class that holds
-its numbers on every dimension the class names. An action the sketch has
-nothing for takes the class picked by `class_by_mnemonic`, then
-`class_by_timeout` (Bazel test sizes arrive as timeouts), then
-`default_class`; without classes the raw `cold_start` numbers apply. With
-`memory_escalation.ladder_kb` set to the classes' memory values, a memory
-kill steps the reservation to the next class instead of scaling it, and a
-kill at the top class fails the action.
+`headroom_percent`. For memory and disk, the initial reservation is at least
+the measured killed peak plus headroom, even when p95 is smaller; when no
+peak was measured, the killed reservation supplies the floor. Two half-window
+histograms retain samples for between half and one full `window_days` window,
+and kill floors expire with the window. Wide histogram counters preserve the
+relative weights of common and rare observations. **`classes`** defines named
+points with `cpu_count`, `memory_kb` and `disk_kb`, listed ascending; a hint
+takes the smallest class that holds its numbers on every dimension the class
+names. An action the sketch has nothing for takes the class picked by
+`class_by_mnemonic`, then `class_by_timeout`, then `default_class`; without
+classes the raw `cold_start` numbers apply. Gang clamps learned reservations
+to the largest admitted eligible capacity, reserving the fleet's whole CPU
+when memory is clamped, rather than rejecting a new submission.
 
 The `memory_budget_bytes` accounting includes entry storage, variable-length
 keys, map bookkeeping, probation and reserved snapshot working memory. The
@@ -319,11 +326,9 @@ earlier during rendering; the server's fallback does not override chart checks.
 #### Waiting for an autoscaled size class [#waiting-for-an-autoscaled-size-class]
 
 Learned sizing selects from the configured class ladder, including a class whose
-pool currently has no connected workers. The retry escalator separately caps its
-memory ceiling at the largest connected worker advertisement; a size class is not
-an inventory of pools that can be provisioned. Capping learned hints to currently connected
-workers would prevent scale-from-zero and could repeat memory kills on a small
-worker.
+pool currently has no connected workers. The retry escalator caps a killed
+resource at the largest eligible configured capacity, rather than depending on
+which workers are connected at that moment.
 
 The memory scheduler sees only its own connected workers. Redis peer exchange
 adds other schedulers' **connected** workers, not pool templates awaiting startup. A pod
@@ -402,10 +407,10 @@ of its lives; the separate budget is what stops an action that reliably
 OOM-kills its worker from taking one down forever. Past it the client sees a
 `FAILED_PRECONDITION` saying the worker was lost that many times.
 
-**`UpdateWithEscalation` counts against `memory_escalation.max_steps`**
-(default 8), not `max_job_retries` either: the scheduler chose to run the
-action again with more memory, and the fleet's ceiling bounds how far that
-goes.
+**`UpdateWithEscalation` counts against the killed resource's
+`resource_escalation` `max_steps`**, not `max_job_retries`. Memory and disk
+escalation budgets are separate, and eligible configured capacities bound the
+reservation.
 
 The limit is checked as `attempts > max_job_retries`, strictly, so the
 default of `3` permits **four** total executions. That off-by-one is in the

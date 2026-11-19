@@ -43,7 +43,7 @@ pub const HIST_BUCKETS: usize = 25;
 /// Bumped by hand when the worker's sampler changes what a measurement
 /// means (the process-group fix of v1.8.2 is the example). A snapshot of
 /// another generation is dropped at load and the sketch starts empty.
-pub const SAMPLER_GENERATION: u32 = 1;
+pub const SAMPLER_GENERATION: u32 = 2;
 
 /// Fixed charge for an entry and its map/Arc bookkeeping. Key contents are
 /// charged separately. The allowance also covers its largest encoded form.
@@ -232,11 +232,12 @@ pub struct Entry {
     /// shaping it, however often the key runs.
     pub current: Half,
     pub previous: Half,
-    /// The largest reservation an attempt was killed at for memory within
-    /// the window. The next hint sits above it.
-    pub killed_at_kb: u64,
-    /// When that kill was seen; the floor expires a window after it.
-    pub killed_at_s: u64,
+    /// Largest measured memory kill peak (or reservation when unavailable).
+    pub killed_peak_memory_kb: u64,
+    pub killed_memory_s: u64,
+    /// Largest measured disk kill peak (or reservation when unavailable).
+    pub killed_peak_disk_kb: u64,
+    pub killed_disk_s: u64,
     /// Seconds since the Unix epoch of the last sample, for the window.
     pub last_seen_s: u64,
     /// The half-window `current` counts: `now_s / (window_s / 2)`; see
@@ -255,10 +256,9 @@ pub struct Observation {
     /// not a measurement).
     pub cpu_millicores: Option<u64>,
     pub peak_disk_kb: u64,
-    /// The memory the attempt was killed at, when it was killed for memory
-    /// and the reservation is known. A kill at an unknown reservation
-    /// records no floor: a floor of zero is no floor.
-    pub killed_at_kb: Option<u64>,
+    /// Memory and disk kill floors, using the measured peak when available.
+    pub killed_peak_memory_kb: Option<u64>,
+    pub killed_peak_disk_kb: Option<u64>,
     /// Any kill, for the probation rule.
     pub killed: bool,
     pub now_s: u64,
@@ -493,6 +493,19 @@ impl ResourceSketch {
         self.window
     }
 
+    /// Remove all learned entries and probation while retaining cumulative statistics.
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            let mut inner = shard.lock();
+            for family in &mut inner.families {
+                family.clear();
+            }
+            inner.probation.clear();
+            inner.bytes = [0; 3];
+            inner.probation_bytes = 0;
+        }
+    }
+
     /// Records one attempt. A command key with no entry yet earns one on a
     /// kill or on its second sighting: a digest that ran once and was not
     /// killed is an action-cache hit next time, so a first sighting only
@@ -570,7 +583,16 @@ impl ResourceSketch {
             inner.bytes[key.family().index()] -= entry_charge(key);
             return None;
         }
-        Some(entry.clone())
+        let mut entry = entry.clone();
+        if now_s.saturating_sub(entry.killed_memory_s) > self.window_s() {
+            entry.killed_peak_memory_kb = 0;
+            entry.killed_memory_s = 0;
+        }
+        if now_s.saturating_sub(entry.killed_disk_s) > self.window_s() {
+            entry.killed_peak_disk_kb = 0;
+            entry.killed_disk_s = 0;
+        }
+        Some(entry)
     }
 
     /// The reservation for an entry: `ShapeOne` of the hints producer,
@@ -828,9 +850,13 @@ impl Entry {
             }
             self.period = period;
         }
-        if self.killed_at_kb > 0 && now_s.saturating_sub(self.killed_at_s) > window_s {
-            self.killed_at_kb = 0;
-            self.killed_at_s = 0;
+        if self.killed_peak_memory_kb > 0 && now_s.saturating_sub(self.killed_memory_s) > window_s {
+            self.killed_peak_memory_kb = 0;
+            self.killed_memory_s = 0;
+        }
+        if self.killed_peak_disk_kb > 0 && now_s.saturating_sub(self.killed_disk_s) > window_s {
+            self.killed_peak_disk_kb = 0;
+            self.killed_disk_s = 0;
         }
     }
 
@@ -859,12 +885,19 @@ impl Entry {
             half.disk.add(observation.peak_disk_kb);
             half.max_disk_kb = half.max_disk_kb.max(observation.peak_disk_kb);
         }
-        if let Some(killed_at_kb) = observation.killed_at_kb
-            && killed_at_kb > 0
-            && killed_at_kb >= self.killed_at_kb
+        if let Some(peak) = observation.killed_peak_memory_kb
+            && peak > 0
+            && peak >= self.killed_peak_memory_kb
         {
-            self.killed_at_kb = killed_at_kb;
-            self.killed_at_s = observation.now_s;
+            self.killed_peak_memory_kb = peak;
+            self.killed_memory_s = observation.now_s;
+        }
+        if let Some(peak) = observation.killed_peak_disk_kb
+            && peak > 0
+            && peak >= self.killed_peak_disk_kb
+        {
+            self.killed_peak_disk_kb = peak;
+            self.killed_disk_s = observation.now_s;
         }
         self.seeded = false;
     }
@@ -908,31 +941,24 @@ const fn p95_capped(upper: u64, max: u64) -> u64 {
     }
 }
 
-const fn with_headroom(value: u64, headroom_percent: u64) -> u64 {
+fn with_headroom(value: u64, headroom_percent: u64) -> u64 {
     if value == 0 {
         return 0;
     }
-    value.saturating_mul(100 + headroom_percent) / 100
+    let product = u128::from(value).saturating_mul(100 + u128::from(headroom_percent));
+    u64::try_from(product.div_ceil(100)).unwrap_or(u64::MAX)
 }
 
-/// The first class on the ladder that holds the numbers on every dimension
-/// it names and sits above a reservation the action was killed at. Past the
-/// top of the ladder it is the top class, unless the action was killed at
-/// or above the top's memory: no class then sits above the kill, and the
-/// raw numbers stand rather than a class whose memory would be killed again.
+/// The first class that holds the shaped dimensions.
 fn smallest_dominating_class(
     classes: &[SizeClassSpec],
     memory_kb: u64,
     cpu: u64,
     disk_kb: u64,
-    killed_at_kb: u64,
 ) -> Option<&SizeClassSpec> {
-    let top = classes.last()?;
-    if top.memory_kb <= killed_at_kb {
-        return None;
-    }
+    classes.last()?;
     for class in classes {
-        if class.memory_kb < memory_kb || class.memory_kb <= killed_at_kb {
+        if class.memory_kb < memory_kb {
             continue;
         }
         if class.cpu_count > 0 && cpu > 0 && class.cpu_count < cpu {
@@ -943,7 +969,7 @@ fn smallest_dominating_class(
         }
         return Some(class);
     }
-    Some(top)
+    None
 }
 
 fn shape(policy: &Policy, entry: &Entry) -> Shaped {
@@ -952,12 +978,7 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
         p95_capped(entry.memory_p95_upper(), entry.max_memory_kb()),
         headroom,
     );
-    if entry.killed_at_kb > 0 && memory_kb <= entry.killed_at_kb {
-        // Killed at that reservation: the next one must be larger, however
-        // small the samples that survived were, by the same headroom a
-        // measurement gets.
-        memory_kb = with_headroom(entry.killed_at_kb, headroom) + 1;
-    }
+    memory_kb = memory_kb.max(with_headroom(entry.killed_peak_memory_kb, headroom));
     // A CPU p95 of zero is an action that used no measurable CPU or a
     // worker that reported none; neither keeps the action off a small
     // class, so no CPU need is stated and the class goes by memory.
@@ -969,6 +990,7 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
         p95_capped(entry.disk_p95_upper(), entry.max_disk_kb()),
         headroom,
     );
+    disk_kb = disk_kb.max(with_headroom(entry.killed_peak_disk_kb, headroom));
     // A number on a dimension the fleet does not reserve says nothing about
     // the ones it does, so it is dropped before anything is decided from
     // it: a disk-only measurement is no measurement, and the cold start
@@ -986,9 +1008,15 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
         return Shaped::default();
     }
     let mut class = None;
-    if let Some(found) =
-        smallest_dominating_class(&policy.classes, memory_kb, cpu, disk_kb, entry.killed_at_kb)
-    {
+    let found = smallest_dominating_class(&policy.classes, memory_kb, cpu, disk_kb).or_else(|| {
+        policy.classes.last().filter(|top| {
+            (!policy.reserve_memory
+                || top.memory_kb >= with_headroom(entry.killed_peak_memory_kb, headroom))
+                && (!policy.reserve_disk
+                    || top.disk_kb >= with_headroom(entry.killed_peak_disk_kb, headroom))
+        })
+    });
+    if let Some(found) = found {
         class = Some(found.name.clone());
         if found.memory_kb > 0 {
             memory_kb = found.memory_kb;
@@ -1110,8 +1138,10 @@ impl Snapshot {
             let samples = r.u32()?;
             let current = r.half()?;
             let previous = r.half()?;
-            let killed_at_kb = r.u64()?;
-            let killed_at_s = r.u64()?;
+            let killed_peak_memory_kb = r.u64()?;
+            let killed_memory_s = r.u64()?;
+            let killed_peak_disk_kb = r.u64()?;
+            let killed_disk_s = r.u64()?;
             let last_seen_s = r.u64()?;
             let period = r.u64()?;
             let seeded = r.u8()? == 1;
@@ -1121,8 +1151,10 @@ impl Snapshot {
                     samples,
                     current,
                     previous,
-                    killed_at_kb,
-                    killed_at_s,
+                    killed_peak_memory_kb,
+                    killed_memory_s,
+                    killed_peak_disk_kb,
+                    killed_disk_s,
                     last_seen_s,
                     period,
                     seeded,
@@ -1279,8 +1311,10 @@ fn encode_entry(out: &mut Vec<u8>, key: &SketchKey, entry: &Entry) {
         }
     }
     for value in [
-        entry.killed_at_kb,
-        entry.killed_at_s,
+        entry.killed_peak_memory_kb,
+        entry.killed_memory_s,
+        entry.killed_peak_disk_kb,
+        entry.killed_disk_s,
         entry.last_seen_s,
         entry.period,
     ] {

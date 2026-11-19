@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use mock_instant::thread_local::MockClock;
 use nativelink_config::schedulers::{
-    MemoryEscalationSpec, PropertyType, SchedulerSpec, SimpleSpec,
+    EscalationDimensionSpec, PropertyType, ResourceCapacity, ResourceEscalationSpec, SimpleSpec,
 };
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
@@ -27,13 +27,10 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     ActionResourceUsage, Reservation, ResourceOutcome, StartExecute, UpdateForWorker,
     update_for_worker,
 };
-use nativelink_scheduler::default_scheduler_factory::{
-    memory_awaited_action_db_factory, scheduler_factory,
-};
+use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
 use nativelink_scheduler::simple_scheduler::SimpleScheduler;
 use nativelink_scheduler::worker::Worker;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
-use nativelink_store::store_manager::StoreManager;
 use nativelink_util::action_messages::{
     ActionInfo, ActionResult, ActionStage, OperationId, WorkerId,
 };
@@ -54,130 +51,163 @@ mod utils {
 const NOW_TIME: u64 = 10000;
 const WORKER: &str = "the_worker";
 
-fn make_scheduler(max_job_retries: usize) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
-    make_scheduler_with_ladder(max_job_retries, vec![])
+#[test]
+fn capacity_serde_defaults_and_rejects_unknown_fields() {
+    let empty: ResourceCapacity = serde_json::from_str("{}").expect("empty maps default");
+    assert!(empty.minimum.is_empty());
+    assert!(empty.exact.is_empty());
+    let capacity: ResourceCapacity =
+        serde_json::from_str(r#"{"minimum":{"memory_kb":12345},"exact":{"ISA":"arm64"}}"#)
+            .expect("capacity parses");
+    assert_eq!(capacity.minimum.get("memory_kb"), Some(&12_345));
+    assert_eq!(capacity.exact.get("ISA").map(String::as_str), Some("arm64"));
+    assert!(serde_json::from_str::<ResourceCapacity>(r#"{"memory_kb":12345}"#).is_err());
 }
 
-fn make_scheduler_with_ladder(
-    max_job_retries: usize,
-    ladder_kb: Vec<u64>,
-) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
-    make_scheduler_with_limits(max_job_retries, ladder_kb, 0)
+fn capacity(memory: u64, disk: u64, cpu: u64) -> ResourceCapacity {
+    ResourceCapacity {
+        minimum: BTreeMap::from([
+            ("memory_kb".to_string(), memory),
+            ("disk_kb".to_string(), disk),
+            ("cpu_count".to_string(), cpu),
+        ]),
+        exact: BTreeMap::from([
+            ("ISA".to_string(), "arm64".to_string()),
+            ("fleet".to_string(), "compile".to_string()),
+            ("sandbox".to_string(), "isolated".to_string()),
+        ]),
+    }
 }
 
-fn make_scheduler_with_limits(
-    max_job_retries: usize,
-    ladder_kb: Vec<u64>,
-    max_steps: u64,
-) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
-    make_scheduler_with_disk(max_job_retries, ladder_kb, max_steps, "")
+fn make_scheduler() -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
+    // The larger-memory fleet cannot satisfy a 1,000 KiB disk request.
+    make_scheduler_with_capacities(vec![
+        capacity(100_000, 100_000, 8),
+        capacity(200_000, 500, 16),
+    ])
 }
 
-fn make_scheduler_with_disk(
-    max_job_retries: usize,
-    ladder_kb: Vec<u64>,
-    max_steps: u64,
-    disk_property: &str,
-) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
-    make_scheduler_with_disk_and_memory_cap(max_job_retries, ladder_kb, max_steps, disk_property, 0)
-}
-
-fn make_scheduler_with_disk_and_memory_cap(
-    max_job_retries: usize,
-    ladder_kb: Vec<u64>,
-    max_steps: u64,
-    disk_property: &str,
-    max_kb: u64,
+fn make_scheduler_with_capacities(
+    capacities: Vec<ResourceCapacity>,
 ) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
     MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let task_change_notify = Arc::new(Notify::new());
+    let notify = Arc::new(Notify::new());
+    let dimension = |property: &str| EscalationDimensionSpec {
+        property: property.to_string(),
+        percent: 250,
+        max_steps: 3,
+    };
     let spec = SimpleSpec {
         supported_platform_properties: Some(HashMap::from([
             ("memory_kb".to_string(), PropertyType::Minimum),
             ("disk_kb".to_string(), PropertyType::Minimum),
             ("cpu_count".to_string(), PropertyType::Minimum),
+            ("ISA".to_string(), PropertyType::Exact),
+            ("fleet".to_string(), PropertyType::Exact),
+            ("sandbox".to_string(), PropertyType::Exact),
         ])),
-        memory_escalation: Some(MemoryEscalationSpec {
-            property: "memory_kb".to_string(),
-            disk_property: disk_property.to_string(),
-            percent: 200,
-            max_kb,
-            ladder_kb,
+        resource_escalation: Some(ResourceEscalationSpec {
+            memory: dimension("memory_kb"),
+            disk: Some(dimension("disk_kb")),
+            headroom_percent: 25,
             cpu_property: "cpu_count".to_string(),
-            max_steps,
+            capacities,
         }),
-        max_job_retries,
+        max_job_retries: 1,
         max_worker_loss_retries: 2,
         ..SimpleSpec::default()
     };
     SimpleScheduler::new_with_callback(
         &spec,
-        memory_awaited_action_db_factory(0, &task_change_notify, MockInstantWrapped::default),
+        memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
         || async move {},
-        task_change_notify,
+        notify,
         MockInstantWrapped::default,
         None,
     )
 }
 
-async fn add_worker(
-    scheduler: &SimpleScheduler,
-    memory_kb: u64,
-) -> Result<mpsc::Receiver<UpdateForWorker>, Error> {
-    add_worker_with_disk(scheduler, memory_kb, 5_000).await
-}
-
-async fn add_worker_with_disk(
-    scheduler: &SimpleScheduler,
-    memory_kb: u64,
-    disk_kb: u64,
-) -> Result<mpsc::Receiver<UpdateForWorker>, Error> {
+async fn add_worker(scheduler: &SimpleScheduler) -> Result<mpsc::Receiver<UpdateForWorker>, Error> {
     let (tx, mut rx) = mpsc::channel(64);
     let worker = Worker::new(
         WorkerId(WORKER.to_string()),
         PlatformProperties::new(HashMap::from([
             (
                 "memory_kb".to_string(),
-                PlatformPropertyValue::Minimum(memory_kb),
+                PlatformPropertyValue::Minimum(200_000),
             ),
             (
                 "disk_kb".to_string(),
-                PlatformPropertyValue::Minimum(disk_kb),
+                PlatformPropertyValue::Minimum(100_000),
             ),
-            ("cpu_count".to_string(), PlatformPropertyValue::Minimum(8)),
+            ("cpu_count".to_string(), PlatformPropertyValue::Minimum(16)),
+            (
+                "ISA".to_string(),
+                PlatformPropertyValue::Exact("arm64".to_string()),
+            ),
+            (
+                "fleet".to_string(),
+                PlatformPropertyValue::Exact("compile".to_string()),
+            ),
+            (
+                "sandbox".to_string(),
+                PlatformPropertyValue::Exact("isolated".to_string()),
+            ),
         ])),
         tx,
         NOW_TIME,
-        /* max_inflight_tasks */ 4,
+        4,
     );
     scheduler
         .add_worker(worker)
         .await
         .err_tip(|| "Failed to add worker")?;
     tokio::task::yield_now().await;
-    let connected = rx.recv().await.unwrap();
     assert!(matches!(
-        connected.update,
+        rx.recv().await.unwrap().update,
         Some(update_for_worker::Update::ConnectionResult(_))
     ));
     Ok(rx)
 }
 
-/// The next dispatch the worker sees, and the memory it was reserved with.
-async fn next_dispatch(rx: &mut mpsc::Receiver<UpdateForWorker>) -> (StartExecute, u64) {
+async fn add_action(
+    scheduler: &SimpleScheduler,
+    memory: u64,
+    disk: u64,
+) -> Result<Box<dyn ActionStateResult>, Error> {
+    let base = make_base_action_info(
+        UNIX_EPOCH + MockClock::time(),
+        DigestInfo::new([42; 32], 512),
+    );
+    let action = Arc::new(ActionInfo {
+        platform_properties: HashMap::from([
+            ("memory_kb".to_string(), memory.to_string()),
+            ("disk_kb".to_string(), disk.to_string()),
+            ("cpu_count".to_string(), "1".to_string()),
+            ("ISA".to_string(), "arm64".to_string()),
+            ("fleet".to_string(), "compile".to_string()),
+            ("sandbox".to_string(), "isolated".to_string()),
+        ]),
+        ..(*base).clone()
+    });
+    let listener = scheduler.add_action(OperationId::default(), action).await?;
+    tokio::task::yield_now().await;
+    Ok(listener)
+}
+
+async fn next_dispatch(rx: &mut mpsc::Receiver<UpdateForWorker>) -> StartExecute {
     let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("a dispatch within two seconds")
         .expect("the channel is open");
-    let Some(update_for_worker::Update::StartAction(start_execute)) = msg.update else {
+    let Some(update_for_worker::Update::StartAction(start)) = msg.update else {
         panic!("expected a StartAction, got {msg:?}");
     };
-    let memory_kb = dispatch_property(&start_execute, "memory_kb");
-    (start_execute, memory_kb)
+    start
 }
 
-fn dispatch_property(start_execute: &StartExecute, name: &str) -> u64 {
-    start_execute
+fn property(start: &StartExecute, name: &str) -> u64 {
+    start
         .platform
         .as_ref()
         .and_then(|platform| {
@@ -190,175 +220,370 @@ fn dispatch_property(start_execute: &StartExecute, name: &str) -> u64 {
         .expect("the dispatch carries the property")
 }
 
-/// What a worker sends when its enforcement killed the action at its
-/// reservation: the usage report, then the result carrying the error.
-async fn report_memory_kill(
-    worker_scheduler: &dyn WorkerScheduler,
-    operation_id: &str,
-    reserved_kb: u64,
+async fn record_usage(
+    worker: &dyn WorkerScheduler,
+    id: &str,
+    outcome: ResourceOutcome,
+    reserved: u64,
+    peak: u64,
 ) -> Result<(), Error> {
-    let worker_id = WorkerId(WORKER.to_string());
-    let operation_id = OperationId::from(operation_id);
-    worker_scheduler
+    let memory = outcome == ResourceOutcome::KilledMemory;
+    worker
         .record_action_resource_usage(
-            &worker_id,
-            &operation_id,
+            &WorkerId(WORKER.to_string()),
+            &OperationId::from(id),
             ActionResourceUsage {
-                peak_memory_kb: reserved_kb + reserved_kb / 5,
+                peak_memory_kb: if memory { peak } else { 0 },
+                peak_disk_kb: if memory { 0 } else { peak },
                 sampled: true,
-                outcome: ResourceOutcome::KilledMemory.into(),
+                outcome: outcome.into(),
                 enforced: true,
                 reserved: Some(Reservation {
-                    memory_kb: reserved_kb,
+                    memory_kb: if memory { reserved } else { 0 },
+                    disk_kb: if memory { 0 } else { reserved },
                     ..Default::default()
                 }),
                 ..Default::default()
             },
         )
-        .await?;
-    worker_scheduler
+        .await
+}
+
+async fn finish(worker: &dyn WorkerScheduler, id: &str, result: ActionResult) -> Result<(), Error> {
+    worker
         .update_action(
-            &worker_id,
-            &operation_id,
-            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
-                exit_code: 9,
-                error: Some(make_err!(
-                    Code::FailedPrecondition,
-                    "Action exceeded its memory reservation: reserved {reserved_kb} KiB"
-                )),
-                ..ActionResult::default()
-            })),
+            &WorkerId(WORKER.to_string()),
+            &OperationId::from(id),
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(result)),
         )
         .await?;
     tokio::task::yield_now().await;
     Ok(())
 }
 
-async fn report_disk_kill(
-    worker_scheduler: &dyn WorkerScheduler,
-    operation_id: &str,
-    reserved_kb: u64,
+async fn kill(
+    worker: &dyn WorkerScheduler,
+    id: &str,
+    outcome: ResourceOutcome,
+    reserved: u64,
+    peak: u64,
 ) -> Result<(), Error> {
-    report_disk_usage(
-        worker_scheduler,
-        operation_id,
-        reserved_kb,
-        reserved_kb + reserved_kb / 5,
+    record_usage(worker, id, outcome, reserved, peak).await?;
+    finish(
+        worker,
+        id,
+        ActionResult {
+            exit_code: 9,
+            error: Some(make_err!(Code::FailedPrecondition, "worker resource kill")),
+            ..ActionResult::default()
+        },
     )
     .await
 }
 
-async fn report_disk_usage(
-    worker_scheduler: &dyn WorkerScheduler,
-    operation_id: &str,
-    reserved_kb: u64,
-    peak_kb: u64,
-) -> Result<(), Error> {
-    let worker_id = WorkerId(WORKER.to_string());
-    let operation_id = OperationId::from(operation_id);
-    worker_scheduler
-        .record_action_resource_usage(
-            &worker_id,
-            &operation_id,
-            ActionResourceUsage {
-                peak_disk_kb: peak_kb,
-                sampled: true,
-                outcome: ResourceOutcome::KilledDisk.into(),
-                enforced: true,
-                reserved: Some(Reservation {
-                    disk_kb: reserved_kb,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await?;
-    worker_scheduler
-        .update_action(
-            &worker_id,
-            &operation_id,
-            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
-                exit_code: 9,
-                error: Some(make_err!(Code::FailedPrecondition, "disk pressure kill")),
-                ..ActionResult::default()
-            })),
-        )
-        .await?;
-    tokio::task::yield_now().await;
-    Ok(())
-}
-
 async fn wait_for_completion(listener: &mut Box<dyn ActionStateResult>) -> ActionResult {
     loop {
-        let (state, _) = listener.changed().await.expect("state stream open");
+        let (state, _) = tokio::time::timeout(Duration::from_secs(2), listener.changed())
+            .await
+            .expect("completion within two seconds")
+            .expect("state stream open");
         if let ActionStage::Completed(result) = &state.stage {
             return result.clone();
         }
     }
 }
 
-#[nativelink_test]
-async fn disk_kill_escalates_to_the_fleet_ceiling_without_reserving_cpu() -> Result<(), Error> {
-    let (scheduler, worker_scheduler) = make_scheduler_with_disk(5, vec![], 0, "disk_kb");
-    let mut rx = add_worker_with_disk(&scheduler, 10_000, 5_000).await?;
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([10; 32], 512),
+async fn assert_terminal(
+    listener: &mut Box<dyn ActionStateResult>,
+    rx: &mut mpsc::Receiver<UpdateForWorker>,
+    id: &str,
+    peak: u64,
+    capacity: u64,
+    reason: &str,
+) {
+    let result = wait_for_completion(listener).await;
+    let error = result.error.expect("terminal resource failure");
+    assert_eq!(error.code, Code::FailedPrecondition);
+    let message = error.to_string();
+    assert!(message.contains(id), "{message}");
+    assert!(
+        message.contains(&format!("measured peak {peak} KiB")),
+        "{message}"
     );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([
-            ("memory_kb".to_string(), "1000".to_string()),
-            ("disk_kb".to_string(), "1000".to_string()),
-            ("cpu_count".to_string(), "1".to_string()),
-        ]),
-        ..(*base).clone()
-    });
-    let mut listener = scheduler
-        .add_action(OperationId::default(), action_info)
-        .await?;
-    tokio::task::yield_now().await;
+    assert!(
+        message.contains(&format!("capacity {capacity} KiB")),
+        "{message}"
+    );
+    assert!(message.contains(reason), "{message}");
+    assert_eq!(
+        message.matches(&format!("operation {id} killed")).count(),
+        1,
+        "{message}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "terminal failure must not requeue"
+    );
+}
 
-    let (first, _) = next_dispatch(&mut rx).await;
-    // The worker's echoed reservation wins over the action's property.
-    report_disk_kill(worker_scheduler.as_ref(), &first.operation_id, 2_000).await?;
-    let (second, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(dispatch_property(&second, "disk_kb"), 4_000);
-    assert_eq!(memory, 1_000);
-    report_disk_kill(worker_scheduler.as_ref(), &second.operation_id, 4_000).await?;
-    let (third, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(dispatch_property(&third, "disk_kb"), 5_000);
-    assert_eq!(dispatch_property(&third, "cpu_count"), 1);
-    assert_eq!(memory, 1_000);
-    report_disk_kill(worker_scheduler.as_ref(), &third.operation_id, 5_000).await?;
-    let result = wait_for_completion(&mut listener).await;
-    let err = result.error.expect("disk kill at the ceiling fails");
-    assert_eq!(err.code, Code::FailedPrecondition);
-    assert!(err.to_string().contains("killed for disk"), "{err}");
-    assert!(err.to_string().contains("no worker can run it"), "{err}");
+#[nativelink_test]
+async fn exact_properties_bound_escalation_and_impossible_peaks() -> Result<(), Error> {
+    for (key, value) in [
+        ("", Some("")),
+        ("ISA", Some("x86-64")),
+        ("fleet", Some("link")),
+        ("sandbox", Some("shared")),
+        ("sandbox", None),
+    ] {
+        let mut large = capacity(200_000, 100_000, 16);
+        if !key.is_empty() {
+            if let Some(value) = value {
+                large.exact.insert(key.to_string(), value.to_string());
+            } else {
+                large.exact.remove(key);
+            }
+        }
+        let (scheduler, worker) =
+            make_scheduler_with_capacities(vec![capacity(100_000, 100_000, 8), large]);
+        let mut rx = add_worker(&scheduler).await?;
+        let mut listener = add_action(&scheduler, 50_000, 1_000).await?;
+        let first = next_dispatch(&mut rx).await;
+        kill(
+            worker.as_ref(),
+            &first.operation_id,
+            ResourceOutcome::KilledMemory,
+            50_000,
+            80_000,
+        )
+        .await?;
+        let second = next_dispatch(&mut rx).await;
+        let eligible = key.is_empty();
+        assert_eq!(
+            property(&second, "memory_kb"),
+            if eligible { 125_000 } else { 100_000 }
+        );
+        assert_eq!(property(&second, "cpu_count"), if eligible { 1 } else { 8 });
+        if !eligible {
+            kill(
+                worker.as_ref(),
+                &second.operation_id,
+                ResourceOutcome::KilledMemory,
+                100_000,
+                150_000,
+            )
+            .await?;
+            assert_terminal(
+                &mut listener,
+                &mut rx,
+                &second.operation_id,
+                150_000,
+                100_000,
+                "exceeds capacity",
+            )
+            .await;
+        }
+    }
     Ok(())
 }
 
 #[nativelink_test]
-async fn disk_kill_is_unchanged_when_disk_escalation_is_disabled() -> Result<(), Error> {
-    let (scheduler, worker_scheduler) = make_scheduler(5);
-    let mut rx = add_worker_with_disk(&scheduler, 10_000, 5_000).await?;
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([11; 32], 512),
-    );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([
-            ("memory_kb".to_string(), "1000".to_string()),
-            ("disk_kb".to_string(), "1000".to_string()),
-        ]),
-        ..(*base).clone()
-    });
-    let mut listener = scheduler
-        .add_action(OperationId::default(), action_info)
+async fn percent_and_measured_peak_each_dominate_and_requeues_ignore_job_budget()
+-> Result<(), Error> {
+    let (scheduler, worker) = make_scheduler();
+    let mut rx = add_worker(&scheduler).await?;
+    let _listener = add_action(&scheduler, 1_001, 1_000).await?;
+    let first = next_dispatch(&mut rx).await;
+    // ceil(1001 * 250 / 100), not the small measured peak.
+    kill(
+        worker.as_ref(),
+        &first.operation_id,
+        ResourceOutcome::KilledMemory,
+        1_001,
+        7,
+    )
+    .await?;
+    let second = next_dispatch(&mut rx).await;
+    assert_eq!(property(&second, "memory_kb"), 2_503);
+    assert_eq!(second.operation_id, first.operation_id);
+    // ceil(6003 * 125 / 100) exceeds ceil(2503 * 250 / 100).
+    kill(
+        worker.as_ref(),
+        &second.operation_id,
+        ResourceOutcome::KilledMemory,
+        2_503,
+        6_003,
+    )
+    .await?;
+    let third = next_dispatch(&mut rx).await;
+    assert_eq!(property(&third, "memory_kb"), 7_504);
+    kill(
+        worker.as_ref(),
+        &third.operation_id,
+        ResourceOutcome::KilledMemory,
+        7_504,
+        1,
+    )
+    .await?;
+    let fourth = next_dispatch(&mut rx).await;
+    assert_eq!(property(&fourth, "memory_kb"), 18_760);
+    assert_eq!(property(&fourth, "disk_kb"), 1_000);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn eligible_capacity_clamps_and_reserves_whole_cpu_then_kill_is_terminal() -> Result<(), Error>
+{
+    let (scheduler, worker) = make_scheduler();
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 50_000, 1_000).await?;
+    let first = next_dispatch(&mut rx).await;
+    kill(
+        worker.as_ref(),
+        &first.operation_id,
+        ResourceOutcome::KilledMemory,
+        50_000,
+        80_000,
+    )
+    .await?;
+    let second = next_dispatch(&mut rx).await;
+    // The 200,000 KiB fleet is ineligible because its disk is only 500 KiB.
+    assert_eq!(property(&second, "memory_kb"), 100_000);
+    assert_eq!(property(&second, "cpu_count"), 8);
+    kill(
+        worker.as_ref(),
+        &second.operation_id,
+        ResourceOutcome::KilledMemory,
+        100_000,
+        99_999,
+    )
+    .await?;
+    assert_terminal(
+        &mut listener,
+        &mut rx,
+        &second.operation_id,
+        99_999,
+        100_000,
+        "whole-worker",
+    )
+    .await;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn eligibility_ignores_the_dimension_being_escalated() -> Result<(), Error> {
+    let (scheduler, worker) = make_scheduler();
+    let mut rx = add_worker(&scheduler).await?;
+    let _listener = add_action(&scheduler, 110_000, 1_000).await?;
+    let first = next_dispatch(&mut rx).await;
+    kill(
+        worker.as_ref(),
+        &first.operation_id,
+        ResourceOutcome::KilledMemory,
+        110_000,
+        99_000,
+    )
+    .await?;
+    let second = next_dispatch(&mut rx).await;
+    assert_eq!(property(&second, "memory_kb"), 100_000);
+    assert_eq!(property(&second, "cpu_count"), 8);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn peak_above_eligible_capacity_is_one_terminal_failure() -> Result<(), Error> {
+    let (scheduler, worker) = make_scheduler();
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 1_000, 1_000).await?;
+    let first = next_dispatch(&mut rx).await;
+    kill(
+        worker.as_ref(),
+        &first.operation_id,
+        ResourceOutcome::KilledMemory,
+        1_000,
+        100_001,
+    )
+    .await?;
+    assert_terminal(
+        &mut listener,
+        &mut rx,
+        &first.operation_id,
+        100_001,
+        100_000,
+        "exceeds capacity",
+    )
+    .await;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn max_steps_is_per_resource_and_exhaustion_is_terminal() -> Result<(), Error> {
+    let (scheduler, worker) = make_scheduler();
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 1_000, 1_000).await?;
+    for reserved in [1_000, 2_500, 6_250] {
+        let dispatch = next_dispatch(&mut rx).await;
+        assert_eq!(property(&dispatch, "memory_kb"), reserved);
+        kill(
+            worker.as_ref(),
+            &dispatch.operation_id,
+            ResourceOutcome::KilledMemory,
+            reserved,
+            1,
+        )
         .await?;
-    tokio::task::yield_now().await;
-    let (first, _) = next_dispatch(&mut rx).await;
-    report_disk_kill(worker_scheduler.as_ref(), &first.operation_id, 1_000).await?;
+    }
+    let disk_dispatch = next_dispatch(&mut rx).await;
+    assert_eq!(property(&disk_dispatch, "memory_kb"), 15_625);
+    assert_eq!(property(&disk_dispatch, "disk_kb"), 1_000);
+    kill(
+        worker.as_ref(),
+        &disk_dispatch.operation_id,
+        ResourceOutcome::KilledDisk,
+        1_000,
+        1,
+    )
+    .await?;
+    let after_disk = next_dispatch(&mut rx).await;
+    assert_eq!(property(&after_disk, "memory_kb"), 15_625);
+    assert_eq!(property(&after_disk, "disk_kb"), 2_500);
+    kill(
+        worker.as_ref(),
+        &after_disk.operation_id,
+        ResourceOutcome::KilledMemory,
+        15_625,
+        1,
+    )
+    .await?;
+    assert_terminal(
+        &mut listener,
+        &mut rx,
+        &after_disk.operation_id,
+        1,
+        100_000,
+        "max_steps 3 exhausted",
+    )
+    .await;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn kill_without_usage_report_is_not_escalated() -> Result<(), Error> {
+    let (scheduler, worker) = make_scheduler();
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 1_000, 1_000).await?;
+    let first = next_dispatch(&mut rx).await;
+    finish(
+        worker.as_ref(),
+        &first.operation_id,
+        ActionResult {
+            exit_code: 9,
+            error: Some(make_err!(Code::FailedPrecondition, "unreported kill")),
+            ..ActionResult::default()
+        },
+    )
+    .await?;
     let result = wait_for_completion(&mut listener).await;
     assert_eq!(result.exit_code, 9);
     assert!(
@@ -366,333 +591,40 @@ async fn disk_kill_is_unchanged_when_disk_escalation_is_disabled() -> Result<(),
             .error
             .expect("worker error")
             .to_string()
-            .contains("disk pressure kill")
+            .contains("unreported kill")
     );
-    Ok(())
-}
-
-#[nativelink_test]
-async fn memory_and_disk_kills_share_the_budget_and_escalate_only_their_resource()
--> Result<(), Error> {
-    let (scheduler, worker_scheduler) = make_scheduler_with_disk(5, vec![], 1, "disk_kb");
-    let mut rx = add_worker_with_disk(&scheduler, 10_000, 10_000).await?;
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([12; 32], 512),
-    );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([
-            ("memory_kb".to_string(), "1000".to_string()),
-            ("disk_kb".to_string(), "1000".to_string()),
-        ]),
-        ..(*base).clone()
-    });
-    let mut listener = scheduler
-        .add_action(OperationId::default(), action_info)
-        .await?;
-    tokio::task::yield_now().await;
-    let (first, _) = next_dispatch(&mut rx).await;
-    report_memory_kill(worker_scheduler.as_ref(), &first.operation_id, 1_000).await?;
-    let (second, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 2_000);
-    assert_eq!(dispatch_property(&second, "disk_kb"), 1_000);
-    report_disk_kill(worker_scheduler.as_ref(), &second.operation_id, 1_000).await?;
-    let err = wait_for_completion(&mut listener)
-        .await
-        .error
-        .expect("shared budget exhausted");
-    assert!(err.to_string().contains("killed for disk"), "{err}");
-    assert!(err.to_string().contains("more than max_steps"), "{err}");
-    Ok(())
-}
-
-#[nativelink_test]
-async fn disk_escalation_falls_back_to_property_then_peak() -> Result<(), Error> {
-    for (disk_property, expected) in [(Some("1500"), 3_000), (None, 2_400)] {
-        let (scheduler, worker_scheduler) = make_scheduler_with_disk(5, vec![], 0, "disk_kb");
-        let mut rx = add_worker_with_disk(&scheduler, 10_000, 10_000).await?;
-        let base = make_base_action_info(
-            UNIX_EPOCH + MockClock::time(),
-            DigestInfo::new([13; 32], 512),
-        );
-        let mut properties = HashMap::from([("memory_kb".to_string(), "1000".to_string())]);
-        if let Some(disk) = disk_property {
-            properties.insert("disk_kb".to_string(), disk.to_string());
-        }
-        let action_info = Arc::new(ActionInfo {
-            platform_properties: properties,
-            ..(*base).clone()
-        });
-        let _listener = scheduler
-            .add_action(OperationId::default(), action_info)
-            .await?;
-        tokio::task::yield_now().await;
-        let (first, _) = next_dispatch(&mut rx).await;
-        report_disk_usage(worker_scheduler.as_ref(), &first.operation_id, 0, 1_200).await?;
-        let (second, _) = next_dispatch(&mut rx).await;
-        assert_eq!(dispatch_property(&second, "disk_kb"), expected);
-    }
-    Ok(())
-}
-
-#[nativelink_test]
-async fn factory_rejects_disk_property_aliases() -> Result<(), Error> {
-    for disk_property in ["memory_kb", "cpu_count"] {
-        let spec = SimpleSpec {
-            memory_escalation: Some(MemoryEscalationSpec {
-                property: "memory_kb".to_string(),
-                disk_property: disk_property.to_string(),
-                percent: 200,
-                max_kb: 0,
-                ladder_kb: vec![],
-                cpu_property: "cpu_count".to_string(),
-                max_steps: 8,
-            }),
-            ..SimpleSpec::default()
-        };
-        let result =
-            scheduler_factory(&SchedulerSpec::Simple(spec), &StoreManager::new(), None).await;
-        let err = match result {
-            Err(err) => err,
-            Ok(_) => panic!("disk property alias must be rejected"),
-        };
-        assert!(
-            err.to_string().contains("disk_property must differ"),
-            "{err}"
-        );
-    }
-    Ok(())
-}
-
-#[nativelink_test]
-async fn disk_uses_ladder_but_ignores_memory_cap() -> Result<(), Error> {
-    let (scheduler, worker_scheduler) =
-        make_scheduler_with_disk_and_memory_cap(5, vec![3_000, 7_000], 0, "disk_kb", 2_000);
-    let mut rx = add_worker_with_disk(&scheduler, 10_000, 10_000).await?;
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([14; 32], 512),
-    );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([
-            ("memory_kb".to_string(), "1000".to_string()),
-            ("disk_kb".to_string(), "1000".to_string()),
-        ]),
-        ..(*base).clone()
-    });
-    let _listener = scheduler
-        .add_action(OperationId::default(), action_info)
-        .await?;
-    tokio::task::yield_now().await;
-    let (first, _) = next_dispatch(&mut rx).await;
-    report_disk_kill(worker_scheduler.as_ref(), &first.operation_id, 1_000).await?;
-    let (second, _) = next_dispatch(&mut rx).await;
-    assert_eq!(dispatch_property(&second, "disk_kb"), 3_000);
-    report_disk_kill(worker_scheduler.as_ref(), &second.operation_id, 3_000).await?;
-    let (third, _) = next_dispatch(&mut rx).await;
-    assert_eq!(dispatch_property(&third, "disk_kb"), 7_000);
-    Ok(())
-}
-
-/// A memory kill doubles the reservation and runs the action again; the
-/// doubling stops at the largest memory any worker advertises; a kill at
-/// that ceiling fails the action with the worker's own error.
-#[nativelink_test]
-async fn a_memory_kill_requeues_the_action_with_double_the_reservation() -> Result<(), Error> {
-    let (scheduler, worker_scheduler) = make_scheduler(5);
-    let mut rx = add_worker(&scheduler, 5_000).await?;
-
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([1; 32], 512),
-    );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([("memory_kb".to_string(), "2000".to_string())]),
-        ..(*base).clone()
-    });
-    let mut listener = scheduler
-        .add_action(OperationId::default(), action_info)
-        .await?;
-    tokio::task::yield_now().await;
-
-    let (first, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 2_000);
-    report_memory_kill(worker_scheduler.as_ref(), &first.operation_id, 2_000).await?;
-
-    let (second, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 4_000, "the reservation doubles after a kill");
-    assert_eq!(
-        second.operation_id, first.operation_id,
-        "same operation, asking for more"
-    );
-    report_memory_kill(worker_scheduler.as_ref(), &second.operation_id, 4_000).await?;
-
-    let (third, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 5_000, "capped at the largest worker");
-    report_memory_kill(worker_scheduler.as_ref(), &third.operation_id, 5_000).await?;
-
-    // Nothing bigger exists: the client gets the worker's error.
-    let result = wait_for_completion(&mut listener).await;
-    let err = result.error.expect("the action fails");
-    assert_eq!(err.code, Code::FailedPrecondition, "{err}");
     assert!(
-        err.to_string().contains("memory reservation"),
-        "the worker's message reaches the client: {err}"
+        tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err()
     );
     Ok(())
 }
 
-/// Escalations have their own budget: four kills on a `max_job_retries` of
-/// one, and the action is still running, each time with more memory.
 #[nativelink_test]
-async fn escalation_does_not_spend_the_retry_budget() -> Result<(), Error> {
-    // One retry for the action's own failures; escalations are not those.
-    let (scheduler, worker_scheduler) = make_scheduler(1);
-    let mut rx = add_worker(&scheduler, 1_000_000).await?;
-
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([2; 32], 512),
+async fn completed_usage_does_not_escalate_or_change_result() -> Result<(), Error> {
+    let (scheduler, worker) = make_scheduler();
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 1_000, 1_000).await?;
+    let first = next_dispatch(&mut rx).await;
+    record_usage(
+        worker.as_ref(),
+        &first.operation_id,
+        ResourceOutcome::Completed,
+        1_000,
+        90_000,
+    )
+    .await?;
+    let expected = ActionResult {
+        exit_code: 23,
+        ..ActionResult::default()
+    };
+    finish(worker.as_ref(), &first.operation_id, expected.clone()).await?;
+    assert_eq!(wait_for_completion(&mut listener).await, expected);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err()
     );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([("memory_kb".to_string(), "1000".to_string())]),
-        ..(*base).clone()
-    });
-    let _listener = scheduler
-        .add_action(OperationId::default(), action_info)
-        .await?;
-    tokio::task::yield_now().await;
-
-    let mut reserved = 1_000;
-    for _ in 0..4 {
-        let (dispatch, memory) = next_dispatch(&mut rx).await;
-        assert_eq!(memory, reserved);
-        report_memory_kill(worker_scheduler.as_ref(), &dispatch.operation_id, reserved).await?;
-        reserved *= 2;
-    }
-    // Four kills, four requeues, on a budget of one: still running.
-    let (_, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 16_000);
-    Ok(())
-}
-
-/// `max_steps` bounds the escalations: with two, the third kill ends the
-/// action, and the client hears that the budget is spent.
-#[nativelink_test]
-async fn escalation_stops_at_max_steps() -> Result<(), Error> {
-    let (scheduler, worker_scheduler) = make_scheduler_with_limits(5, vec![], 2);
-    let mut rx = add_worker(&scheduler, 1_000_000).await?;
-
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([4; 32], 512),
-    );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([("memory_kb".to_string(), "1000".to_string())]),
-        ..(*base).clone()
-    });
-    let mut listener = scheduler
-        .add_action(OperationId::default(), action_info)
-        .await?;
-    tokio::task::yield_now().await;
-
-    let mut reserved = 1_000;
-    for _ in 0..3 {
-        let (dispatch, memory) = next_dispatch(&mut rx).await;
-        assert_eq!(memory, reserved);
-        report_memory_kill(worker_scheduler.as_ref(), &dispatch.operation_id, reserved).await?;
-        reserved *= 2;
-    }
-
-    let result = wait_for_completion(&mut listener).await;
-    let err = result.error.expect("the third kill is past the budget");
-    assert_eq!(err.code, Code::FailedPrecondition, "{err}");
-    assert!(err.to_string().contains("more than max_steps"), "{err}");
-    Ok(())
-}
-
-/// A worker lost mid-action is not the action's failure: the requeue has
-/// its own budget (`max_worker_loss_retries`, two here) and leaves
-/// `max_job_retries` alone; past that budget the client hears the worker
-/// keeps dying under this action.
-#[nativelink_test]
-async fn a_lost_worker_does_not_spend_the_retry_budget() -> Result<(), Error> {
-    let (scheduler, worker_scheduler) = make_scheduler(1);
-    let mut rx = add_worker(&scheduler, 1_000_000).await?;
-
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([4; 32], 512),
-    );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([("memory_kb".to_string(), "1000".to_string())]),
-        ..(*base).clone()
-    });
-    let mut listener = scheduler
-        .add_action(OperationId::default(), action_info)
-        .await?;
-    tokio::task::yield_now().await;
-
-    for loss in 1..=2 {
-        let (_, memory) = next_dispatch(&mut rx).await;
-        assert_eq!(memory, 1_000, "loss {loss}: the reservation is unchanged");
-        worker_scheduler
-            .remove_worker(&WorkerId(WORKER.to_string()))
-            .await?;
-        tokio::task::yield_now().await;
-        rx = add_worker(&scheduler, 1_000_000).await?;
-    }
-    // Two losses on a job budget of one: still queued and dispatched.
-    let (_, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 1_000);
-    // The third loss is past the loss budget.
-    worker_scheduler
-        .remove_worker(&WorkerId(WORKER.to_string()))
-        .await?;
-    let result = wait_for_completion(&mut listener).await;
-    let err = result.error.expect("the action fails past the loss budget");
-    assert_eq!(err.code, Code::FailedPrecondition, "{err}");
-    assert!(err.to_string().contains("lost 3 times"), "{err}");
-    Ok(())
-}
-
-/// With a size ladder, a kill steps to the next class above the reservation
-/// rather than scaling; past the top class the largest worker is reserved
-/// whole, and only a kill there fails the action.
-#[nativelink_test]
-async fn escalation_steps_the_ladder_then_takes_the_whole_worker() -> Result<(), Error> {
-    let (scheduler, worker_scheduler) = make_scheduler_with_ladder(5, vec![1_000, 4_000, 9_000]);
-    let mut rx = add_worker(&scheduler, 1_000_000).await?;
-
-    let base = make_base_action_info(
-        UNIX_EPOCH + MockClock::time(),
-        DigestInfo::new([3; 32], 512),
-    );
-    let action_info = Arc::new(ActionInfo {
-        platform_properties: HashMap::from([("memory_kb".to_string(), "1500".to_string())]),
-        ..(*base).clone()
-    });
-    let mut listener = scheduler
-        .add_action(OperationId::default(), action_info)
-        .await?;
-    tokio::task::yield_now().await;
-
-    let (first, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 1_500);
-    report_memory_kill(worker_scheduler.as_ref(), &first.operation_id, 1_500).await?;
-    let (second, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 4_000, "the next class above 1500");
-    report_memory_kill(worker_scheduler.as_ref(), &second.operation_id, 4_000).await?;
-    let (third, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 9_000, "the top class");
-    report_memory_kill(worker_scheduler.as_ref(), &third.operation_id, 9_000).await?;
-    let (fourth, memory) = next_dispatch(&mut rx).await;
-    assert_eq!(memory, 1_000_000, "the whole of the largest worker");
-    report_memory_kill(worker_scheduler.as_ref(), &fourth.operation_id, 1_000_000).await?;
-
-    let result = wait_for_completion(&mut listener).await;
-    let err = result.error.expect("nothing above the whole worker");
-    assert_eq!(err.code, Code::FailedPrecondition, "{err}");
-    assert!(err.to_string().contains("no worker can run it"), "{err}");
     Ok(())
 }

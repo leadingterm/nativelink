@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(target_os = "linux")]
+mod action_cgroup;
 pub mod buck2_file_capture;
 pub mod capacity;
 pub mod directory_cache;
@@ -22,6 +24,8 @@ pub mod namespace_utils;
 pub mod persistent_worker;
 pub mod qos;
 pub mod reaper;
+#[cfg(target_os = "linux")]
+mod resource_pressure;
 pub mod running_actions_manager;
 pub mod worker_api_client_wrapper;
 pub mod worker_utils;

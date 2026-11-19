@@ -223,21 +223,43 @@ async fn simple_scheduler_factory(
     maybe_origin_event_tx: Option<&mpsc::Sender<OriginEvent>>,
     resource_sketch: Option<Arc<ResourceSketch>>,
 ) -> Result<SchedulerFactoryResults, Error> {
-    if let Some(policy) = &spec.memory_escalation
-        && policy.percent <= 100
-    {
-        return Err(make_input_err!(
-            "memory_escalation.percent must be above 100 to grow the reservation, got {}",
-            policy.percent
-        ));
-    }
-    if let Some(policy) = &spec.memory_escalation
-        && !policy.disk_property.is_empty()
-        && (policy.disk_property == policy.property || policy.disk_property == policy.cpu_property)
-    {
-        return Err(make_input_err!(
-            "memory_escalation.disk_property must differ from property and cpu_property"
-        ));
+    if let Some(policy) = &spec.resource_escalation {
+        for dimension in core::iter::once(&policy.memory).chain(policy.disk.iter()) {
+            if dimension.property.is_empty() || dimension.percent <= 100 || dimension.max_steps == 0
+            {
+                return Err(make_input_err!(
+                    "resource escalation requires a property, percent above 100, and nonzero max_steps"
+                ));
+            }
+        }
+        if policy.cpu_property.is_empty()
+            || policy.memory.property == policy.cpu_property
+            || policy.disk.as_ref().is_some_and(|disk| {
+                disk.property == policy.memory.property || disk.property == policy.cpu_property
+            })
+            || policy.capacities.is_empty()
+            || policy.capacities.iter().any(|capacity| {
+                capacity
+                    .minimum
+                    .get(&policy.memory.property)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+                    || capacity
+                        .minimum
+                        .get(&policy.cpu_property)
+                        .copied()
+                        .unwrap_or(0)
+                        == 0
+                    || policy.disk.as_ref().is_some_and(|disk| {
+                        capacity.minimum.get(&disk.property).copied().unwrap_or(0) == 0
+                    })
+            })
+        {
+            return Err(make_input_err!(
+                "resource escalation requires distinct properties and nonzero configured capacities"
+            ));
+        }
     }
     if let Some(hold) = &spec.reservation_hold
         && (hold.hold_after_s == 0 || hold.max_hold_s == 0)

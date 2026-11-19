@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[cfg(feature = "dev-schema")]
 use schemars::JsonSchema;
@@ -311,7 +311,7 @@ pub struct SimpleSpec {
     /// task itself is the one causing the server to go into a bad state.
     /// A lost worker and a memory escalation are not the action's failures
     /// and have their own budgets: `max_worker_loss_retries` and
-    /// `memory_escalation.max_steps`.
+    /// `resource_escalation` per-resource `max_steps`.
     /// Default: 3
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_job_retries: usize,
@@ -341,15 +341,11 @@ pub struct SimpleSpec {
     #[serde(default)]
     pub live_memory_veto: Option<String>,
 
-    /// Requeue an action killed for memory with a larger reservation.
-    /// Setting `disk_property` also enables escalation after disk kills.
-    /// Both resources share the `max_steps` budget and do not spend
-    /// `max_job_retries`. Each grows up to the largest non-draining worker's
-    /// reservation for that resource. `max_kb` and the final whole-worker
-    /// CPU reservation apply only to memory.
+    /// Requeue resource-killed actions with measured-peak-aware reservations.
+    /// Each resource has its own retry budget, independent of job retries.
     /// Default: unset (resource kills are not escalated)
     #[serde(default)]
-    pub memory_escalation: Option<MemoryEscalationSpec>,
+    pub resource_escalation: Option<ResourceEscalationSpec>,
 
     /// Hold a worker for a queued action that keeps finding no room. An
     /// action whose reservation only fits an idle worker starves under
@@ -559,63 +555,43 @@ fn default_historical_resource_memory_property_name() -> String {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
-pub struct MemoryEscalationSpec {
-    /// The `minimum` platform property carrying the memory reservation.
-    /// Default: `memory_kb`
-    #[serde(default = "default_historical_resource_memory_property_name")]
-    pub property: String,
-
-    /// The `minimum` platform property carrying the disk reservation in KiB.
-    /// Empty disables escalation after a disk kill. It must differ from the
-    /// memory and CPU properties. Default: empty.
+pub struct ResourceEscalationSpec {
+    /// Memory escalation policy.
+    pub memory: EscalationDimensionSpec,
+    /// Optional disk escalation policy.
     #[serde(default)]
-    pub disk_property: String,
-
-    /// Each kill scales its resource's reservation by this factor, in
-    /// hundredths: 200 doubles it, 150 adds half.
-    /// Default: 200
-    #[serde(default = "default_memory_escalation_percent")]
-    pub percent: u64,
-
-    /// Never reserve more memory than this many KiB; 0 takes the largest
-    /// memory any connected worker advertises. Does not cap disk.
-    /// Default: 0
-    #[serde(default)]
-    pub max_kb: u64,
-
-    /// Reservation size classes, ascending, in KiB, used for both memory
-    /// and disk. When set, a kill steps to the next class above the current
-    /// reservation instead of scaling by `percent`; past the top class the
-    /// last step reserves the fleet's largest value for that resource.
-    /// Default: empty (scale by `percent`)
-    #[serde(default)]
-    pub ladder_kb: Vec<u64>,
-
-    /// The `minimum` platform property carrying the CPU reservation. The
-    /// last escalation reserves the largest worker's whole memory and,
-    /// through this property, its whole CPU, so nothing shares the worker
-    /// with the action. Empty leaves CPU alone.
-    /// Default: `cpu_count`
-    #[serde(default = "default_memory_escalation_cpu_property")]
+    pub disk: Option<EscalationDimensionSpec>,
+    /// Headroom applied to measured peaks.
+    pub headroom_percent: u64,
+    /// Minimum CPU property reserved whole at the eligible capacity.
     pub cpu_property: String,
+    /// Declared minimum and exact properties of each configured worker type.
+    pub capacities: Vec<ResourceCapacity>,
+}
 
-    /// The most escalations one action gets before the scheduler completes
-    /// it with `FailedPrecondition`; 0 lets the ceiling alone bound them.
-    /// Default: 8
-    #[serde(default = "default_memory_escalation_max_steps")]
+/// Platform properties declared by a configured worker type.
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct ResourceCapacity {
+    /// Minimum-property capacities, including the resource and CPU properties.
+    #[serde(default)]
+    pub minimum: BTreeMap<String, u64>,
+    /// Exact properties; a requested key must be present and equal.
+    #[serde(default)]
+    pub exact: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct EscalationDimensionSpec {
+    /// Minimum property carrying this resource reservation.
+    pub property: String,
+    /// Reservation growth percentage; must exceed 100.
+    pub percent: u64,
+    /// Maximum requeues for this resource.
     pub max_steps: u64,
-}
-
-fn default_memory_escalation_cpu_property() -> String {
-    "cpu_count".to_string()
-}
-
-const fn default_memory_escalation_max_steps() -> u64 {
-    8
-}
-
-const fn default_memory_escalation_percent() -> u64 {
-    200
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy)]

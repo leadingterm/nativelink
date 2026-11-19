@@ -1296,9 +1296,6 @@ impl SimpleScheduler {
             } else {
                 spec.max_worker_loss_retries
             },
-            max_escalations: spec.memory_escalation.as_ref().map_or(0, |policy| {
-                usize::try_from(policy.max_steps).unwrap_or(usize::MAX)
-            }),
         };
         let state_manager = SimpleSchedulerStateManager::new(
             retry_limits,
@@ -1318,7 +1315,7 @@ impl SimpleScheduler {
             platform_property_manager.clone(),
             spec.allocation_strategy,
             spec.live_memory_veto.clone(),
-            spec.memory_escalation.clone(),
+            spec.resource_escalation.clone(),
             spec.reservation_hold,
             worker_change_notify.clone(),
             worker_timeout_s,

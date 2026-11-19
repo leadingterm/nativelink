@@ -916,122 +916,218 @@ pub struct EndpointConfig {
 pub enum MemoryEnforcement {
     /// Measure only.
     None,
-    /// Kill the action's process group once two consecutive samples exceed
-    /// the reservation plus headroom, or one sample exceeds twice it.
+    /// Kill an action under sustained pool pressure.
     #[default]
+    Pressure,
+    /// Enforce a per-action reservation ceiling.
     Soft,
 }
 
+/// Worker resource enforcement settings. Invalid values fail configuration loading.
 #[derive(Clone, Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct ResourceEnforcementConfig {
-    /// What to do with an action that exceeds its memory reservation.
-    /// Default: soft
+    /// Memory enforcement mode. Default: `pressure`.
     #[serde(default)]
     pub memory: MemoryEnforcement,
-
-    /// Whether to refuse an action whose disk reservation exceeds the free
-    /// space under the work directory, less what the actions already
-    /// admitted reserved, before its inputs are fetched. The
-    /// refusal is `ResourceExhausted`, which the scheduler requeues without
-    /// counting an attempt and holds off this worker until its next
-    /// keepalive.
-    /// Default: none
+    /// Disk enforcement mode. Default: `pressure`.
     #[serde(default)]
     pub disk: DiskEnforcement,
-
-    /// Platform property carrying the action's disk reservation in KiB.
-    /// Default: `disk_kb`
+    /// Platform property carrying the disk reservation in KiB. Default: `disk_kb`.
     #[serde(
         default = "default_disk_property_name",
         deserialize_with = "convert_string_with_shellexpand"
     )]
     pub disk_property_name: String,
-
-    /// Platform property carrying the action's memory reservation in KiB,
-    /// as the scheduler sends it. An action without the property is not
-    /// enforced.
-    /// Default: `memory_kb`
+    /// Platform property carrying the memory reservation in KiB. Default: `memory_kb`.
     #[serde(
         default = "default_memory_property_name",
         deserialize_with = "convert_string_with_shellexpand"
     )]
     pub memory_property_name: String,
-
-    /// Percent above the reservation an action may reach before it is
-    /// killed.
-    /// Default: 20
+    /// Percentage above the memory reservation allowed in soft mode. Default: 20.
     #[serde(
         default = "default_memory_headroom_percent",
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub memory_headroom_percent: u64,
-
-    /// Percent above its disk reservation an action's own files may reach
-    /// before it is killed, with `disk: soft`.
-    /// Default: 20
+    /// Consecutive memory samples above the soft ceiling before killing. Default: 2.
+    #[serde(
+        default = "default_memory_soft_samples",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub memory_soft_samples: u32,
+    /// Percentage of the memory soft ceiling triggering an immediate kill. Default: 200.
+    #[serde(
+        default = "default_memory_soft_spike_percent",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub memory_soft_spike_percent: u64,
+    /// Per-action memory sampling interval in milliseconds. Default: 250.
+    #[serde(
+        default = "default_memory_sample_interval_ms",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub memory_sample_interval_ms: u64,
+    /// Minimum percentage of elapsed time stalled to count as pressure. Default: 10.
+    #[serde(
+        default = "default_memory_pressure_stall_percent",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub memory_pressure_stall_percent: u32,
+    /// Memory pressure polling interval in milliseconds. Default: 250.
+    #[serde(
+        default = "default_memory_sample_interval_ms",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub memory_pressure_poll_interval_ms: u64,
+    /// Sustained memory pressure before a kill, in milliseconds. Default: 5000.
+    #[serde(
+        default = "default_memory_pressure_kill_after_ms",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub memory_pressure_kill_after_ms: u64,
+    /// Absolute action-pool cgroup path for exact usage and pressure. When absent,
+    /// usage falls back to PSS and pressure to the nearest limited ancestor. Default: unset.
+    #[serde(default)]
+    pub memory_pool_path: Option<String>,
+    /// Percentage above the disk reservation allowed in soft mode. Default: 20.
     #[serde(
         default = "default_memory_headroom_percent",
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub disk_headroom_percent: u64,
-
-    /// Free space threshold as a whole percentage of filesystem capacity.
-    /// Values above 100 are clamped; 0 disables disk pressure kills. Default: 5.
+    /// Consecutive disk samples above the soft ceiling before killing. Default: 1.
+    #[serde(
+        default = "default_disk_soft_samples",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub disk_soft_samples: u32,
+    /// Per-action disk sampling interval in milliseconds. Default: 10000.
+    #[serde(
+        default = "default_disk_sample_interval_ms",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub disk_sample_interval_ms: u64,
+    /// Free filesystem percentage at or below which disk pressure occurs. Default: 5.
     #[serde(
         default = "default_disk_pressure_free_percent",
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub disk_pressure_free_percent: u32,
-
-    /// Seconds free space must remain at or below the threshold. 0 means 1.
-    /// Default: 5 seconds.
+    /// Disk pressure polling interval in milliseconds. Default: 2000.
     #[serde(
-        default = "default_disk_pressure_kill_after_s",
-        deserialize_with = "convert_duration_with_shellexpand"
+        default = "default_disk_pressure_poll_interval_ms",
+        deserialize_with = "convert_numeric_with_shellexpand"
     )]
-    pub disk_pressure_kill_after_s: u64,
-
-    /// Kill one running action once the worker's cgroup has spent at least
-    /// this share of the last ten seconds, as a whole number from 0 to 100,
-    /// with every task stalled on memory (`full avg10` in cgroup v2
-    /// `memory.pressure`) for `memory_pressure_kill_after_s` without a
-    /// break. A worker whose actions fit under its limit only by thrashing
-    /// never reaches the OOM killer and stops answering the scheduler; this
-    /// ends the action instead, as a memory kill, so the scheduler requeues
-    /// it with a larger reservation. The kill lands on the action furthest
-    /// over its reservation, or the largest when none is over, and never
-    /// on one that reserves the whole worker. It does not check that the
-    /// actions caused the pressure: pressure from the worker itself (page
-    /// cache from the filesystem store, a large upload) still kills an
-    /// action. Needs `memory: soft`, which supplies the per-action samples
-    /// the choice is made from. Values over 100 are read as 100. 0 disables.
-    /// Default: 0
-    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
-    pub memory_pressure_kill_percent: u64,
-
-    /// How long `memory.pressure` must stay at or above
-    /// `memory_pressure_kill_percent` before an action is killed, in
-    /// seconds. Another kill waits this long again. 0 is read as 1.
-    /// Default: 30
+    pub disk_pressure_poll_interval_ms: u64,
+    /// Sustained disk pressure before a kill, in milliseconds. Default: 5000.
     #[serde(
-        default = "default_memory_pressure_kill_after_s",
-        deserialize_with = "convert_duration_with_shellexpand"
+        default = "default_disk_pressure_kill_after_ms",
+        deserialize_with = "convert_numeric_with_shellexpand"
     )]
-    pub memory_pressure_kill_after_s: u64,
+    pub disk_pressure_kill_after_ms: u64,
+}
+
+impl ResourceEnforcementConfig {
+    /// Reject invalid resource settings rather than silently adjusting them.
+    ///
+    /// # Errors
+    /// Returns the invalid field and its required range.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("memory_soft_samples", u64::from(self.memory_soft_samples)),
+            ("memory_sample_interval_ms", self.memory_sample_interval_ms),
+            (
+                "memory_pressure_poll_interval_ms",
+                self.memory_pressure_poll_interval_ms,
+            ),
+            (
+                "memory_pressure_kill_after_ms",
+                self.memory_pressure_kill_after_ms,
+            ),
+            ("disk_soft_samples", u64::from(self.disk_soft_samples)),
+            ("disk_sample_interval_ms", self.disk_sample_interval_ms),
+            (
+                "disk_pressure_poll_interval_ms",
+                self.disk_pressure_poll_interval_ms,
+            ),
+            (
+                "disk_pressure_kill_after_ms",
+                self.disk_pressure_kill_after_ms,
+            ),
+        ] {
+            if value == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+        }
+        for (name, value) in [
+            (
+                "memory_pressure_stall_percent",
+                self.memory_pressure_stall_percent,
+            ),
+            (
+                "disk_pressure_free_percent",
+                self.disk_pressure_free_percent,
+            ),
+        ] {
+            if !(1..=100).contains(&value) {
+                return Err(format!("{name} must be between 1 and 100"));
+            }
+        }
+        if self.memory_soft_spike_percent <= 100 {
+            return Err("memory_soft_spike_percent must be greater than 100".to_string());
+        }
+        for (name, value) in [
+            ("memory_headroom_percent", self.memory_headroom_percent),
+            ("disk_headroom_percent", self.disk_headroom_percent),
+        ] {
+            if value.checked_add(100).is_none() {
+                return Err(format!("{name} overflows when added to 100"));
+            }
+        }
+        if self
+            .memory_pool_path
+            .as_ref()
+            .is_some_and(|path| !path.starts_with('/'))
+        {
+            return Err("memory_pool_path must be absolute".to_string());
+        }
+        Ok(())
+    }
 }
 
 const fn default_disk_pressure_free_percent() -> u32 {
     5
 }
 
-const fn default_disk_pressure_kill_after_s() -> u64 {
-    5
+const fn default_disk_pressure_kill_after_ms() -> u64 {
+    5000
 }
-
-const fn default_memory_pressure_kill_after_s() -> u64 {
-    30
+const fn default_memory_pressure_kill_after_ms() -> u64 {
+    5000
+}
+const fn default_memory_soft_samples() -> u32 {
+    2
+}
+const fn default_memory_soft_spike_percent() -> u64 {
+    200
+}
+const fn default_memory_sample_interval_ms() -> u64 {
+    250
+}
+const fn default_memory_pressure_stall_percent() -> u32 {
+    10
+}
+const fn default_disk_soft_samples() -> u32 {
+    1
+}
+const fn default_disk_sample_interval_ms() -> u64 {
+    10000
+}
+const fn default_disk_pressure_poll_interval_ms() -> u64 {
+    2000
 }
 
 fn default_memory_property_name() -> String {
@@ -1051,7 +1147,6 @@ fn default_disk_property_name() -> String {
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub enum DiskEnforcement {
     /// Fetch inputs regardless of free space.
-    #[default]
     None,
     /// Refuse the action when the free space under the work directory is
     /// below its reservation.
@@ -1064,6 +1159,7 @@ pub enum DiskEnforcement {
     Soft,
     /// `guard`, plus kill an action only under sustained worker disk pressure.
     /// Reservations are not per-action ceilings in this mode.
+    #[default]
     Pressure,
 }
 
@@ -1110,6 +1206,10 @@ pub enum EnvironmentSource {
     /// with the parent process about out-of-band information. This file
     /// will be read after the command has finished executing. Based on the
     /// contents of the file, the behavior of the result may be modified.
+    /// The path is `<root_action_directory>/.side_channels/<action-id>/report`;
+    /// its private directory is removed during action cleanup.
+    /// When using namespaces, the side channel root must remain reachable
+    /// by the entrypoint wrapper.
     ///
     /// The format of the file contents should be json with the following
     /// schema:
@@ -1120,6 +1220,8 @@ pub enum EnvironmentSource {
     ///   // "memory": The kernel's memory limit killed the task. The result
     ///   // reports an enforced memory kill so the reservation can be raised.
     ///   "failure": "timeout",
+    ///   // Exact kernel memory peak in KiB, when available.
+    ///   "peak_memory_kb": 12345,
     /// }
     ///
     /// All fields are optional, file does not need to be created and may be
@@ -1465,11 +1567,9 @@ pub struct LocalWorkerConfig {
     #[serde(default)]
     pub drain_on_shutdown: bool,
 
-    /// Kill an action that grows past its memory reservation before the
-    /// pod's cgroup limit does. On cgroup v2 the container cgroup carries
-    /// `memory.oom.group`, so the kernel's kill takes the worker and every
-    /// action on it; this one takes only the offender and fails it with
-    /// `FailedPrecondition`. Linux only; accepted and ignored elsewhere.
+    /// Enforce action reservations or relieve sustained resource pressure.
+    /// Pressure mode does not impose a per-action reservation ceiling.
+    /// Linux only; accepted and ignored elsewhere.
     /// Actions run through a persistent worker are not covered, since that
     /// process outlives the action and serves others. With either axis on,
     /// the worker reads an action's platform properties from the
@@ -1519,11 +1619,13 @@ pub struct LocalWorkerConfig {
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub orphan_sweep_interval_s: u64,
 
-    /// Milliseconds between the SIGTERM a timed-out or cancelled action
-    /// receives and the SIGKILL that follows if it is still running, so a
-    /// tool that handles SIGTERM can write its own cleanup. The memory
-    /// reservation kill skips the grace and sends SIGKILL at once. Linux
-    /// only; elsewhere the kill is immediate. 0 takes the default.
+    /// Milliseconds between SIGTERM and SIGKILL for a timed-out or cancelled
+    /// action. For a resource kill with validated Gang cgroup metadata, the
+    /// worker writes `cgroup.kill` and waits this long for the wrapper to exit
+    /// and report its final peak, then kills the wrapper if it is still running.
+    /// Without metadata, a resource kill immediately sends SIGKILL to the
+    /// process groups. Linux only; elsewhere the kill is immediate.
+    /// 0 takes the default.
     /// Default: 5000
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub kill_grace_ms: u64,
@@ -1897,6 +1999,11 @@ impl CasConfig {
     fn validate_single_use_worker(&self) -> Result<(), Error> {
         let workers = self.workers.as_deref().unwrap_or_default();
         for WorkerConfig::Local(worker) in workers {
+            if let Some(enforcement) = &worker.resource_enforcement {
+                enforcement
+                    .validate()
+                    .map_err(|error| make_input_err!("{error}"))?;
+            }
             if let Some(capture) = &worker.experimental_buck2_file_capture {
                 if !worker.single_use
                     || !worker.entrypoint.is_empty()
@@ -2084,6 +2191,179 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+
+    #[test]
+    fn resource_enforcement_defaults_and_nondefault_values() {
+        let d: ResourceEnforcementConfig = serde_json5::from_str("{}").unwrap();
+        assert_eq!(
+            (d.memory, d.disk),
+            (MemoryEnforcement::Pressure, DiskEnforcement::Pressure)
+        );
+        assert_eq!(
+            (&*d.memory_property_name, &*d.disk_property_name),
+            ("memory_kb", "disk_kb")
+        );
+        assert_eq!(
+            (
+                d.memory_headroom_percent,
+                d.memory_soft_samples,
+                d.memory_soft_spike_percent
+            ),
+            (20, 2, 200)
+        );
+        assert_eq!(
+            (
+                d.memory_sample_interval_ms,
+                d.memory_pressure_stall_percent,
+                d.memory_pressure_poll_interval_ms,
+                d.memory_pressure_kill_after_ms
+            ),
+            (250, 10, 250, 5000)
+        );
+        assert_eq!(d.memory_pool_path, None);
+        assert_eq!(
+            (
+                d.disk_headroom_percent,
+                d.disk_soft_samples,
+                d.disk_sample_interval_ms,
+                d.disk_pressure_free_percent,
+                d.disk_pressure_poll_interval_ms,
+                d.disk_pressure_kill_after_ms
+            ),
+            (20, 1, 10000, 5, 2000, 5000)
+        );
+        d.validate().unwrap();
+        let c: ResourceEnforcementConfig = serde_json5::from_str(
+            r#"{
+            memory: "soft", disk: "guard", memory_property_name: "ram",
+            disk_property_name: "space", memory_headroom_percent: 31,
+            memory_soft_samples: 3, memory_soft_spike_percent: 175,
+            memory_sample_interval_ms: 123, memory_pressure_stall_percent: 7,
+            memory_pressure_poll_interval_ms: 124, memory_pressure_kill_after_ms: 125,
+            memory_pool_path: "/sys/fs/cgroup/actions", disk_headroom_percent: 32,
+            disk_soft_samples: 4, disk_sample_interval_ms: 126,
+            disk_pressure_free_percent: 8, disk_pressure_poll_interval_ms: 127,
+            disk_pressure_kill_after_ms: 128
+        }"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(
+            (c.memory, c.disk),
+            (MemoryEnforcement::Soft, DiskEnforcement::Guard)
+        );
+        assert_eq!(
+            (&*c.memory_property_name, &*c.disk_property_name),
+            ("ram", "space")
+        );
+        assert_eq!(
+            (
+                c.memory_headroom_percent,
+                c.memory_soft_samples,
+                c.memory_soft_spike_percent
+            ),
+            (31, 3, 175)
+        );
+        assert_eq!(
+            (
+                c.memory_sample_interval_ms,
+                c.memory_pressure_stall_percent,
+                c.memory_pressure_poll_interval_ms,
+                c.memory_pressure_kill_after_ms
+            ),
+            (123, 7, 124, 125)
+        );
+        assert_eq!(
+            c.memory_pool_path.as_deref(),
+            Some("/sys/fs/cgroup/actions")
+        );
+        assert_eq!(
+            (
+                c.disk_headroom_percent,
+                c.disk_soft_samples,
+                c.disk_sample_interval_ms,
+                c.disk_pressure_free_percent,
+                c.disk_pressure_poll_interval_ms,
+                c.disk_pressure_kill_after_ms
+            ),
+            (32, 4, 126, 8, 127, 128)
+        );
+    }
+
+    #[test]
+    fn resource_enforcement_rejects_invalid_fields_at_load() {
+        for (field, value) in [
+            ("memory_soft_samples", "0"),
+            ("memory_sample_interval_ms", "0"),
+            ("memory_pressure_poll_interval_ms", "0"),
+            ("memory_pressure_kill_after_ms", "0"),
+            ("disk_soft_samples", "0"),
+            ("disk_sample_interval_ms", "0"),
+            ("disk_pressure_poll_interval_ms", "0"),
+            ("disk_pressure_kill_after_ms", "0"),
+            ("memory_pressure_stall_percent", "0"),
+            ("memory_pressure_stall_percent", "101"),
+            ("disk_pressure_free_percent", "0"),
+            ("disk_pressure_free_percent", "101"),
+            ("memory_soft_spike_percent", "100"),
+            ("memory_pool_path", "\"relative/path\""),
+        ] {
+            let text = format!(
+                r#"{{
+                stores: [], servers: [], workers: [{{ local: {{
+                    worker_api_endpoint: {{ uri: "http://localhost:50051" }}, cas_fast_slow_store: "cas",
+                    work_directory: "/work", platform_properties: {{}},
+                    resource_enforcement: {{ {field}: {value} }}
+                }} }}]
+            }}"#
+            );
+            let error = CasConfig::try_from_json5_str(&text)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+        let mut config: ResourceEnforcementConfig = serde_json5::from_str("{}").unwrap();
+        config.memory_headroom_percent = u64::MAX;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("memory_headroom_percent")
+        );
+        config.memory_headroom_percent = 20;
+        config.disk_headroom_percent = u64::MAX;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("disk_headroom_percent")
+        );
+    }
+
+    #[test]
+    fn resource_enforcement_rejects_unknown_and_removed_fields() {
+        for field in [
+            "unknown",
+            "memory_pressure_kill_percent",
+            "memory_pressure_kill_after_s",
+            "disk_pressure_kill_after_s",
+        ] {
+            let text = format!("{{ {field}: 1 }}");
+            assert!(
+                serde_json5::from_str::<ResourceEnforcementConfig>(&text).is_err(),
+                "{field}"
+            );
+        }
+        for mode in ["none", "pressure", "soft"] {
+            let text = format!("{{ memory: \"{mode}\" }}");
+            assert!(serde_json5::from_str::<ResourceEnforcementConfig>(&text).is_ok());
+        }
+        for mode in ["none", "guard", "pressure", "soft"] {
+            let text = format!("{{ disk: \"{mode}\" }}");
+            assert!(serde_json5::from_str::<ResourceEnforcementConfig>(&text).is_ok());
+        }
+        assert!(serde_json5::from_str::<ResourceEnforcementConfig>("{ memory: 'guard' }").is_err());
+    }
 
     #[test]
     fn single_use_worker_defaults_off_and_rejects_shared_processes() {

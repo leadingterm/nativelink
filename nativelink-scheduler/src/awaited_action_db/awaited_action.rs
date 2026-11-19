@@ -101,11 +101,13 @@ pub struct AwaitedAction {
     #[metric(help = "How many times the AwaitedAction lost its worker")]
     pub worker_losses: usize,
 
-    /// Requeues with a larger memory reservation after a memory kill. Not
-    /// an attempt either. Absent in older records.
+    /// Resource requeues, independent of generic attempts.
     #[serde(default)]
-    #[metric(help = "How many times the AwaitedAction was escalated")]
-    pub escalations: usize,
+    #[metric(help = "How many times the AwaitedAction escalated memory")]
+    pub memory_escalations: usize,
+    #[serde(default)]
+    #[metric(help = "How many times the AwaitedAction escalated disk")]
+    pub disk_escalations: usize,
 
     /// Requeues after the worker reported it could not reach its store
     /// (`Unavailable`): a CAS pod being replaced, not the action's doing,
@@ -156,7 +158,8 @@ impl AwaitedAction {
             sort_key,
             attempts: 0,
             worker_losses: 0,
-            escalations: 0,
+            memory_escalations: 0,
+            disk_escalations: 0,
             store_losses: 0,
             last_worker_updated_timestamp: now,
             last_client_keepalive_timestamp: now,
