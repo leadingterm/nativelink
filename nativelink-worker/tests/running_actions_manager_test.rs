@@ -7545,10 +7545,6 @@ exit 1
         let (_, _, cas_store, ac_store) = setup_stores().await?;
         let root_action_directory = make_temp_path("root_action_directory");
         fs::create_dir_all(&root_action_directory).await?;
-        let side_root = format!("{root_action_directory}/.side_channels");
-        fs::create_dir_all(&side_root).await?;
-        #[cfg(target_family = "unix")]
-        tokio::fs::set_permissions(&side_root, std::fs::Permissions::from_mode(0o700)).await?;
 
         let test_wrapper_script = {
             let test_wrapper_dir = make_temp_path("wrapper_dir");

@@ -88,6 +88,12 @@ pub struct ConnectWorkerRequest {
     /// / (false) from older workers.
     #[prost(bool, tag = "4")]
     pub admits_when_idle: bool,
+    /// / Per-action limits for minimum properties; absent keys use physical capacity.
+    #[prost(map = "string, uint64", tag = "5")]
+    pub action_ceilings: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        u64,
+    >,
 }
 /// / The result of an ExecutionRequest.
 #[derive(Clone, PartialEq, ::prost::Message)]

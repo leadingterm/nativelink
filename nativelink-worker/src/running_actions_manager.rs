@@ -3942,6 +3942,18 @@ impl RunningActionImpl {
             let side_root = side_dir
                 .parent()
                 .err_tip(|| "Side channel directory has no parent")?;
+            #[cfg(target_family = "unix")]
+            let mut root_builder = tokio::fs::DirBuilder::new();
+            #[cfg(not(target_family = "unix"))]
+            let root_builder = tokio::fs::DirBuilder::new();
+            #[cfg(target_family = "unix")]
+            root_builder.mode(0o700);
+            if let Err(error) = root_builder.create(side_root).await
+                && error.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(Error::from(error)
+                    .append(format!("Creating side channel root {}", side_root.display())));
+            }
             let metadata = tokio::fs::symlink_metadata(side_root)
                 .await
                 .err_tip(|| format!("Reading side channel root {}", side_root.display()))?;
@@ -6320,14 +6332,14 @@ impl RunningActionsManagerImpl {
                     action_platform
                 }
                 None => {
-                    let command_digest = action
+                    let command_digest: DigestInfo = action
                         .command_digest
-                        .as_ref()
+                        .clone()
                         .err_tip(|| "Expected command_digest on Action")?
-                        .clone();
+                        .try_into()?;
                     let command = get_and_decode_digest::<ProtoCommand>(
                         self.cas_store.as_ref(),
-                        command_digest,
+                        command_digest.into(),
                     )
                     .await
                     .err_tip(|| "Converting command_digest to Command")
