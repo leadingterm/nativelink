@@ -977,6 +977,22 @@ pub struct ResourceEnforcementConfig {
     )]
     pub disk_headroom_percent: u64,
 
+    /// Free space threshold as a whole percentage of filesystem capacity.
+    /// Values above 100 are clamped; 0 disables disk pressure kills. Default: 5.
+    #[serde(
+        default = "default_disk_pressure_free_percent",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub disk_pressure_free_percent: u32,
+
+    /// Seconds free space must remain at or below the threshold. 0 means 1.
+    /// Default: 5 seconds.
+    #[serde(
+        default = "default_disk_pressure_kill_after_s",
+        deserialize_with = "convert_duration_with_shellexpand"
+    )]
+    pub disk_pressure_kill_after_s: u64,
+
     /// Kill one running action once the worker's cgroup has spent at least
     /// this share of the last ten seconds, as a whole number from 0 to 100,
     /// with every task stalled on memory (`full avg10` in cgroup v2
@@ -1004,6 +1020,14 @@ pub struct ResourceEnforcementConfig {
         deserialize_with = "convert_duration_with_shellexpand"
     )]
     pub memory_pressure_kill_after_s: u64,
+}
+
+const fn default_disk_pressure_free_percent() -> u32 {
+    5
+}
+
+const fn default_disk_pressure_kill_after_s() -> u64 {
+    5
 }
 
 const fn default_memory_pressure_kill_after_s() -> u64 {
@@ -1038,6 +1062,9 @@ pub enum DiskEnforcement {
     /// files the action itself wrote (inputs are hard links into the CAS
     /// and are not counted).
     Soft,
+    /// `guard`, plus kill an action only under sustained worker disk pressure.
+    /// Reservations are not per-action ceilings in this mode.
+    Pressure,
 }
 
 const fn default_memory_headroom_percent() -> u64 {

@@ -280,6 +280,10 @@ enum OverLimit {
         observed_kb: u64,
         full_avg10_percent: u64,
     },
+    DiskPressure {
+        observed_kb: u64,
+        free_percent: u64,
+    },
 }
 
 /// What one running action publishes for the worker-wide memory pressure
@@ -293,6 +297,10 @@ pub struct ActionMemoryWatch {
     last_memory_kb: AtomicU64,
     /// The memory reservation the action runs under, 0 when it has none.
     reserved_memory_kb: AtomicU64,
+    last_disk_kb: AtomicU64,
+    reserved_disk_kb: AtomicU64,
+    // Encoded as free percent + 1, since zero free space is meaningful.
+    disk_kill_requested: AtomicU64,
     kill_requested_percent: AtomicU64,
     /// Every process group the sampler last found holding the action's
     /// processes. A test that `set -m` put in a group of its own keeps
@@ -314,6 +322,7 @@ impl ActionMemoryWatch {
 
     pub fn kill_requested(&self) -> bool {
         self.kill_requested_percent.load(Ordering::Relaxed) > 0
+            || self.disk_kill_requested.load(Ordering::Relaxed) > 0
     }
 }
 
@@ -422,6 +431,7 @@ const fn whole_percent(value: f64) -> u64 {
 struct Ceilings {
     memory_limit_kb: Option<u64>,
     disk_limit_kb: Option<u64>,
+    disk_pressure_sampling: bool,
     over_limit_tx: Option<oneshot::Sender<OverLimit>>,
     /// Where each sample is published and where a pressure kill arrives.
     watch: Arc<ActionMemoryWatch>,
@@ -671,6 +681,18 @@ async fn sample_action_resource_usage(
                 "Memory pressure kill asked, action already ended"
             );
         }
+        let disk_request = ceilings.watch.disk_kill_requested.load(Ordering::Relaxed);
+        if disk_request > 0
+            && let Some(over_limit_tx) = ceilings.over_limit_tx.take()
+            && over_limit_tx
+                .send(OverLimit::DiskPressure {
+                    observed_kb: ceilings.watch.last_disk_kb.load(Ordering::Relaxed),
+                    free_percent: disk_request - 1,
+                })
+                .is_err()
+        {
+            debug!("Disk pressure kill asked, action already ended");
+        }
 
         // A walk that finished since the last sample; the memory samples
         // above never waited for it.
@@ -680,6 +702,10 @@ async fn sample_action_resource_usage(
             disk_sample = None;
             if let Ok(disk_kb) = finished {
                 peak_disk_kb = peak_disk_kb.max(disk_kb);
+                ceilings
+                    .watch
+                    .last_disk_kb
+                    .store(disk_kb, Ordering::Relaxed);
                 if let Some(limit_kb) = ceilings.disk_limit_kb
                     && disk_kb > limit_kb
                     && let Some(over_limit_tx) = ceilings.over_limit_tx.take()
@@ -692,7 +718,7 @@ async fn sample_action_resource_usage(
         // The periodic walk belongs to the soft limit; the guard alone
         // measures once, at the end, and pays no walk while running.
         samples_since_disk += 1;
-        if ceilings.disk_limit_kb.is_some()
+        if (ceilings.disk_limit_kb.is_some() || ceilings.disk_pressure_sampling)
             && samples_since_disk >= DISK_SAMPLE_EVERY
             && disk_sample.is_none()
         {
@@ -722,6 +748,7 @@ async fn sample_action_resource_usage(
     // Nothing is sampled from here on, so the pressure monitor must not
     // pick this action on a stale figure while its outputs upload.
     ceilings.watch.last_memory_kb.store(0, Ordering::Relaxed);
+    ceilings.watch.last_disk_kb.store(0, Ordering::Relaxed);
     drop(disk_sample.take());
     if let Some(handle) = start_disk_sample(disk_directory.as_ref())
         && let Ok(disk_kb) = handle.await
@@ -2938,6 +2965,13 @@ impl RunningActionImpl {
             .store(full_avg10_percent.max(1), Ordering::Relaxed);
     }
 
+    /// Ask the sampler to kill this action under worker disk pressure.
+    pub fn request_disk_pressure_kill(&self, free_percent: u64) {
+        self.memory_watch
+            .disk_kill_requested
+            .store(free_percent.min(100) + 1, Ordering::Relaxed);
+    }
+
     pub fn new(
         execution_metadata: ExecutionMetadata,
         operation_id: OperationId,
@@ -3622,6 +3656,7 @@ impl RunningActionImpl {
                                     Ceilings {
                                         memory_limit_kb: None,
                                         disk_limit_kb: None,
+                                        disk_pressure_sampling: false,
                                         over_limit_tx: None,
                                         // A detached watch: the process
                                         // outlives this action and serves
@@ -3919,11 +3954,17 @@ impl RunningActionImpl {
                     .get(property)
                     .and_then(|value| value.parse::<u64>().ok())
                     .unwrap_or(0);
-                let limit_kb = (enforcement.disk_soft && reserved_kb > 0).then(|| {
-                    reserved_kb.saturating_mul(100 + enforcement.disk_headroom_percent) / 100
-                });
+                let limit_kb = disk_ceiling_kb(
+                    enforcement.disk_soft,
+                    reserved_kb,
+                    enforcement.disk_headroom_percent,
+                );
                 Some((reserved_kb, limit_kb))
             });
+        self.memory_watch.reserved_disk_kb.store(
+            disk_enforcement.map_or(0, |(reserved_kb, _)| reserved_kb),
+            Ordering::Relaxed,
+        );
         let (over_limit_tx, over_limit_rx) = oneshot::channel::<OverLimit>();
         // Holds the sender when no ceiling is enforced, so the receiver
         // below stays pending instead of resolving closed.
@@ -3937,7 +3978,9 @@ impl RunningActionImpl {
                 .execution_configuration
                 .resource_enforcement
                 .as_ref()
-                .is_some_and(|enforcement| enforcement.pressure_kill.is_some());
+                .is_some_and(|enforcement| {
+                    enforcement.pressure_kill.is_some() || enforcement.disk_pressure_kill.is_some()
+                });
             let over_limit_tx =
                 (memory_limit_kb.is_some() || disk_limit_kb.is_some() || pressure_kill_armed)
                     .then(|| over_limit_keepalive.take())
@@ -3955,6 +3998,12 @@ impl RunningActionImpl {
                 Ceilings {
                     memory_limit_kb,
                     disk_limit_kb,
+                    disk_pressure_sampling: self
+                        .running_actions_manager
+                        .execution_configuration
+                        .resource_enforcement
+                        .as_ref()
+                        .is_some_and(|e| e.disk_pressure_kill.is_some()),
                     over_limit_tx,
                     watch: self.memory_watch.clone(),
                 },
@@ -4097,6 +4146,24 @@ impl RunningActionImpl {
                             ),
                         )));
 
+                    }
+                    OverLimit::DiskPressure { observed_kb, free_percent } => {
+                        self.running_actions_manager.metrics.disk_pressure_kills.inc();
+                        kill_reason = Some(KillReason::Disk);
+                        hard_kill(&mut child_process_guard, &self.memory_watch, "disk pressure").await;
+                        let reserved_kb = disk_enforcement.map_or(0, |(reserved_kb, _)| reserved_kb);
+                        let after_s = self.running_actions_manager.execution_configuration.resource_enforcement.as_ref()
+                            .and_then(|e| e.disk_pressure_kill).map_or(0, |p| p.after.as_secs());
+                        let why = if observed_kb > reserved_kb {
+                            format!("this action was furthest over its reservation, {observed_kb} KiB against {reserved_kb} KiB")
+                        } else {
+                            format!("this action used the most disk, {observed_kb} KiB, within its reservation of {reserved_kb} KiB")
+                        };
+                        let mut state = self.state.lock();
+                        state.error = Error::merge_option(state.error.take(), Some(Error::new(
+                            Code::FailedPrecondition,
+                            format!("Action was killed under worker disk pressure: free space was {free_percent}% after {after_s} s of sustained pressure, and {why}."),
+                        )));
                     }
                     OverLimit::Memory(observed_kb) => {
                         self.running_actions_manager.metrics.memory_reservation_kills.inc();
@@ -5101,6 +5168,8 @@ pub struct ResourceEnforcement {
     /// Kill the action holding the most memory when the worker's cgroup
     /// stays under memory pressure; `None` leaves a thrashing worker alone.
     pub pressure_kill: Option<PressureKill>,
+    /// Disk pressure policy; unlike soft disk enforcement this has no action ceiling.
+    pub disk_pressure_kill: Option<DiskPressureKill>,
 }
 
 /// When sustained memory pressure on the worker's cgroup kills an action.
@@ -5113,6 +5182,13 @@ pub struct PressureKill {
     /// The largest memory reservation the worker advertises; an action
     /// holding it is never the victim. `None` falls back to the cgroup limit.
     pub largest_reservation_kb: Option<u64>,
+}
+
+/// When sustained low free space kills an action.
+#[derive(Debug, Clone, Copy)]
+pub struct DiskPressureKill {
+    pub free_percent: u32,
+    pub after: Duration,
 }
 
 /// The reservation a memory ceiling is built from.
@@ -5157,14 +5233,63 @@ impl ResourceEnforcement {
             );
         }
         let pressure_kill = pressure_kill.filter(|_| memory.is_some());
+        if config.disk_pressure_free_percent > 100 {
+            warn!("disk_pressure_free_percent is over 100; using 100");
+        }
+        if config.disk == DiskEnforcement::Pressure && config.disk_pressure_free_percent == 0 {
+            warn!("disk_pressure_free_percent is 0; disk pressure kill stays off");
+        }
+        if config.disk == DiskEnforcement::None && config.disk_pressure_free_percent > 0 {
+            warn!("disk pressure kill requires disk: pressure; it stays off");
+        }
+        if config.disk == DiskEnforcement::Pressure && config.disk_pressure_kill_after_s == 0 {
+            warn!("disk_pressure_kill_after_s is 0; using 1");
+        }
+        let disk_pressure_kill = (config.disk == DiskEnforcement::Pressure
+            && config.disk_pressure_free_percent > 0)
+            .then(|| DiskPressureKill {
+                free_percent: config.disk_pressure_free_percent.min(100),
+                after: Duration::from_secs(config.disk_pressure_kill_after_s.max(1)),
+            });
         (memory.is_some() || disk_property_name.is_some()).then_some(Self {
             memory,
             disk_property_name,
             disk_soft: config.disk == DiskEnforcement::Soft,
             disk_headroom_percent: config.disk_headroom_percent,
             pressure_kill,
+            disk_pressure_kill,
         })
     }
+}
+
+/// Available percentage of filesystem blocks, rounded down.
+pub fn disk_free_percent(available: u64, blocks: u64) -> Option<u64> {
+    (blocks > 0).then(|| {
+        u64::try_from(u128::from(available) * 100 / u128::from(blocks)).unwrap_or(u64::MAX)
+    })
+}
+
+/// A soft reservation is a ceiling; pressure and guard reservations are not.
+pub fn disk_ceiling_kb(soft: bool, reserved_kb: u64, headroom_percent: u64) -> Option<u64> {
+    (soft && reserved_kb > 0)
+        .then(|| reserved_kb.saturating_mul(100u64.saturating_add(headroom_percent)) / 100)
+}
+
+/// Compare exactly, including the threshold boundary.
+pub fn disk_under_pressure(available: u64, blocks: u64, threshold: u32) -> bool {
+    blocks > 0 && u128::from(available) * 100 <= u128::from(blocks) * u128::from(threshold)
+}
+
+#[cfg(target_os = "linux")]
+fn disk_blocks(path: &str) -> Option<(u64, u64)> {
+    let path = std::ffi::CString::new(path).ok()?;
+    // SAFETY: statvfs initializes the output on success and the path is a valid C string.
+    let mut stat: libc::statvfs = unsafe { core::mem::zeroed() };
+    // SAFETY: both pointers remain valid for the duration of the call.
+    if unsafe { libc::statvfs(path.as_ptr(), &raw mut stat) } != 0 {
+        return None;
+    }
+    Some((widen(stat.f_bavail), widen(stat.f_blocks)))
 }
 
 /// Free space in KiB on the filesystem holding `path`, as an unprivileged
@@ -5565,6 +5690,7 @@ pub struct RunningActionsManagerImpl {
     /// with the first action, so a manager that never runs one never
     /// reads the cgroup.
     pressure_monitor_started: AtomicBool,
+    disk_pressure_monitor_started: AtomicBool,
     // Note: We don't use Notify because we need to support a .wait_for()-like function, which
     // Notify does not support.
     action_done_tx: watch::Sender<()>,
@@ -5685,6 +5811,7 @@ impl RunningActionsManagerImpl {
             timeout_handled_externally: args.timeout_handled_externally,
             running_actions: Mutex::new(HashMap::new()),
             pressure_monitor_started: AtomicBool::new(false),
+            disk_pressure_monitor_started: AtomicBool::new(false),
             action_done_tx,
             callbacks,
             metrics: Arc::new(Metrics {
@@ -6228,6 +6355,87 @@ async fn memory_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, polic
     }
 }
 
+impl RunningActionsManagerImpl {
+    fn ensure_disk_pressure_monitor(self: &Arc<Self>) {
+        let Some(policy) = self
+            .execution_configuration
+            .resource_enforcement
+            .as_ref()
+            .and_then(|e| e.disk_pressure_kill)
+        else {
+            return;
+        };
+        if self
+            .disk_pressure_monitor_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            background_spawn!(
+                "disk_pressure_monitor",
+                disk_pressure_monitor(Arc::downgrade(self), policy)
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = policy;
+            warn!("disk pressure kill requires Linux; it stays off");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn disk_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy: DiskPressureKill) {
+    let mut window = PressureWindow::new(1, policy.after);
+    loop {
+        tokio::time::sleep(MEMORY_PRESSURE_SAMPLE_INTERVAL).await;
+        let Some(manager) = manager.upgrade() else {
+            return;
+        };
+        let path = manager.root_action_directory.clone();
+        let sample = spawn_blocking!("disk_pressure_statvfs", move || disk_blocks(&path))
+            .await
+            .ok()
+            .flatten();
+        let Some((available, blocks)) = sample.filter(|(_, blocks)| *blocks > 0) else {
+            window.observe(0.0, Instant::now());
+            warn!("Could not sample worker disk pressure");
+            continue;
+        };
+        let pressured = disk_under_pressure(available, blocks, policy.free_percent);
+        if !window.observe(if pressured { 1.0 } else { 0.0 }, Instant::now()) {
+            continue;
+        }
+        let running: Vec<Arc<RunningActionImpl>> = manager
+            .running_actions
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let Some(victim) = pick_pressure_victim(
+            running.iter().map(|action| PressureCandidate {
+                item: action,
+                last_kb: action.memory_watch.last_disk_kb.load(Ordering::Relaxed),
+                reserved_kb: action.memory_watch.reserved_disk_kb.load(Ordering::Relaxed),
+                kill_requested: action.memory_watch.kill_requested(),
+            }),
+            None,
+        ) else {
+            warn!(
+                running = running.len(),
+                "Worker under sustained disk pressure with no sampled action to kill"
+            );
+            continue;
+        };
+        let free_percent = disk_free_percent(available, blocks).unwrap_or(0).min(100);
+        warn!(operation_id = ?victim.operation_id, free_percent, "Worker under sustained disk pressure; killing the action furthest over its reservation, or using the most disk");
+        victim.request_disk_pressure_kill(free_percent);
+    }
+}
+
 impl RunningActionsManager for RunningActionsManagerImpl {
     type RunningAction = RunningActionImpl;
 
@@ -6237,6 +6445,7 @@ impl RunningActionsManager for RunningActionsManagerImpl {
         start_execute: StartExecute,
     ) -> Result<Arc<RunningActionImpl>, Error> {
         self.ensure_memory_pressure_monitor();
+        self.ensure_disk_pressure_monitor();
         self.metrics
             .create_and_add_action
             .wrap(async move {
@@ -6469,6 +6678,8 @@ pub struct Metrics {
     disk_guard_refusals: CounterWithTime,
     #[metric(help = "Actions killed for writing past their disk reservation.")]
     disk_reservation_kills: CounterWithTime,
+    #[metric(help = "Actions killed under sustained worker disk pressure.")]
+    disk_pressure_kills: CounterWithTime,
     #[metric(help = "Actions served by a pooled persistent worker process.")]
     persistent_worker_dispatches: CounterWithTime,
     #[metric(
