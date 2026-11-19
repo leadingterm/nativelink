@@ -7124,6 +7124,151 @@ exit 0
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    async fn exit_137_side_channel_test(
+        report_memory: bool,
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "side_channel_worker";
+        const RESERVED_KB: u64 = 1_048_576;
+        let (_, _, cas_store, _ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let wrapper_dir = make_temp_path("side_channel_wrapper");
+        fs::create_dir_all(&wrapper_dir).await?;
+        let wrapper = format!("{wrapper_dir}/wrapper.sh");
+        // The entrypoint protocol is exercised through the same shell-script seam as the timeout test.
+        let script = if report_memory {
+            "#!/bin/bash\nprintf '%s' '{\"failure\":\"memory\"}' > \"$SIDE_CHANNEL_FILE\"\nexit 137\n"
+        } else {
+            "#!/bin/bash\nexit 137\n"
+        };
+        tokio::fs::write(&wrapper, script).await?;
+        tokio::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).await?;
+
+        let manager = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            root_action_directory,
+            execution_configuration: ExecutionConfiguration {
+                entrypoint: Some(wrapper),
+                additional_environment: Some(HashMap::from([(
+                    "SIDE_CHANNEL_FILE".to_string(),
+                    EnvironmentSource::SideChannelFile,
+                )])),
+                resource_enforcement: Some(ResourceEnforcement {
+                    memory: Some(MemoryLimit {
+                        property_name: "memory_kb".to_string(),
+                        headroom_percent: 20,
+                    }),
+                    disk_property_name: None,
+                    disk_soft: false,
+                    disk_headroom_percent: 20,
+                    pressure_kill: None,
+                    disk_pressure_kill: None,
+                }),
+                ..Default::default()
+            },
+            cas_store: cas_store.clone(),
+            ac_store: None,
+            historical_store: Store::new(cas_store.clone()),
+            upload_action_result_config: &UploadActionResultConfig {
+                upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                ..Default::default()
+            },
+            max_action_timeout: Duration::MAX,
+            max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+            max_download_timeout: Duration::from_secs(DEFAULT_MAX_DOWNLOAD_TIMEOUT),
+            max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+            max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+            timeout_handled_externally: false,
+            active_input_leases: false,
+            readonly_input_mounts: Vec::new(),
+            directory_cache: None,
+            use_namespaces: use_namespaces(),
+        })?);
+        let command = Command {
+            arguments: vec!["unused".to_string()],
+            working_directory: ".".to_string(),
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let running_action = manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    request_metadata: None,
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: Some(Platform {
+                        properties: vec![Property {
+                            name: "memory_kb".into(),
+                            value: RESERVED_KB.to_string(),
+                        }],
+                    }),
+                    worker_id: WORKER_ID.to_string(),
+                },
+            )
+            .await?;
+        let result = run_action(running_action.clone()).await?;
+        assert_eq!(result.exit_code, 137);
+        let usage = running_action.resource_usage().expect("action usage");
+        assert_eq!(usage.reserved.map(|r| r.memory_kb), Some(RESERVED_KB));
+        if report_memory {
+            let error = result.error.expect("memory kill must report an error");
+            assert_eq!(error.code, Code::FailedPrecondition);
+            assert!(
+                error.to_string().contains("kernel's memory limit"),
+                "{error}"
+            );
+            assert_eq!(usage.outcome, ResourceOutcome::KilledMemory as i32);
+            assert!(usage.enforced);
+        } else {
+            assert!(result.error.is_none());
+            assert_eq!(usage.outcome, ResourceOutcome::Completed as i32);
+            assert!(!usage.enforced);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[nativelink_test]
+    async fn entrypoint_sends_memory_kill_via_side_channel()
+    -> Result<(), Box<dyn core::error::Error>> {
+        exit_137_side_channel_test(true).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[nativelink_test]
+    async fn exit_137_without_side_channel_is_completed() -> Result<(), Box<dyn core::error::Error>>
+    {
+        exit_137_side_channel_test(false).await
+    }
+
     #[cfg_attr(feature = "nix", ignore)]
     #[nativelink_test]
     async fn entrypoint_sends_timeout_via_side_channel() -> Result<(), Box<dyn core::error::Error>>

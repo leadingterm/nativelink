@@ -1117,6 +1117,8 @@ pub enum EnvironmentSource {
     ///   // If set the command will be considered a failure.
     ///   // May be one of the following static strings:
     ///   // "timeout": Will Consider this task to be a timeout.
+    ///   // "memory": The kernel's memory limit killed the task. The result
+    ///   // reports an enforced memory kill so the reservation can be raised.
     ///   "failure": "timeout",
     /// }
     ///

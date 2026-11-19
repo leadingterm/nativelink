@@ -1017,6 +1017,8 @@ pub fn parse_cpu_ticks_from_stat(stat: &str) -> Option<u64> {
 enum SideChannelFailureReason {
     /// Task should be considered timed out.
     Timeout,
+    /// Task was killed by the kernel's memory limit.
+    Memory,
 }
 
 /// This represents the json data that can be passed from the running process
@@ -1027,6 +1029,31 @@ enum SideChannelFailureReason {
 struct SideChannelInfo {
     /// If the task should be considered a failure and why.
     failure: Option<SideChannelFailureReason>,
+}
+
+enum SideChannelReport {
+    Timeout(Error),
+    Memory,
+}
+
+fn apply_side_channel_report(
+    report: Option<SideChannelReport>,
+    kill_reason: Option<KillReason>,
+    (outcome, enforced): (ResourceOutcome, bool),
+) -> (ResourceOutcome, bool, Option<Error>) {
+    match report {
+        Some(SideChannelReport::Timeout(error)) => (outcome, enforced, Some(error)),
+        Some(SideChannelReport::Memory) if kill_reason.is_none() => (
+            ResourceOutcome::KilledMemory,
+            true,
+            Some(Error::new(
+                Code::FailedPrecondition,
+                "Action was killed by the kernel's memory limit. Raise the memory reservation."
+                    .to_string(),
+            )),
+        ),
+        _ => (outcome, enforced, None),
+    }
 }
 
 fn action_supports_persistent_workers(
@@ -2596,7 +2623,7 @@ async fn process_side_channel_file(
     side_channel_file: Cow<'_, OsStr>,
     args: &[&OsStr],
     timeout: Duration,
-) -> Result<Option<Error>, Error> {
+) -> Result<Option<SideChannelReport>, Error> {
     let mut json_contents = String::new();
     {
         // Note: Scoping `file_slot` allows the file_slot semaphore to be released faster.
@@ -2624,15 +2651,16 @@ async fn process_side_channel_file(
             let join_args = args.join(OsStr::new(" "));
             let command = join_args.to_string_lossy();
             warn!(%command, timeout=timeout.as_secs_f32(), "Side channel timeout for command");
-            Error::new(
+            SideChannelReport::Timeout(Error::new(
                 Code::DeadlineExceeded,
                 format!(
                     "Command '{}' timed out after {} seconds",
                     command,
                     timeout.as_secs_f32()
                 ),
-            )
+            ))
         }
+        SideChannelFailureReason::Memory => SideChannelReport::Memory,
     }))
 }
 
@@ -4303,6 +4331,13 @@ impl RunningActionImpl {
                     #[cfg(not(target_os = "linux"))]
                     let sampled_usage = SampledResourceUsage::default();
 
+                    let side_channel_report = if let Some(side_channel_file) = maybe_side_channel_file {
+                        process_side_channel_file(side_channel_file.clone(), &args, requested_timeout).await
+                            .err_tip(|| format!("Error processing side channel file: {}", side_channel_file.display()))?
+                    } else {
+                        None
+                    };
+
                     let memory_limit_kb = memory_reservation
                         .map(|(_, limit_kb)| limit_kb)
                         .or(self.running_actions_manager.pod_memory_limit_kb);
@@ -4311,11 +4346,15 @@ impl RunningActionImpl {
                     let signal = exit_status.signal();
                     #[cfg(not(target_family = "unix"))]
                     let signal = None;
-                    let (outcome, enforced) = classify_outcome(
+                    let (outcome, enforced, maybe_error_override) = apply_side_channel_report(
+                        side_channel_report,
                         kill_reason,
-                        signal,
-                        sampled_usage.last_memory_kb,
-                        memory_limit_kb,
+                        classify_outcome(
+                            kill_reason,
+                            signal,
+                            sampled_usage.last_memory_kb,
+                            memory_limit_kb,
+                        ),
                     );
 
                     let exit_code = exit_status.code().map_or_else(|| {
@@ -4341,7 +4380,7 @@ impl RunningActionImpl {
                         }
                         exit_code
                     });
-                    if kill_reason.is_none() && outcome == ResourceOutcome::KilledMemory {
+                    if kill_reason.is_none() && outcome == ResourceOutcome::KilledMemory && !enforced {
                         let mut state = self.state.lock();
                         state.error = Error::merge_option(state.error.take(), Some(Error::new(
                             Code::FailedPrecondition,
@@ -4395,12 +4434,6 @@ impl RunningActionImpl {
                     // log something useful instead of repeating same ?arg
                     info!(?exit_code, outcome = outcome.as_str_name(), "Command complete");
 
-                    let maybe_error_override = if let Some(side_channel_file) = maybe_side_channel_file {
-                        process_side_channel_file(side_channel_file.clone(), &args, requested_timeout).await
-                        .err_tip(|| format!("Error processing side channel file: {}", side_channel_file.display()))?
-                    } else {
-                        None
-                    };
                     {
                         let mut state = self.state.lock();
                         state.error = Error::merge_option(state.error.take(), maybe_error_override);
@@ -6700,6 +6733,22 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn worker_kill_takes_precedence_over_side_channel_memory() {
+        for reason in [
+            KillReason::Memory,
+            KillReason::Disk,
+            KillReason::Timeout,
+            KillReason::External,
+        ] {
+            let original = classify_outcome(Some(reason), None, 0, None);
+            let (outcome, enforced, error) =
+                apply_side_channel_report(Some(SideChannelReport::Memory), Some(reason), original);
+            assert_eq!((outcome, enforced), original);
+            assert!(error.is_none());
+        }
+    }
 
     #[cfg(unix)]
     #[nativelink_test]
