@@ -341,15 +341,13 @@ pub struct SimpleSpec {
     #[serde(default)]
     pub live_memory_veto: Option<String>,
 
-    /// When a worker reports an action killed for memory (`KILLED_MEMORY`,
-    /// by its own reservation enforcement or by the kernel), requeue the
-    /// action with a larger reservation instead of failing it. Escalations
-    /// have their own budget (`max_steps`) and do not spend
-    /// `max_job_retries`. The reservation grows to the largest memory any
-    /// connected worker advertises (or `max_kb`); the last step reserves
-    /// that worker whole, memory and CPU, so the action runs alone, and only
-    /// a kill there fails the action: nothing in the fleet could run it.
-    /// Default: unset (a memory kill fails the action)
+    /// Requeue an action killed for memory with a larger reservation.
+    /// Setting `disk_property` also enables escalation after disk kills.
+    /// Both resources share the `max_steps` budget and do not spend
+    /// `max_job_retries`. Each grows up to the largest non-draining worker's
+    /// reservation for that resource. `max_kb` and the final whole-worker
+    /// CPU reservation apply only to memory.
+    /// Default: unset (resource kills are not escalated)
     #[serde(default)]
     pub memory_escalation: Option<MemoryEscalationSpec>,
 
@@ -567,23 +565,28 @@ pub struct MemoryEscalationSpec {
     #[serde(default = "default_historical_resource_memory_property_name")]
     pub property: String,
 
-    /// Each kill scales the reservation by this factor, in hundredths:
-    /// 200 doubles it, 150 adds half.
+    /// The `minimum` platform property carrying the disk reservation in KiB.
+    /// Empty disables escalation after a disk kill. It must differ from the
+    /// memory and CPU properties. Default: empty.
+    #[serde(default)]
+    pub disk_property: String,
+
+    /// Each kill scales its resource's reservation by this factor, in
+    /// hundredths: 200 doubles it, 150 adds half.
     /// Default: 200
     #[serde(default = "default_memory_escalation_percent")]
     pub percent: u64,
 
-    /// Never reserve more than this many KiB; 0 takes the largest memory
-    /// any connected worker advertises.
+    /// Never reserve more memory than this many KiB; 0 takes the largest
+    /// memory any connected worker advertises. Does not cap disk.
     /// Default: 0
     #[serde(default)]
     pub max_kb: u64,
 
-    /// The memory values of the fleet's size classes, ascending, in KiB.
-    /// When set, a kill steps the reservation to the next class above it
-    /// instead of scaling by `percent`; past the top class the last step
-    /// reserves the largest worker whole. The chart fills this from the
-    /// same classes the `historical_resource` scheduler uses.
+    /// Reservation size classes, ascending, in KiB, used for both memory
+    /// and disk. When set, a kill steps to the next class above the current
+    /// reservation instead of scaling by `percent`; past the top class the
+    /// last step reserves the fleet's largest value for that resource.
     /// Default: empty (scale by `percent`)
     #[serde(default)]
     pub ladder_kb: Vec<u64>,
