@@ -5395,6 +5395,8 @@ pub struct ResourceEnforcement {
 pub struct PressureKill {
     /// Share of elapsed time stalled on memory.
     pub stall_percent: u32,
+    /// Minimum available bytes in the action pool.
+    pub reserve_bytes: u64,
     /// Delay between PSI reads.
     pub poll_interval: Duration,
     /// For this long without a break.
@@ -5442,6 +5444,7 @@ impl ResourceEnforcement {
         let pressure_kill =
             (config.memory == MemoryEnforcement::Pressure).then_some(PressureKill {
                 stall_percent: config.memory_pressure_stall_percent,
+                reserve_bytes: config.memory_pressure_reserve_bytes,
                 poll_interval: Duration::from_millis(config.memory_pressure_poll_interval_ms),
                 after: Duration::from_millis(config.memory_pressure_kill_after_ms),
             });
@@ -5874,6 +5877,27 @@ impl Drop for CleanupGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct PressureKillState {
+    generation: u64,
+    pending: Option<Weak<RunningActionImpl>>,
+}
+
+#[cfg(target_os = "linux")]
+impl PressureKillState {
+    fn unsettled(&mut self, running: &HashMap<OperationId, Weak<RunningActionImpl>>) -> bool {
+        let pending = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| running.values().any(|action| Weak::ptr_eq(action, pending)));
+        if !pending {
+            self.pending = None;
+        }
+        pending
+    }
+}
+
 /// Holds state info about what is being executed and the interface for interacting
 /// with actions while they are running.
 #[derive(Debug)]
@@ -5899,7 +5923,8 @@ pub struct RunningActionsManagerImpl {
     /// reads the cgroup.
     pressure_monitor_started: AtomicBool,
     disk_pressure_monitor_started: AtomicBool,
-    pressure_kill_generation: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pressure_kill_state: Mutex<PressureKillState>,
     // Note: We don't use Notify because we need to support a .wait_for()-like function, which
     // Notify does not support.
     action_done_tx: watch::Sender<()>,
@@ -6022,7 +6047,8 @@ impl RunningActionsManagerImpl {
             running_actions: Mutex::new(HashMap::new()),
             pressure_monitor_started: AtomicBool::new(false),
             disk_pressure_monitor_started: AtomicBool::new(false),
-            pressure_kill_generation: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            pressure_kill_state: Mutex::new(PressureKillState::default()),
             action_done_tx,
             callbacks,
             metrics: Arc::new(Metrics {
@@ -6555,6 +6581,16 @@ impl RunningActionsManagerImpl {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl RunningActionsManagerImpl {
+    fn pressure_kill_status(&self) -> (u64, bool) {
+        let mut state = self.pressure_kill_state.lock();
+        let running = self.running_actions.lock();
+        let unsettled = state.unsettled(&running);
+        (state.generation, unsettled)
+    }
+}
+
 /// Polls cumulative PSI totals and chooses an action only after sustained stalls.
 #[cfg(target_os = "linux")]
 async fn memory_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy: PressureKill) {
@@ -6583,21 +6619,17 @@ pub async fn memory_pressure_monitor_with(
     let Some(owner) = manager.upgrade() else {
         return;
     };
-    let path = owner
+    let Some(pool) = owner
         .execution_configuration
         .resource_enforcement
         .as_ref()
-        .and_then(|e| {
-            e.memory_pool_path
-                .as_ref()
-                .map(|p| p.join("memory.pressure"))
-        })
-        .or_else(crate::capacity::memory_pressure_file);
-    let Some(path) = path else {
-        warn!("no readable memory.pressure for this worker's cgroup");
+        .and_then(|e| e.memory_pool_path.clone())
+    else {
+        warn!("memory pressure kill requires an explicit action pool");
         return;
     };
-    let mut generation = owner.pressure_kill_generation.load(Ordering::Acquire);
+    let path = pool.join("memory.pressure");
+    let mut generation = owner.pressure_kill_state.lock().generation;
     drop(owner);
     let mut window = crate::resource_pressure::PsiWindow::new(policy.stall_percent, policy.after);
     loop {
@@ -6605,12 +6637,19 @@ pub async fn memory_pressure_monitor_with(
         let Some(manager) = manager.upgrade() else {
             return;
         };
-        let current_generation = manager.pressure_kill_generation.load(Ordering::Acquire);
+        // Always consume the injected sample and clock, even when suppressed.
+        let sample = read_total(&path);
+        let time = now();
+        let (current_generation, unsettled) = manager.pressure_kill_status();
         if generation != current_generation {
             window.reset();
             generation = current_generation;
         }
-        if !window.observe(read_total(&path), now()) {
+        if unsettled || !crate::resource_pressure::pool_shortage(&pool, policy.reserve_bytes) {
+            window.reset();
+            continue;
+        }
+        if !window.observe(sample, time) {
             continue;
         }
         let running: Vec<Arc<RunningActionImpl>> = manager
@@ -6631,21 +6670,26 @@ pub async fn memory_pressure_monitor_with(
             );
             continue;
         };
-        let next_generation = generation.wrapping_add(1);
-        if manager
-            .pressure_kill_generation
-            .compare_exchange(
-                generation,
-                next_generation,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
+        if !crate::resource_pressure::pool_shortage(&pool, policy.reserve_bytes) {
+            window.reset();
+            continue;
+        }
+        // Both monitors lock state before the map and publish while holding
+        // both, so no monitor can miss an in-flight request.
+        let mut state = manager.pressure_kill_state.lock();
+        let registered = manager.running_actions.lock();
+        if state.unsettled(&registered)
+            || state.generation != generation
+            || !registered
+                .get(&victim.operation_id)
+                .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), Arc::as_ptr(victim)))
         {
             window.reset();
             continue;
         }
-        generation = next_generation;
+        generation = generation.wrapping_add(1);
+        state.generation = generation;
+        state.pending = Some(Arc::downgrade(victim));
         victim.request_memory_pressure_kill(u64::from(policy.stall_percent));
         window.reset();
     }
@@ -6686,18 +6730,22 @@ impl RunningActionsManagerImpl {
 #[cfg(target_os = "linux")]
 async fn disk_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy: DiskPressureKill) {
     let mut window = PressureWindow::new(1, policy.after);
-    let mut generation = manager.upgrade().map_or(0, |owner| {
-        owner.pressure_kill_generation.load(Ordering::Acquire)
-    });
+    let mut generation = manager
+        .upgrade()
+        .map_or(0, |owner| owner.pressure_kill_state.lock().generation);
     loop {
         tokio::time::sleep(policy.poll_interval).await;
         let Some(manager) = manager.upgrade() else {
             return;
         };
-        let current_generation = manager.pressure_kill_generation.load(Ordering::Acquire);
+        let (current_generation, unsettled) = manager.pressure_kill_status();
         if generation != current_generation {
             window.observe(0.0, Instant::now());
             generation = current_generation;
+        }
+        if unsettled {
+            window.observe(0.0, Instant::now());
+            continue;
         }
         let path = manager.root_action_directory.clone();
         let sample = spawn_blocking!("disk_pressure_statvfs", move || disk_blocks(&path))
@@ -6731,21 +6779,20 @@ async fn disk_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy:
             );
             continue;
         };
-        let next_generation = generation.wrapping_add(1);
-        if manager
-            .pressure_kill_generation
-            .compare_exchange(
-                generation,
-                next_generation,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
+        let mut state = manager.pressure_kill_state.lock();
+        let registered = manager.running_actions.lock();
+        if state.unsettled(&registered)
+            || state.generation != generation
+            || !registered
+                .get(&victim.operation_id)
+                .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), Arc::as_ptr(victim)))
         {
             window.observe(0.0, Instant::now());
             continue;
         }
-        generation = next_generation;
+        generation = generation.wrapping_add(1);
+        state.generation = generation;
+        state.pending = Some(Arc::downgrade(victim));
         let free_percent = disk_free_percent(available, blocks).unwrap_or(0).min(100);
         warn!(operation_id = ?victim.operation_id, free_percent, "Worker under sustained disk pressure; killing the action furthest over its reservation, or using the most disk");
         victim.request_disk_pressure_kill(free_percent);

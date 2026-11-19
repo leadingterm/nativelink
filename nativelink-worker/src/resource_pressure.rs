@@ -1,6 +1,7 @@
 // Copyright 2024 The NativeLink Authors. All rights reserved.
 // Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Parse the cumulative stall time in microseconds, preferring `some`.
@@ -15,6 +16,39 @@ pub(crate) fn psi_total(text: &str) -> Option<u64> {
         })
     };
     total("some").or_else(|| total("full"))
+}
+
+/// Whether the explicitly configured pool has less than its reserve available.
+/// Missing or malformed samples and an entirely unbounded pool fail closed.
+pub(crate) fn pool_shortage(pool: &Path, reserve: u64) -> bool {
+    pool_shortage_with(pool, reserve, |path| std::fs::read_to_string(path).ok())
+}
+
+fn pool_shortage_with(pool: &Path, reserve: u64, read: impl Fn(&Path) -> Option<String>) -> bool {
+    let sample = || {
+        let current = read(&pool.join("memory.current"))?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let limit = |name| {
+            let value = read(&pool.join(name))?;
+            let value = value.trim();
+            if value == "max" {
+                Some(None)
+            } else {
+                Some(Some(value.parse::<u64>().ok()?))
+            }
+        };
+        let max = limit("memory.max")?;
+        let high = limit("memory.high")?;
+        let limit = match (max, high) {
+            (Some(max), Some(high)) => max.min(high),
+            (Some(limit), None) | (None, Some(limit)) => limit,
+            (None, None) => return None,
+        };
+        Some(limit.saturating_sub(current) < reserve)
+    };
+    sample().unwrap_or(false)
 }
 
 /// A continuous window of per-interval PSI stall rates.
@@ -73,6 +107,53 @@ impl PsiWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_shortage_requires_valid_finite_limit_and_strict_reserve() {
+        let pool = Path::new("/pool");
+        let sample = |current: Option<&str>, max: Option<&str>, high: Option<&str>, reserve| {
+            pool_shortage_with(pool, reserve, |path| {
+                let value = match path.file_name()?.to_str()? {
+                    "memory.current" => current,
+                    "memory.max" => max,
+                    "memory.high" => high,
+                    _ => None,
+                };
+                value.map(str::to_owned)
+            })
+        };
+        assert!(!sample(Some("90"), Some("100"), Some("max"), 10));
+        assert!(sample(Some("91"), Some("100"), Some("max"), 10));
+        assert!(!sample(Some("89"), Some("100"), Some("max"), 10));
+        assert!(sample(Some("91"), Some("200"), Some("100"), 10));
+        assert!(sample(Some("91"), Some("100"), Some("200"), 10));
+        assert!(sample(Some("91"), Some("max"), Some("100"), 10));
+        assert!(!sample(Some("91"), Some("max"), Some("max"), 10));
+        assert!(!sample(None, Some("100"), Some("max"), 10));
+        assert!(!sample(Some("91"), None, Some("100"), 10));
+        assert!(!sample(Some("91"), Some("100"), None, 10));
+        assert!(!sample(Some("bad"), Some("100"), Some("max"), 10));
+        assert!(!sample(Some("91"), Some("bad"), Some("100"), 10));
+        assert!(!sample(Some("91"), Some("100"), Some("bad"), 10));
+        assert!(!sample(
+            Some("18446744073709551616"),
+            Some("100"),
+            Some("max"),
+            10
+        ));
+        assert!(sample(
+            Some("18446744073709551615"),
+            Some("1"),
+            Some("max"),
+            1
+        ));
+        assert!(!sample(
+            Some("0"),
+            Some("18446744073709551615"),
+            Some("max"),
+            u64::MAX
+        ));
+    }
 
     #[test]
     fn cumulative_stalls_reset_on_flat_counter_errors_and_clock_regression() {

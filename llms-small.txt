@@ -4007,6 +4007,21 @@ over `Exact` and `Priority` properties) produces the candidate set, and only
 that set is scanned in LRU order, checking availability and `Minimum`
 va…
 
+#### Choosing a snapshot store
+
+`snapshot_store` names an entry in **this scheduler process's top-level `stores`**.
+It does not create a store or reference another CAS process's configuration. A
+missing name or failed startup write/read probe warns and leaves learning in
+memory for that process's lifetime. Fix the configuration or backend and restart
+to enable persistence; unsaved measurements are lost on restart.
+
+#### Waiting for an autoscaled size class
+
+Learned sizing selects from the configured class ladder, including a class whose
+pool currently has no connected workers. The retry escalator caps a killed
+resource at the largest eligible configured capacity, rather than depending on
+which workers are connected at that moment.
+
 ### Platform properties are typed, and `Minimum` is a resource pool
 
 Every property key a worker advertises has a declared type:
@@ -4156,10 +4171,10 @@ result computed with a different value of it.
 
 The default `max_job_retries` of 3 is checked strictly, so an action may
 execute **four** times on its own failures. A lost worker has its own budget,
-`max_worker_loss_retries` (default 10), and a memory escalation its own
-(`memory_escalation.max_steps`, default 8), so an action can run more often
-than four times when workers die under it or it keeps outgrowing its
-reservation; a `ResourceExhausted` never costs anyth…
+`max_worker_loss_retries` (default 10), and memory and disk escalations each
+have their own `resource_escalation` `max_steps` budget, so an action can run
+more often than four times when workers die under it or it keeps outgrowing
+its reservation; a `ResourceExhausted`…
 
 ### Some output metadata is discarded
 

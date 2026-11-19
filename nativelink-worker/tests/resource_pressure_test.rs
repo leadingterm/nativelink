@@ -41,6 +41,7 @@ const POLICY: PressureKill = PressureKill {
     stall_percent: 7,
     poll_interval: POLL,
     after: Duration::from_millis(250),
+    reserve_bytes: 1_048_576,
 };
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -67,11 +68,18 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> TestResult<Self> {
+        Self::with_pool(true).await
+    }
+
+    async fn with_pool(configure_pool: bool) -> TestResult<Self> {
         let temp = tempfile::tempdir()?;
         let pool = temp.path().join("pool");
         let root = temp.path().join("actions");
         std::fs::create_dir_all(&pool)?;
         std::fs::create_dir_all(&root)?;
+        std::fs::write(pool.join("memory.current"), "11264000")?;
+        std::fs::write(pool.join("memory.max"), "12000000")?;
+        std::fs::write(pool.join("memory.high"), "max")?;
         let side_channels = root.join(".side_channels");
         std::fs::create_dir(&side_channels)?;
         std::fs::set_permissions(&side_channels, std::fs::Permissions::from_mode(0o700))?;
@@ -121,7 +129,7 @@ impl Fixture {
                     memory_sample_interval: Duration::from_millis(17),
                     disk_sample_interval: Duration::from_millis(131),
                     disk_soft_samples: 3,
-                    memory_pool_path: Some(pool.clone()),
+                    memory_pool_path: configure_pool.then(|| pool.clone()),
                     pressure_kill: Some(POLICY),
                     disk_pressure_kill: None,
                 }),
@@ -279,6 +287,17 @@ impl Fixture {
         }
         Ok(LiveAction { run, scope, pid })
     }
+    async fn finish_action(&self, action: &mut LiveAction) -> TestResult {
+        if !action.run.is_finished() {
+            let status = std::process::Command::new(which::which("kill")?)
+                .args(["-KILL", &action.pid.to_string()])
+                .status()?;
+            assert!(status.success(), "failed to stop fixture process");
+        }
+        drop((&mut action.run).await?);
+        Ok(())
+    }
+
     async fn stop(&self, actions: &[&LiveAction]) -> TestResult {
         for action in actions {
             if !action.run.is_finished() {
@@ -399,7 +418,7 @@ async fn pressure_selects_excess_then_resets_window() -> TestResult {
     let large = fixture
         .action("large", 9_000, Some(7_000), Metadata::Valid)
         .await?;
-    let excess = fixture
+    let mut excess = fixture
         .action("excess", 1_000, Some(4_000), Metadata::Valid)
         .await?;
     let monitor = Monitor::start(&fixture.manager);
@@ -417,11 +436,53 @@ async fn pressure_selects_excess_then_resets_window() -> TestResult {
         !excess.run.is_finished(),
         "cgroup kill must not signal wrapper's process group"
     );
-    for i in 1..=8 {
-        monitor.step(Some(36_000), 550 + i * 50).await;
+    for i in 1..=13 {
+        monitor.step(Some(36_000 + i * 4_000), 550 + i * 50).await;
     }
     assert_eq!(std::fs::read(large.scope.join("cgroup.kill"))?, b"");
     assert!(!large.run.is_finished());
+    fixture.finish_action(&mut excess).await?;
+
+    std::fs::write(fixture.pool.join("memory.max"), "67108864")?;
+    monitor.pressure(1250, 92_000).await;
+    monitor.pressure(1550, 116_000).await;
+    monitor.step(Some(140_000), 1850).await;
+    monitor.step(Some(144_000), 1900).await;
+    assert_eq!(std::fs::read(large.scope.join("cgroup.kill"))?, b"");
+    assert!(!large.run.is_finished());
+
+    std::fs::write(fixture.pool.join("memory.max"), "12000000")?;
+    for i in 0..=3 {
+        monitor.step(Some(148_000 + i * 4_000), 1950 + i * 50).await;
+    }
+    monitor.step(Some(160_000), 2150).await;
+    assert_eq!(std::fs::read(large.scope.join("cgroup.kill"))?, b"");
+    monitor.pressure(2200, 160_000).await;
+    wait_until(|| std::fs::read(large.scope.join("cgroup.kill")).is_ok_and(|v| v == b"1")).await;
+    fixture.stop(&[&large]).await?;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn ambient_stalls_with_pool_headroom_do_not_kill() -> TestResult {
+    let fixture = Fixture::new().await?;
+    std::fs::write(fixture.pool.join("memory.current"), "11264000")?;
+    std::fs::write(fixture.pool.join("memory.max"), "67108864")?;
+    std::fs::write(fixture.pool.join("memory.high"), "max")?;
+    let large = fixture
+        .action("large", 9_000, Some(7_000), Metadata::Valid)
+        .await?;
+    let excess = fixture
+        .action("excess", 1_000, Some(4_000), Metadata::Valid)
+        .await?;
+    let monitor = Monitor::start(&fixture.manager);
+    monitor.pressure(0, 0).await;
+    monitor.pressure(300, 24_000).await;
+    monitor.step(Some(48_000), 600).await;
+    assert_eq!(std::fs::read(large.scope.join("cgroup.kill"))?, b"");
+    assert_eq!(std::fs::read(excess.scope.join("cgroup.kill"))?, b"");
+    assert!(!large.run.is_finished());
+    assert!(!excess.run.is_finished());
     fixture.stop(&[&large, &excess]).await?;
     Ok(())
 }
@@ -459,7 +520,7 @@ async fn errors_and_decreasing_counters_require_a_new_window() -> TestResult {
 #[nativelink_test]
 async fn largest_below_reservation_and_already_killing_are_selected_correctly() -> TestResult {
     let fixture = Fixture::new().await?;
-    let large = fixture
+    let mut large = fixture
         .action("large", 9_000, Some(7_000), Metadata::Valid)
         .await?;
     let small = fixture
@@ -469,10 +530,105 @@ async fn largest_below_reservation_and_already_killing_are_selected_correctly() 
     monitor.pressure(0, 0).await;
     wait_until(|| std::fs::read(large.scope.join("cgroup.kill")).is_ok_and(|v| v == b"1")).await;
     assert_eq!(std::fs::read(small.scope.join("cgroup.kill"))?, b"");
-    // The first action remains alive in the fake cgroup but is already killing.
+    // The first action remains registered until its process exits and cleanup finishes.
     monitor.pressure(300, 24_000).await;
+    monitor.pressure(600, 48_000).await;
+    monitor.step(Some(72_000), 900).await;
+    assert_eq!(std::fs::read(small.scope.join("cgroup.kill"))?, b"");
+    assert!(!small.run.is_finished());
+    fixture.finish_action(&mut large).await?;
+    monitor.pressure(950, 76_000).await;
+    monitor.step(Some(100_000), 1250).await;
     wait_until(|| std::fs::read(small.scope.join("cgroup.kill")).is_ok_and(|v| v == b"1")).await;
-    fixture.stop(&[&large, &small]).await?;
+    fixture.stop(&[&small]).await?;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn finite_high_causes_shortage_even_with_ample_max() -> TestResult {
+    let fixture = Fixture::new().await?;
+    std::fs::write(fixture.pool.join("memory.max"), "67108864")?;
+    std::fs::write(fixture.pool.join("memory.high"), "12000000")?;
+    let victim = fixture
+        .action("victim", 1_000, Some(4_000), Metadata::Valid)
+        .await?;
+    let monitor = Monitor::start(&fixture.manager);
+    monitor.pressure(0, 0).await;
+    wait_until(|| std::fs::read(victim.scope.join("cgroup.kill")).is_ok_and(|v| v == b"1")).await;
+    fixture.stop(&[&victim]).await?;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn invalid_or_missing_pool_samples_reset_pressure_window() -> TestResult {
+    for (file, value) in [
+        ("memory.current", None),
+        ("memory.current", Some("invalid")),
+        ("memory.max", None),
+        ("memory.max", Some("invalid")),
+        ("memory.high", None),
+        ("memory.high", Some("invalid")),
+        ("memory.max", Some("max")),
+    ] {
+        let fixture = Fixture::new().await?;
+        let victim = fixture
+            .action("victim", 1_000, Some(4_000), Metadata::Valid)
+            .await?;
+        let monitor = Monitor::start(&fixture.manager);
+        monitor.step(Some(0), 0).await;
+        for i in 1..=4 {
+            monitor.step(Some(i * 4_000), i * 50).await;
+        }
+        match value {
+            Some(value) => std::fs::write(fixture.pool.join(file), value)?,
+            None => std::fs::remove_file(fixture.pool.join(file))?,
+        }
+        monitor.pressure(250, 20_000).await;
+        monitor.step(Some(44_000), 550).await;
+        monitor.step(Some(48_000), 600).await;
+        assert_eq!(
+            std::fs::read(victim.scope.join("cgroup.kill"))?,
+            b"",
+            "{file}: {value:?}"
+        );
+
+        let restored = match file {
+            "memory.current" => "11264000",
+            "memory.max" => "12000000",
+            "memory.high" => "max",
+            _ => unreachable!(),
+        };
+        std::fs::write(fixture.pool.join(file), restored)?;
+        for i in 0..=3 {
+            monitor.step(Some(52_000 + i * 4_000), 650 + i * 50).await;
+        }
+        monitor.step(Some(64_000), 850).await;
+        assert_eq!(
+            std::fs::read(victim.scope.join("cgroup.kill"))?,
+            b"",
+            "{file}: {value:?}"
+        );
+        monitor.pressure(900, 64_000).await;
+        wait_until(|| std::fs::read(victim.scope.join("cgroup.kill")).is_ok_and(|v| v == b"1"))
+            .await;
+        fixture.stop(&[&victim]).await?;
+    }
+    Ok(())
+}
+
+#[nativelink_test]
+async fn absent_pool_never_reads_ancestor_pressure() -> TestResult {
+    let fixture = Fixture::with_pool(false).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        memory_pressure_monitor_with(
+            Arc::downgrade(&fixture.manager),
+            POLICY,
+            |_| panic!("must not read pressure without an explicit pool"),
+            Instant::now,
+        ),
+    )
+    .await?;
     Ok(())
 }
 

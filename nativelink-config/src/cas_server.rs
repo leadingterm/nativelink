@@ -988,8 +988,16 @@ pub struct ResourceEnforcementConfig {
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub memory_pressure_kill_after_ms: u64,
+    /// Pool shortage watermark in bytes. Available bytes are the minimum finite
+    /// pool `memory.high` or `memory.max` less `memory.current`, saturating at zero.
+    /// Default: 1 GiB.
+    #[serde(
+        default = "default_memory_pressure_reserve_bytes",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub memory_pressure_reserve_bytes: u64,
     /// Absolute action-pool cgroup path for exact usage and pressure. When absent,
-    /// usage falls back to PSS and pressure to the nearest limited ancestor. Default: unset.
+    /// usage falls back to PSS and userspace pressure kills are disabled. Default: unset.
     #[serde(default)]
     pub memory_pool_path: Option<String>,
     /// Percentage above the disk reservation allowed in soft mode. Default: 20.
@@ -1046,6 +1054,10 @@ impl ResourceEnforcementConfig {
             (
                 "memory_pressure_kill_after_ms",
                 self.memory_pressure_kill_after_ms,
+            ),
+            (
+                "memory_pressure_reserve_bytes",
+                self.memory_pressure_reserve_bytes,
             ),
             ("disk_soft_samples", u64::from(self.disk_soft_samples)),
             ("disk_sample_interval_ms", self.disk_sample_interval_ms),
@@ -1107,6 +1119,9 @@ const fn default_disk_pressure_kill_after_ms() -> u64 {
 }
 const fn default_memory_pressure_kill_after_ms() -> u64 {
     5000
+}
+const fn default_memory_pressure_reserve_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 const fn default_memory_soft_samples() -> u32 {
     2
@@ -2228,6 +2243,7 @@ mod tests {
             ),
             (250, 10, 250, 5000)
         );
+        assert_eq!(d.memory_pressure_reserve_bytes, 1024 * 1024 * 1024);
         assert_eq!(d.memory_pool_path, None);
         assert_eq!(
             (
@@ -2248,6 +2264,7 @@ mod tests {
             memory_soft_samples: 3, memory_soft_spike_percent: 175,
             memory_sample_interval_ms: 123, memory_pressure_stall_percent: 7,
             memory_pressure_poll_interval_ms: 124, memory_pressure_kill_after_ms: 125,
+            memory_pressure_reserve_bytes: 123456,
             memory_pool_path: "/sys/fs/cgroup/actions", disk_headroom_percent: 32,
             disk_soft_samples: 4, disk_sample_interval_ms: 126,
             disk_pressure_free_percent: 8, disk_pressure_poll_interval_ms: 127,
@@ -2281,6 +2298,7 @@ mod tests {
             ),
             (123, 7, 124, 125)
         );
+        assert_eq!(c.memory_pressure_reserve_bytes, 123456);
         assert_eq!(
             c.memory_pool_path.as_deref(),
             Some("/sys/fs/cgroup/actions")
@@ -2305,6 +2323,7 @@ mod tests {
             ("memory_sample_interval_ms", "0"),
             ("memory_pressure_poll_interval_ms", "0"),
             ("memory_pressure_kill_after_ms", "0"),
+            ("memory_pressure_reserve_bytes", "0"),
             ("disk_soft_samples", "0"),
             ("disk_sample_interval_ms", "0"),
             ("disk_pressure_poll_interval_ms", "0"),
