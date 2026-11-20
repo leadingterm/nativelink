@@ -565,6 +565,10 @@ pub struct ResourceEscalationSpec {
     pub headroom_percent: u64,
     /// Minimum CPU property reserved whole at the eligible capacity.
     pub cpu_property: String,
+    /// Properties ignored only when selecting a capacity for resource escalation.
+    /// Worker dispatch still matches these properties normally.
+    #[serde(default)]
+    pub capacity_ignored_properties: Vec<String>,
     /// Declared minimum and exact properties of each configured worker type.
     pub capacities: Vec<ResourceCapacity>,
 }
