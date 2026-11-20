@@ -6202,7 +6202,17 @@ impl RunningActionsManagerImpl {
             fs::create_dir(&action_directory)
                 .await
                 .err_tip(|| format!("Error creating action directory {action_directory}"))?;
-            Ok(action_directory)
+            // Keep action paths in the same physical spelling as the process working directory.
+            dunce::canonicalize(&action_directory)
+                .err_tip(|| format!("Error canonicalizing action directory {action_directory}"))?
+                .into_os_string()
+                .into_string()
+                .map_err(|path| {
+                    make_err!(
+                        Code::Internal,
+                        "Canonical action directory is not UTF-8: {path:?}"
+                    )
+                })
         })
     }
 

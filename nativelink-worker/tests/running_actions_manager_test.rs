@@ -2352,8 +2352,14 @@ mod tests {
         }
 
         let (_, slow_store, cas_store, ac_store) = setup_stores().await?;
-        let root_action_directory = make_temp_path("root_action_directory");
-        fs::create_dir_all(&root_action_directory).await?;
+        let physical_root = make_temp_path("root_action_directory");
+        fs::create_dir_all(&physical_root).await?;
+        // Reproduce a physical action cwd beneath a symlinked configured root.
+        let root_action_directory = format!("{physical_root}-alias");
+        std::os::unix::fs::symlink(
+            Path::new(&physical_root).canonicalize()?,
+            &root_action_directory,
+        )?;
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
@@ -2393,7 +2399,7 @@ mod tests {
                     "mkdir -p dir1/dir2 && \
                          echo foo > dir1/file && \
                          touch dir1/file2 && \
-                         ln -s ../file dir1/dir2/sym && \
+                         ln -s \"$(pwd -P)/dir1/file\" dir1/dir2/sym && \
                          ln -s dir1/file rel_sym && \
                          ln -s /dev/null empty_sym"
                         .to_string(),
