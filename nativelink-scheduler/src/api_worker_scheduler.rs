@@ -692,7 +692,7 @@ impl ApiWorkerSchedulerImpl {
     /// Note: This function will not do any task matching.
     fn add_worker(&mut self, worker: Worker) -> Result<(), Error> {
         let worker_id = worker.id.clone();
-        let platform_properties = worker.platform_properties.clone();
+        let platform_properties = worker.action_platform_properties.clone();
         // A replacement is one out and one in, so the gauge only moves for a
         // genuinely new worker.
         let replaced = self.workers.put(worker_id.clone(), worker);
@@ -752,7 +752,7 @@ impl ApiWorkerSchedulerImpl {
         let mut shapes: BTreeSet<PropertyShape> = self
             .workers
             .iter()
-            .map(|(_, w)| PropertyShape::from(&w.total_platform_properties))
+            .map(|(_, w)| PropertyShape::from(&w.action_platform_properties))
             .collect();
         if let Some(peer_fleet) = &self.peer_fleet {
             shapes.extend(peer_fleet.iter().map(PropertyShape::from));
@@ -777,7 +777,7 @@ impl ApiWorkerSchedulerImpl {
         let mut seen = HashSet::new();
         self.workers
             .iter()
-            .map(|(_, w)| &w.total_platform_properties)
+            .map(|(_, w)| &w.action_platform_properties)
             .filter(|totals| seen.insert(PropertyShape::from(*totals)))
             .cloned()
             .collect()
@@ -952,7 +952,7 @@ impl ApiWorkerSchedulerImpl {
         for (_, worker) in self.workers.iter() {
             if worker.is_draining
                 || worker.running_action_infos.is_empty()
-                || !platform_properties.is_satisfied_by(&worker.total_platform_properties, false)
+                || !platform_properties.is_satisfied_by(&worker.action_platform_properties, false)
             {
                 continue;
             }
@@ -977,7 +977,7 @@ impl ApiWorkerSchedulerImpl {
         platform_properties: &PlatformProperties,
     ) -> bool {
         let fits_here = self.workers.iter().any(|(_, worker)| {
-            platform_properties.is_satisfied_by(&worker.total_platform_properties, false)
+            platform_properties.is_satisfied_by(&worker.action_platform_properties, false)
         });
         if !fits_here {
             return false;
@@ -1039,7 +1039,7 @@ impl ApiWorkerSchedulerImpl {
             .iter()
             .filter(|(worker_id, worker)| !worker.is_draining && !holds.contains_key(*worker_id))
             .filter(|(_, worker)| {
-                platform_properties.is_satisfied_by(&worker.total_platform_properties, false)
+                platform_properties.is_satisfied_by(&worker.action_platform_properties, false)
             })
             // A worker that declined this much while idle is not offered
             // it again until it reports that much free; a hold on it would
@@ -1182,7 +1182,7 @@ impl ApiWorkerSchedulerImpl {
         let satisfiable = candidates.iter().any(|worker_id| {
             self.workers.peek(worker_id).is_some_and(|w| {
                 platform_properties
-                    .is_satisfied_by(&w.total_platform_properties, full_worker_logging)
+                    .is_satisfied_by(&w.action_platform_properties, full_worker_logging)
             })
         });
         if satisfiable {
@@ -1201,7 +1201,7 @@ impl ApiWorkerSchedulerImpl {
         let fleet: Vec<_> = self
             .workers
             .iter()
-            .map(|(_, w)| &w.total_platform_properties)
+            .map(|(_, w)| &w.action_platform_properties)
             .chain(peer_fleet.iter())
             .collect();
         Some(Arc::new(explain_unsatisfiable(platform_properties, &fleet)))
@@ -1322,7 +1322,8 @@ impl ApiWorkerSchedulerImpl {
             }
 
             // Verify Minimum properties at runtime (their values are dynamic)
-            platform_properties.is_satisfied_by(&w.platform_properties, full_worker_logging)
+            platform_properties.is_satisfied_by(&w.action_platform_properties, full_worker_logging)
+                && platform_properties.is_satisfied_by(&w.platform_properties, full_worker_logging)
         };
 
         // Now check constraints on filtered candidates.
@@ -1465,7 +1466,7 @@ impl ApiWorkerSchedulerImpl {
         policy: &ResourceEscalationSpec,
         properties: &PlatformProperties,
         property: &str,
-    ) -> Option<(u64, u64)> {
+    ) -> Option<(u64, u64, u64)> {
         policy
             .capacities
             .iter()
@@ -1474,10 +1475,18 @@ impl ApiWorkerSchedulerImpl {
                     policy.capacity_ignored_properties.contains(name)
                         || match value {
                             PlatformPropertyValue::Minimum(_) if name == property => true,
-                            PlatformPropertyValue::Minimum(needed) => capacity
-                                .minimum
-                                .get(name)
-                                .is_some_and(|available| available >= needed),
+                            PlatformPropertyValue::Minimum(needed) => {
+                                capacity.minimum.get(name).is_some_and(|physical| {
+                                    *needed
+                                        <= (*physical).min(
+                                            capacity
+                                                .action_ceilings
+                                                .get(name)
+                                                .copied()
+                                                .unwrap_or(*physical),
+                                        )
+                                })
+                            }
                             PlatformPropertyValue::Exact(needed) => capacity
                                 .exact
                                 .get(name)
@@ -1487,10 +1496,23 @@ impl ApiWorkerSchedulerImpl {
                 })
             })
             .filter_map(|capacity| {
-                Some((
-                    *capacity.minimum.get(property)?,
-                    *capacity.minimum.get(&policy.cpu_property)?,
-                ))
+                let physical = *capacity.minimum.get(property)?;
+                let ceiling = physical.min(
+                    capacity
+                        .action_ceilings
+                        .get(property)
+                        .copied()
+                        .unwrap_or(physical),
+                );
+                let cpu = *capacity.minimum.get(&policy.cpu_property)?;
+                let cpu = cpu.min(
+                    capacity
+                        .action_ceilings
+                        .get(&policy.cpu_property)
+                        .copied()
+                        .unwrap_or(cpu),
+                );
+                Some((ceiling, physical, cpu))
             })
             .max()
     }
@@ -1558,7 +1580,7 @@ impl ApiWorkerSchedulerImpl {
                 }
             })
             .unwrap_or(0);
-        let Some((ceiling_kb, fleet_cpu)) =
+        let Some((ceiling_kb, physical_kb, fleet_cpu)) =
             Self::eligible_capacity(policy, &pending.action_info.platform_properties, property)
         else {
             let mut failed = result.clone();
@@ -1581,10 +1603,13 @@ impl ApiWorkerSchedulerImpl {
             Some(PlatformPropertyValue::Minimum(cores)) => *cores,
             _ => 0,
         };
-        let already_whole = reserved_kb >= ceiling_kb && cpu_held >= fleet_cpu;
+        let already_whole =
+            reserved_kb >= ceiling_kb && (ceiling_kb < physical_kb || cpu_held >= fleet_cpu);
         if peak_kb > ceiling_kb || already_whole {
             let reason = if peak_kb > ceiling_kb {
                 "measured peak exceeds capacity"
+            } else if ceiling_kb < physical_kb {
+                "killed at per-action capacity"
             } else {
                 "killed at whole-worker capacity"
             };
@@ -1607,7 +1632,7 @@ impl ApiWorkerSchedulerImpl {
                 .max(scaled(reserved_kb, u128::from(dimension.percent)))
                 .max(reserved_kb.saturating_add(1)),
         );
-        let cpu = (value == ceiling_kb).then(|| (policy.cpu_property.clone(), fleet_cpu));
+        let cpu = (value == physical_kb).then(|| (policy.cpu_property.clone(), fleet_cpu));
         let reason = result.error.clone().unwrap_or_else(|| {
             make_err!(
                 Code::FailedPrecondition,

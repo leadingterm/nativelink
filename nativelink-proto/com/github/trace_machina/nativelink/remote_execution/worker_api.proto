@@ -114,7 +114,10 @@ message ConnectWorkerRequest {
     /// (false) from older workers.
     bool admits_when_idle = 4;
 
-    reserved 5; // NextId.
+    /// Per-action limits for minimum properties; absent keys use physical capacity.
+    map<string, uint64> action_ceilings = 5;
+
+    reserved 6; // NextId.
 }
 
 /// The result of an ExecutionRequest.

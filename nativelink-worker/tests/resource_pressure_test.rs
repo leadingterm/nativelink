@@ -107,6 +107,7 @@ impl Fixture {
             Store::new(slow),
         );
         let manager = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            enforced_environment: None,
             root_action_directory: root.to_string_lossy().into_owned(),
             execution_configuration: ExecutionConfiguration {
                 additional_environment: Some(HashMap::from([(

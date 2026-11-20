@@ -124,9 +124,30 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
             ],
             max_inflight_tasks: 0,
             admits_when_idle: memory_is_limited(),
+            action_ceilings: Default::default(),
         }
     );
 
+    Ok(())
+}
+
+#[nativelink_test]
+async fn connection_advertises_configured_action_ceilings() -> Result<(), Error> {
+    let mut context = setup_local_worker_with_config(LocalWorkerConfig {
+        action_ceilings: HashMap::from([("memory_kb".to_string(), 16_777_216)]),
+        worker_api_endpoint: EndpointConfig {
+            timeout: Some(10000.),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let response = context.maybe_streaming_response.take().unwrap();
+    let request = context.client.expect_connect_worker(Ok(response)).await;
+    assert_eq!(
+        request.action_ceilings,
+        HashMap::from([("memory_kb".to_string(), 16_777_216)])
+    );
     Ok(())
 }
 

@@ -1285,6 +1285,7 @@ pub async fn new_local_worker(
 
     let running_actions_manager =
         Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            enforced_environment: config.enforced_environment.clone(),
             root_action_directory: config.work_directory.clone(),
             execution_configuration: ExecutionConfiguration {
                 max_captured_output_bytes: config.max_captured_output_bytes,
@@ -1495,7 +1496,7 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
         // Decided once, so what admission does and what the scheduler is
         // told always agree.
         let admits_when_idle = crate::capacity::memory_is_limited();
-        let connect_worker_request = make_connect_worker_request(
+        let mut connect_worker_request = make_connect_worker_request(
             self.config.name.clone(),
             &platform_properties,
             &extra_envs,
@@ -1507,6 +1508,7 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             admits_when_idle,
         )
         .await?;
+        connect_worker_request.action_ceilings = self.config.action_ceilings.clone();
         let mut update_for_worker_stream = client
             .connect_worker(connect_worker_request)
             .await

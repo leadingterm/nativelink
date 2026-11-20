@@ -581,6 +581,9 @@ pub struct ResourceCapacity {
     /// Minimum-property capacities, including the resource and CPU properties.
     #[serde(default)]
     pub minimum: BTreeMap<String, u64>,
+    /// Per-action ceilings; absent entries use the physical minimum capacity.
+    #[serde(default)]
+    pub action_ceilings: BTreeMap<String, u64>,
     /// Exact properties; a requested key must be present and equal.
     #[serde(default)]
     pub exact: BTreeMap<String, String>,

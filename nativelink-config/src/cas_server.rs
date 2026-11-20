@@ -1685,6 +1685,14 @@ pub struct LocalWorkerConfig {
     /// worker.
     pub platform_properties: HashMap<String, WorkerProperty>,
 
+    /// Maximum reservation per action for each minimum property.
+    #[serde(default)]
+    pub action_ceilings: HashMap<String, u64>,
+
+    /// Environment sources applied authoritatively after client environment.
+    #[serde(default)]
+    pub enforced_environment: Option<HashMap<String, EnvironmentSource>>,
+
     /// Derive the CPU and memory properties from the worker's own cgroup
     /// limits instead of the values above; see `CapacityConfig`. When the
     /// cgroup cannot be read (not Linux, cgroup v1, no permission) the

@@ -233,6 +233,7 @@ mod tests {
             .await?,
         );
         let manager = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            enforced_environment: None,
             root_action_directory: root.clone(),
             execution_configuration: ExecutionConfiguration::default(),
             cas_store: cas.clone(),
@@ -746,6 +747,7 @@ mod tests {
         );
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -909,6 +911,7 @@ mod tests {
         );
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -1711,6 +1714,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -1843,6 +1847,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -1977,6 +1982,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -2166,6 +2172,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -2363,6 +2370,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -2623,6 +2631,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -2781,6 +2790,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -2930,6 +2940,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -3074,6 +3085,7 @@ mod tests {
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -3294,6 +3306,7 @@ exit 0
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     max_concurrent_input_downloads: 0,
@@ -3469,6 +3482,7 @@ exit 0
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     max_concurrent_input_downloads: 0,
@@ -3736,8 +3750,25 @@ exit 0
         cas_store: &Arc<FastSlowStore>,
         execution_configuration: ExecutionConfiguration,
     ) -> Result<Arc<RunningActionsManagerImpl>, Error> {
+        manager_with_enforced_environment(
+            root_action_directory,
+            cas_store,
+            execution_configuration,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(target_family = "unix")]
+    async fn manager_with_enforced_environment(
+        root_action_directory: &str,
+        cas_store: &Arc<FastSlowStore>,
+        execution_configuration: ExecutionConfiguration,
+        enforced_environment: Option<HashMap<String, EnvironmentSource>>,
+    ) -> Result<Arc<RunningActionsManagerImpl>, Error> {
         Ok(Arc::new(RunningActionsManagerImpl::new(
             RunningActionsManagerArgs {
+                enforced_environment,
                 root_action_directory: root_action_directory.to_string(),
                 execution_configuration,
                 cas_store: cas_store.clone(),
@@ -3904,13 +3935,142 @@ exit 0
         Ok(())
     }
 
-    /// The scheduler's properties replace the client's only with enforcement
-    /// on. An environment variable read from a property the client never
-    /// sent sees the scheduler's value then, and nothing otherwise, so an
-    /// upgrade alone changes no action's environment.
     #[cfg(target_family = "unix")]
     #[nativelink_test]
-    async fn scheduler_properties_reach_the_action_only_with_enforcement_on()
+    async fn protected_environment_uses_authoritative_platform()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (_, slow_store, cas_store, _) = setup_stores().await?;
+        let root = make_temp_path("protected_environment");
+        fs::create_dir_all(&root).await?;
+        let platform = |value: &str| Platform {
+            properties: vec![Property {
+                name: "network".into(),
+                value: value.into(),
+            }],
+        };
+        let command = Command {
+            arguments: vec!["sh".into(), "-c".into(),
+                "printf '%s|%s|%s|%s|%s' \"${GANG_NETWORK-unset}\" \"${GANG_CPU-unset}\" \"${GANG_MEM-unset}\" \"$GANG_SIDE_CHANNEL_FILE\" \"$DEFAULT_VAR\"".into()],
+            environment_variables: [
+                ("PATH", env::var("PATH").unwrap()),
+                ("GANG_NETWORK", "requested".into()),
+                ("GANG_CPU", "spoof".into()),
+                ("GANG_MEM", "spoof".into()),
+                ("GANG_SIDE_CHANNEL_FILE", "spoof".into()),
+                ("DEFAULT_VAR", "client".into()),
+            ].into_iter().map(|(name, value)| EnvironmentVariable { name: name.into(), value }).collect(),
+            platform: Some(platform("not-requested")),
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let mut digests = Vec::new();
+        for action_platform in [Some(platform("requested")), None, Some(Platform::default())] {
+            digests.push(
+                serialize_and_upload_message(
+                    &Action {
+                        command_digest: Some(command_digest.into()),
+                        input_root_digest: Some(input_digest.into()),
+                        platform: action_platform,
+                        ..Default::default()
+                    },
+                    cas_store.as_pin(),
+                    &mut DigestHasherFunc::Sha256.hasher(),
+                )
+                .await?,
+            );
+        }
+        let protected = HashMap::from([
+            (
+                "GANG_NETWORK".into(),
+                EnvironmentSource::Property("network".into()),
+            ),
+            ("GANG_CPU".into(), EnvironmentSource::Property("cpu".into())),
+            (
+                "GANG_MEM".into(),
+                EnvironmentSource::Property("memory".into()),
+            ),
+            (
+                "GANG_SIDE_CHANNEL_FILE".into(),
+                EnvironmentSource::SideChannelFile,
+            ),
+        ]);
+        for enforcement in [
+            None,
+            Some(ResourceEnforcement {
+                memory: None,
+                disk_property_name: None,
+                disk_soft: false,
+                disk_headroom_percent: 20,
+                memory_sample_interval: Duration::from_millis(31),
+                disk_sample_interval: Duration::from_millis(131),
+                disk_soft_samples: 1,
+                memory_pool_path: None,
+                pressure_kill: None,
+                disk_pressure_kill: None,
+            }),
+        ] {
+            let manager = manager_with_enforced_environment(
+                &root,
+                &cas_store,
+                ExecutionConfiguration {
+                    resource_enforcement: enforcement,
+                    additional_environment: Some(HashMap::from([(
+                        "DEFAULT_VAR".into(),
+                        EnvironmentSource::Value("default".into()),
+                    )])),
+                    ..Default::default()
+                },
+                Some(protected.clone()),
+            )
+            .await?;
+            for (digest, supplied, expected) in [
+                (digests[0], Some(platform("requested")), "requested"),
+                (digests[0], Some(platform("not-requested")), "not-requested"),
+                (digests[0], Some(Platform::default()), "unset"),
+                (digests[0], None, "requested"),
+                (digests[1], None, "not-requested"),
+                (digests[2], None, "not-requested"),
+            ] {
+                let mut dispatch = dispatch_with_properties(digest, &[]);
+                dispatch.platform = supplied;
+                let action = manager
+                    .create_and_add_action("worker".into(), dispatch)
+                    .await?;
+                let result = run_action(action).await?;
+                assert_eq!(result.exit_code, 0);
+                let stdout = slow_store
+                    .as_ref()
+                    .get_part_unchunked(result.stdout_digest, 0, None)
+                    .await?;
+                let text = String::from_utf8(stdout.to_vec())?;
+                let fields: Vec<_> = text.split('|').collect();
+                assert_eq!(fields.len(), 5);
+                assert_eq!(&fields[..3], &[expected, "unset", "unset"]);
+                assert!(
+                    fields[3].contains("/.side_channels/") && fields[3].ends_with("/report"),
+                    "{text}"
+                );
+                assert_eq!(fields[4], "client");
+            }
+        }
+        Ok(())
+    }
+
+    /// Scheduler properties are authoritative regardless of enforcement.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn scheduler_properties_reach_the_action_with_or_without_enforcement()
     -> Result<(), Box<dyn core::error::Error>> {
         const WORKER_ID: &str = "foo_worker_id";
         let (_, slow_store, cas_store, _ac_store) = setup_stores().await?;
@@ -3977,7 +4137,7 @@ exit 0
                 .await?;
             seen.push(String::from_utf8(stdout.to_vec())?);
         }
-        assert_eq!(seen, ["4096", ""]);
+        assert_eq!(seen, ["4096", "4096"]);
         Ok(())
     }
 
@@ -3992,6 +4152,7 @@ exit 0
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     persistent_workers: PersistentWorkersSettings::default(),
@@ -4148,6 +4309,7 @@ exit 0
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -4544,6 +4706,7 @@ exit 0
         let (_, _, cas_store, _) = setup_stores().await?;
         for (configured, expected) in [(0, Semaphore::MAX_PERMITS), (7, 7)] {
             let manager = RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: make_temp_path("root_action_directory"),
                 execution_configuration: ExecutionConfiguration {
                     max_concurrent_input_downloads: configured,
@@ -5068,6 +5231,7 @@ exit 0
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration,
                 cas_store: cas_store.clone(),
@@ -5761,6 +5925,7 @@ exit 0
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -5893,6 +6058,7 @@ exit 0
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     persistent_workers: PersistentWorkersSettings::default(),
@@ -6087,6 +6253,7 @@ exit 0
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     persistent_workers: PersistentWorkersSettings::default(),
@@ -6237,6 +6404,7 @@ exit 0
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -6345,6 +6513,7 @@ exit 0
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     persistent_workers: PersistentWorkersSettings::default(),
@@ -6505,6 +6674,7 @@ exit 0
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     persistent_workers: PersistentWorkersSettings::default(),
@@ -6633,6 +6803,7 @@ exit 0
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -6718,6 +6889,7 @@ exit 0
         let (_, slow_store, cas_store, _ac_store) = setup_stores().await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.to_string(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -6883,6 +7055,7 @@ exit 0
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -6949,6 +7122,7 @@ exit 0
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -7022,6 +7196,7 @@ exit 0
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     resource_enforcement: Some(ResourceEnforcement {
@@ -7222,6 +7397,8 @@ exit 0
         tokio::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).await?;
 
         let manager = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            enforced_environment: None,
+
             root_action_directory,
             execution_configuration: ExecutionConfiguration {
                 entrypoint: Some(wrapper),
@@ -7374,10 +7551,6 @@ exit 1
         let (_, _, cas_store, ac_store) = setup_stores().await?;
         let root_action_directory = make_temp_path("root_action_directory");
         fs::create_dir_all(&root_action_directory).await?;
-        let side_root = format!("{root_action_directory}/.side_channels");
-        fs::create_dir_all(&side_root).await?;
-        #[cfg(target_family = "unix")]
-        tokio::fs::set_permissions(&side_root, std::fs::Permissions::from_mode(0o700)).await?;
 
         let test_wrapper_script = {
             let test_wrapper_dir = make_temp_path("wrapper_dir");
@@ -7412,6 +7585,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     max_concurrent_input_downloads: 0,
@@ -7521,6 +7695,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: String::new(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -7603,6 +7778,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: String::new(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -7684,6 +7860,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: String::new(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -7798,6 +7975,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: String::new(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -7848,6 +8026,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: String::new(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -7929,6 +8108,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: String::new(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -8057,6 +8237,7 @@ exit 1
 
             let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
                 RunningActionsManagerArgs {
+                    enforced_environment: None,
                     root_action_directory: root_action_directory.clone(),
                     execution_configuration: ExecutionConfiguration::default(),
                     cas_store: cas_store.clone(),
@@ -8153,6 +8334,7 @@ exit 1
 
             let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
                 RunningActionsManagerArgs {
+                    enforced_environment: None,
                     root_action_directory: root_action_directory.clone(),
                     execution_configuration: ExecutionConfiguration::default(),
                     cas_store: cas_store.clone(),
@@ -8249,6 +8431,7 @@ exit 1
 
             let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
                 RunningActionsManagerArgs {
+                    enforced_environment: None,
                     root_action_directory: root_action_directory.clone(),
                     execution_configuration: ExecutionConfiguration::default(),
                     cas_store: cas_store.clone(),
@@ -8346,6 +8529,7 @@ exit 1
         let (_, _, cas_store, ac_store) = setup_stores().await?;
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -8510,6 +8694,7 @@ exit 1
         let (_, _, cas_store, ac_store) = setup_stores().await?;
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -8689,6 +8874,7 @@ exit 1
         let (_, _, cas_store, ac_store) = setup_stores().await?;
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -8805,6 +8991,7 @@ exit 1
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -8923,6 +9110,7 @@ exit 1
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -9045,6 +9233,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -9174,6 +9363,7 @@ exit 1
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -9327,6 +9517,7 @@ while [ ! -f "$0.d/release" ]; do "{sleep}" 0.01; done
                     .as_bytes(),
                 )?;
             let manager = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: actions.to_string_lossy().into_owned(),
                 execution_configuration: ExecutionConfiguration {
                     persistent_workers: PersistentWorkersSettings::default(),
@@ -9595,6 +9786,7 @@ while [ ! -f "$0.d/release" ]; do "{sleep}" 0.01; done
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -9698,6 +9890,7 @@ done
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -9887,6 +10080,7 @@ done
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -10013,6 +10207,7 @@ done
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     max_concurrent_input_downloads: 0,
@@ -10170,6 +10365,7 @@ done
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     max_concurrent_input_downloads: 0,
@@ -10298,6 +10494,7 @@ done
         fs::create_dir_all(&root_action_directory).await?;
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -10446,6 +10643,7 @@ done
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -10625,6 +10823,7 @@ done
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -10788,6 +10987,7 @@ done
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory,
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
@@ -11090,6 +11290,7 @@ done
 
         let running_actions_manager =
             Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                enforced_environment: None,
                 root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration {
                     resource_enforcement: Some(ResourceEnforcement {

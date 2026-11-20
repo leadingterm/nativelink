@@ -3489,13 +3489,8 @@ impl RunningActionImpl {
         })
     }
 
-    /// The environment an action's process starts with: the worker's
-    /// `additional_environment`, then the action's own variables on top,
-    /// and on Windows the `SystemRoot` and `PATH` defaults without which
-    /// nothing runs. With `per_action` the sources that belong to one
-    /// action (its timeout, a side channel file, its directory) are in and
-    /// the side channel file is reported through it; without it they are
-    /// left out, for a pooled process that serves many actions.
+    /// Builds defaults first, then client variables, then enforced variables.
+    /// Per-action sources are omitted for a pooled process.
     fn action_environment(
         &self,
         command_proto: &ProtoCommand,
@@ -3509,51 +3504,37 @@ impl RunningActionImpl {
             .additional_environment
         {
             for (name, source) in additional_environment {
-                let value = match source {
-                    EnvironmentSource::Property(property) => self
-                        .action_info
-                        .platform_properties
-                        .get(property)
-                        .cloned()
-                        .unwrap_or_default(),
-                    EnvironmentSource::Value(value) => value.clone(),
-                    EnvironmentSource::FromEnvironment => env::var(name).unwrap_or_default(),
-                    EnvironmentSource::TimeoutMillis => {
-                        if per_action.is_none() {
-                            continue;
-                        }
-                        requested_timeout.as_millis().to_string()
-                    }
-                    EnvironmentSource::SideChannelFile => {
-                        let Some(side_channel_file) = per_action.as_mut() else {
-                            continue;
-                        };
-                        let root = Path::new(&self.running_actions_manager.root_action_directory)
-                            .canonicalize()
-                            .err_tip(|| "Canonicalizing side channel root")?;
-                        let path = root
-                            .join(".side_channels")
-                            .join(self.operation_id.to_string())
-                            .join("report");
-                        let file = path
-                            .to_str()
-                            .err_tip(|| "Side channel path is not UTF-8")?
-                            .to_owned();
-                        **side_channel_file = Some(Cow::Owned(path.into_os_string()));
-                        file
-                    }
-                    EnvironmentSource::ActionDirectory => {
-                        if per_action.is_none() {
-                            continue;
-                        }
-                        self.action_directory.clone()
-                    }
-                };
-                env.insert(name.clone(), value);
+                if let Some(value) = self.resolve_environment_source(
+                    name,
+                    source,
+                    requested_timeout,
+                    &mut per_action,
+                )? {
+                    env.insert(name.clone(), value);
+                } else if matches!(source, EnvironmentSource::Property(_)) {
+                    env.insert(name.clone(), String::new());
+                }
             }
         }
         for variable in &command_proto.environment_variables {
             env.insert(variable.name.clone(), variable.value.clone());
+        }
+        if let Some(enforced_environment) = &self.running_actions_manager.enforced_environment {
+            for (name, source) in enforced_environment {
+                match self.resolve_environment_source(
+                    name,
+                    source,
+                    requested_timeout,
+                    &mut per_action,
+                )? {
+                    Some(value) => {
+                        env.insert(name.clone(), value);
+                    }
+                    None => {
+                        env.remove(name);
+                    }
+                }
+            }
         }
         // If SystemRoot is not set on windows we set it to default. Failing
         // to do this causes all commands to fail.
@@ -3567,6 +3548,47 @@ impl RunningActionImpl {
             }
         }
         Ok(env)
+    }
+
+    fn resolve_environment_source(
+        &self,
+        name: &str,
+        source: &EnvironmentSource,
+        requested_timeout: Duration,
+        per_action: &mut Option<&mut Option<Cow<'_, OsStr>>>,
+    ) -> Result<Option<String>, Error> {
+        Ok(match source {
+            EnvironmentSource::Property(property) => {
+                self.action_info.platform_properties.get(property).cloned()
+            }
+            EnvironmentSource::Value(value) => Some(value.clone()),
+            EnvironmentSource::FromEnvironment => Some(env::var(name).unwrap_or_default()),
+            EnvironmentSource::TimeoutMillis => per_action
+                .as_ref()
+                .map(|_| requested_timeout.as_millis().to_string()),
+            EnvironmentSource::SideChannelFile => {
+                if let Some(side_channel_file) = per_action.as_mut() {
+                    let root = Path::new(&self.running_actions_manager.root_action_directory)
+                        .canonicalize()
+                        .err_tip(|| "Canonicalizing side channel root")?;
+                    let path = root
+                        .join(".side_channels")
+                        .join(self.operation_id.to_string())
+                        .join("report");
+                    let file = path
+                        .to_str()
+                        .err_tip(|| "Side channel path is not UTF-8")?
+                        .to_owned();
+                    **side_channel_file = Some(Cow::Owned(path.into_os_string()));
+                    Some(file)
+                } else {
+                    None
+                }
+            }
+            EnvironmentSource::ActionDirectory => {
+                per_action.as_ref().map(|_| self.action_directory.clone())
+            }
+        })
     }
 
     /// What the scheduler's kill leaves behind for a pooled action, whether
@@ -3920,6 +3942,18 @@ impl RunningActionImpl {
             let side_root = side_dir
                 .parent()
                 .err_tip(|| "Side channel directory has no parent")?;
+            #[cfg(target_family = "unix")]
+            let mut root_builder = tokio::fs::DirBuilder::new();
+            #[cfg(not(target_family = "unix"))]
+            let root_builder = tokio::fs::DirBuilder::new();
+            #[cfg(target_family = "unix")]
+            root_builder.mode(0o700);
+            if let Err(error) = root_builder.create(side_root).await
+                && error.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(Error::from(error)
+                    .append(format!("Creating side channel root {}", side_root.display())));
+            }
             let metadata = tokio::fs::symlink_metadata(side_root)
                 .await
                 .err_tip(|| format!("Reading side channel root {}", side_root.display()))?;
@@ -5812,6 +5846,8 @@ pub enum UseNamespaces {
 pub struct RunningActionsManagerArgs<'a> {
     pub root_action_directory: String,
     pub execution_configuration: ExecutionConfiguration,
+    /// Environment sources that override or remove client-provided variables.
+    pub enforced_environment: Option<HashMap<String, EnvironmentSource>>,
     pub cas_store: Arc<FastSlowStore>,
     pub ac_store: Option<Store>,
     pub historical_store: Store,
@@ -5880,6 +5916,7 @@ impl PressureKillState {
 pub struct RunningActionsManagerImpl {
     root_action_directory: String,
     execution_configuration: ExecutionConfiguration,
+    enforced_environment: Option<HashMap<String, EnvironmentSource>>,
     cas_store: Arc<FastSlowStore>,
     filesystem_store: Arc<FilesystemStore>,
     upload_action_results: UploadActionResults,
@@ -6003,6 +6040,7 @@ impl RunningActionsManagerImpl {
         Ok(Self {
             root_action_directory: args.root_action_directory,
             execution_configuration: args.execution_configuration,
+            enforced_environment: args.enforced_environment,
             input_downloads,
             input_pool_hint,
             cas_store: args.cas_store,
@@ -6289,11 +6327,36 @@ impl RunningActionsManagerImpl {
                 .err_tip(|| "Expected action_digest to exist on StartExecute")?
                 .try_into()?;
             let load_start_timestamp = (self.callbacks.now_fn)();
-            let action = self
+            let mut action = self
                 .fetch_action_with_retry(action_digest)
                 .await
                 .err_tip(|| "During start_action")
                 .map_err(tag_missing_input)?;
+            let action_platform = action.platform.take();
+            let platform = match start_execute.platform {
+                Some(platform) => Some(platform),
+                None if action_platform
+                    .as_ref()
+                    .is_some_and(|platform| !platform.properties.is_empty()) =>
+                {
+                    action_platform
+                }
+                None => {
+                    let command_digest: DigestInfo = action
+                        .command_digest
+                        .clone()
+                        .err_tip(|| "Expected command_digest on Action")?
+                        .try_into()?;
+                    let command = get_and_decode_digest::<ProtoCommand>(
+                        self.cas_store.as_ref(),
+                        command_digest.into(),
+                    )
+                    .await
+                    .err_tip(|| "Converting command_digest to Command")
+                    .map_err(tag_missing_input)?;
+                    command.platform
+                }
+            };
             let mut action_info = ActionInfo::try_from_action_and_execute_request(
                 execute_request,
                 action,
@@ -6301,22 +6364,11 @@ impl RunningActionsManagerImpl {
                 queued_timestamp,
             )
             .err_tip(|| "Could not create ActionInfo in create_and_add_action()")?;
-            // With enforcement on, the scheduler's view of the properties
-            // replaces the client's: a hint or cold-start reservation the
-            // scheduler placed this action by only exists there, and what
-            // is enforced (and exported to the environment) has to be the
-            // number the ledger charged. Off, the worker keeps reading the
-            // client's copy as it always did, so an upgrade changes no
-            // action's environment on its own.
-            if self.execution_configuration.resource_enforcement.is_some()
-                && let Some(platform) = start_execute.platform
-            {
-                for property in platform.properties {
-                    action_info
-                        .platform_properties
-                        .insert(property.name, property.value);
-                }
-            }
+            action_info.platform_properties = platform
+                .into_iter()
+                .flat_map(|platform| platform.properties)
+                .map(|property| (property.name, property.value))
+                .collect();
             Ok(action_info)
         })
     }
