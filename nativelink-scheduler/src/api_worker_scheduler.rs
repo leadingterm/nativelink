@@ -1473,17 +1473,20 @@ impl ApiWorkerSchedulerImpl {
                 properties
                     .properties
                     .iter()
-                    .all(|(name, value)| match value {
-                        PlatformPropertyValue::Minimum(_) if name == property => true,
-                        PlatformPropertyValue::Minimum(needed) => capacity
-                            .minimum
-                            .get(name)
-                            .is_some_and(|available| available >= needed),
-                        PlatformPropertyValue::Exact(needed) => capacity
-                            .exact
-                            .get(name)
-                            .is_some_and(|available| available == needed),
-                        _ => true,
+                    .all(|(name, value)| {
+                        policy.capacity_ignored_properties.contains(name)
+                            || match value {
+                                PlatformPropertyValue::Minimum(_) if name == property => true,
+                                PlatformPropertyValue::Minimum(needed) => capacity
+                                    .minimum
+                                    .get(name)
+                                    .is_some_and(|available| available >= needed),
+                                PlatformPropertyValue::Exact(needed) => capacity
+                                    .exact
+                                    .get(name)
+                                    .is_some_and(|available| available == needed),
+                                _ => true,
+                            }
                     })
             })
             .filter_map(|capacity| {
@@ -3234,6 +3237,45 @@ impl WorkerScheduler for ApiWorkerScheduler {
 }
 
 impl RootMetricsComponent for ApiWorkerScheduler {}
+
+#[cfg(test)]
+mod escalation_capacity_tests {
+    use std::collections::HashMap;
+
+    use nativelink_config::schedulers::ResourceEscalationSpec;
+    use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
+    use serde_json::json;
+
+    use super::ApiWorkerSchedulerImpl;
+
+    #[test]
+    fn ignored_properties_only_affect_capacity_selection() {
+        let mut policy: ResourceEscalationSpec = serde_json::from_value(json!({
+            "memory": { "property": "memory", "percent": 200, "max_steps": 2 },
+            "headroom_percent": 20,
+            "cpu_property": "cpu",
+            "capacities": [{
+                "minimum": { "memory": 1024, "cpu": 4 },
+                "exact": { "environment": "new", "ISA": "arm64" }
+            }]
+        })).expect("valid policy");
+        assert!(policy.capacity_ignored_properties.is_empty());
+        let properties = |environment: &str, isa: &str| PlatformProperties::new(HashMap::from([
+            ("environment".to_owned(), PlatformPropertyValue::Exact(environment.to_owned())),
+            ("ISA".to_owned(), PlatformPropertyValue::Exact(isa.to_owned())),
+            ("memory".to_owned(), PlatformPropertyValue::Minimum(32)),
+        ]));
+        let eligible = |policy: &ResourceEscalationSpec, environment, isa| {
+            ApiWorkerSchedulerImpl::eligible_capacity(policy, &properties(environment, isa), "memory")
+        };
+        assert_eq!(eligible(&policy, "new", "arm64"), Some((1024, 4)));
+        assert_eq!(eligible(&policy, "old", "arm64"), None);
+        policy.capacity_ignored_properties.push("environment".to_owned());
+        assert_eq!(eligible(&policy, "new", "arm64"), Some((1024, 4)));
+        assert_eq!(eligible(&policy, "old", "arm64"), Some((1024, 4)));
+        assert_eq!(eligible(&policy, "old", "x86_64"), None);
+    }
+}
 
 #[cfg(test)]
 mod peer_census_trusted_tests {

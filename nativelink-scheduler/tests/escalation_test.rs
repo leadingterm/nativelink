@@ -111,6 +111,7 @@ fn make_scheduler_with_capacities(
             disk: Some(dimension("disk_kb")),
             headroom_percent: 25,
             cpu_property: "cpu_count".to_string(),
+            capacity_ignored_properties: Vec::new(),
             capacities,
         }),
         max_job_retries: 1,
