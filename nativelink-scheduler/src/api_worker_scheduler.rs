@@ -3303,14 +3303,18 @@ mod escalation_capacity_tests {
                 "memory",
             )
         };
-        assert_eq!(eligible(&policy, "new", "arm64"), Some((1024, 4)));
+        assert_eq!(eligible(&policy, "new", "arm64"), Some((1024, 1024, 4)));
         assert_eq!(eligible(&policy, "old", "arm64"), None);
         policy
             .capacity_ignored_properties
             .push("environment".to_owned());
-        assert_eq!(eligible(&policy, "new", "arm64"), Some((1024, 4)));
-        assert_eq!(eligible(&policy, "old", "arm64"), Some((1024, 4)));
+        assert_eq!(eligible(&policy, "new", "arm64"), Some((1024, 1024, 4)));
+        assert_eq!(eligible(&policy, "old", "arm64"), Some((1024, 1024, 4)));
         assert_eq!(eligible(&policy, "old", "x86_64"), None);
+        policy.capacities[0]
+            .action_ceilings
+            .insert("memory".to_owned(), 512);
+        assert_eq!(eligible(&policy, "old", "arm64"), Some((512, 1024, 4)));
     }
 }
 
