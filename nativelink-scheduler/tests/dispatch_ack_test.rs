@@ -238,6 +238,15 @@ async fn supplied_wall_clock_drives_dispatch_and_late_worker_result() -> Result<
         workers.worker_snapshot().await[0].latest_attempt_deadline,
         Some(deadline)
     );
+    // The worker-liveness clock can be ahead of the injected deadline clock.
+    // It must not make the normal sweep expire the still-valid attempt.
+    keepalive(workers.as_ref(), NOW_TIME + 100, None).await?;
+    workers.remove_timedout_workers(NOW_TIME + 100).await?;
+    assert_eq!(workers.worker_snapshot().await[0].running_actions, 1);
+    assert!(matches!(
+        listener.as_state().await?.0.stage,
+        ActionStage::Executing
+    ));
     wall.store(NOW_TIME + 30, Ordering::SeqCst);
     complete(workers.as_ref(), &dispatch.operation_id).await?;
     assert_eq!(
@@ -650,6 +659,69 @@ async fn a_full_channel_requeues_and_pauses_instead_of_evicting() -> Result<(), 
     complete(worker_scheduler.as_ref(), &dispatched.operation_id).await?;
     let result = wait_for_completion(&mut listener).await;
     assert!(result.error.is_none(), "{:?}", result.error);
+    Ok(())
+}
+
+/// Delivery and acknowledgement are part of the common budget. A buffered
+/// dispatch remains owned after the legacy ack timeout and expires in the
+/// ordinary worker sweep, without being queued for another attempt.
+#[nativelink_test]
+async fn unacknowledged_deadline_attempt_waits_for_normal_expiry() -> Result<(), Error> {
+    let (scheduler, workers) = make_scheduler_with_attempt_timeout(3, 5, 30);
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 41).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    MockClock::advance(Duration::from_secs(6));
+    keepalive(workers.as_ref(), NOW_TIME + 6, None).await?;
+    let summary = &workers.worker_snapshot().await[0];
+    assert_eq!(summary.running_actions, 1);
+    assert_eq!(
+        summary.latest_attempt_deadline,
+        Some(UNIX_EPOCH + Duration::from_secs(NOW_TIME + 30))
+    );
+    assert!(matches!(
+        listener.as_state().await?.0.stage,
+        ActionStage::Executing
+    ));
+
+    MockClock::advance(Duration::from_secs(23));
+    keepalive(workers.as_ref(), NOW_TIME + 29, None).await?;
+    MockClock::advance(Duration::from_secs(1));
+    workers.remove_timedout_workers(NOW_TIME + 30).await?;
+    let result = wait_for_completion(&mut listener).await;
+    assert_eq!(
+        result.error.unwrap().code,
+        nativelink_error::Code::DeadlineExceeded
+    );
+    assert_eq!(workers.worker_snapshot().await[0].running_actions, 0);
+    let dispatch = next_dispatch(&mut rx).await;
+    assert_eq!(next_kill(&mut rx).await, dispatch.operation_id);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn missing_reports_do_not_requeue_owned_deadline_attempt() -> Result<(), Error> {
+    let (scheduler, workers) = make_scheduler_with_attempt_timeout(3, 5, 30);
+    let mut rx = add_worker(&scheduler).await?;
+    let listener = add_action(&scheduler, 42).await?;
+    let dispatch = next_dispatch(&mut rx).await;
+    let operation_id = OperationId::from(dispatch.operation_id.as_str());
+    workers
+        .worker_dispatch_accepted(&worker_id(), &operation_id)
+        .await?;
+    workers
+        .worker_running_operations_reported(&worker_id(), vec![])
+        .await?;
+    workers
+        .worker_running_operations_reported(&worker_id(), vec![])
+        .await?;
+    assert_eq!(workers.worker_snapshot().await[0].running_actions, 1);
+    assert!(matches!(
+        listener.as_state().await?.0.stage,
+        ActionStage::Executing
+    ));
+    complete(workers.as_ref(), &dispatch.operation_id).await?;
     Ok(())
 }
 
