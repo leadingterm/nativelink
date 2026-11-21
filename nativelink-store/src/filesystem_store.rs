@@ -2045,6 +2045,11 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.get_snapshot()
     }
 
+    /// Returns the current eviction accounting and configured byte limit.
+    pub fn eviction_snapshot(&self) -> EvictionSnapshot {
+        self.evicting_map.get_snapshot()
+    }
+
     // Only for tests, so we can run check_duplicate_files
     pub fn get_evicting_map(&self) -> Arc<FsEvictingMap<'static, Fe>> {
         self.evicting_map.clone()

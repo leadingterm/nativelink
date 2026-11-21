@@ -20,7 +20,7 @@ use nativelink_config::schedulers::ResourceCapacity;
 use nativelink_error::Error;
 use nativelink_metric::RootMetricsComponent;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ActionResourceUsage, WorkerLoad,
+    ActionResourceUsage, CacheStats, WorkerLoad,
 };
 use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::operation_state_manager::UpdateOperationType;
@@ -49,6 +49,33 @@ impl ResourceCapacitySnapshot {
         }
     }
 }
+/// Cache counters and capacity most recently reported by a connected worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerCacheStats {
+    pub local_read_requests: u64,
+    pub local_read_bytes: u64,
+    pub slow_read_requests: u64,
+    pub slow_read_bytes: u64,
+    pub evictions: u64,
+    pub evicted_bytes: u64,
+    pub size_bytes: u64,
+    pub budget_bytes: u64,
+}
+
+impl From<CacheStats> for WorkerCacheStats {
+    fn from(stats: CacheStats) -> Self {
+        Self {
+            local_read_requests: stats.local_read_requests,
+            local_read_bytes: stats.local_read_bytes,
+            slow_read_requests: stats.slow_read_requests,
+            slow_read_bytes: stats.slow_read_bytes,
+            evictions: stats.evictions,
+            evicted_bytes: stats.evicted_bytes,
+            size_bytes: stats.size_bytes,
+            budget_bytes: stats.budget_bytes,
+        }
+    }
+}
 
 /// `WorkerScheduler` interface is responsible for interactions between the scheduler
 /// and worker related operations.
@@ -69,6 +96,9 @@ pub struct WorkerSummary {
     pub available_platform_properties: HashMap<String, String>,
     /// What the worker last reported having to spare, if it reports.
     pub free_memory_kb: Option<u64>,
+    /// Cache stats from the latest keepalive, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<WorkerCacheStats>,
 }
 
 #[async_trait]
@@ -125,6 +155,7 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
         worker_id: &WorkerId,
         timestamp: WorkerTimestamp,
         load: Option<WorkerLoad>,
+        cache_stats: Option<CacheStats>,
     ) -> Result<(), Error>;
 
     /// A keepalive said which operations the worker is running. An
