@@ -17,6 +17,7 @@
 //! without an eviction, and an acknowledgement that never comes is a
 //! decline after the timeout.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,6 +58,14 @@ fn make_scheduler(
     max_job_retries: usize,
     dispatch_ack_timeout_s: u64,
 ) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
+    make_scheduler_with_attempt_timeout(max_job_retries, dispatch_ack_timeout_s, 0)
+}
+
+fn make_scheduler_with_attempt_timeout(
+    max_job_retries: usize,
+    dispatch_ack_timeout_s: u64,
+    attempt_timeout_s: u64,
+) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
     MockClock::set_time(Duration::from_secs(NOW_TIME));
     let task_change_notify = Arc::new(Notify::new());
     let spec = SimpleSpec {
@@ -66,6 +75,7 @@ fn make_scheduler(
         )])),
         max_job_retries,
         dispatch_ack_timeout_s,
+        attempt_timeout_s,
         ..SimpleSpec::default()
     };
     SimpleScheduler::new_with_callback(
@@ -195,6 +205,122 @@ async fn wait_for_completion(listener: &mut Box<dyn ActionStateResult>) -> Actio
             return result.clone();
         }
     }
+}
+
+#[nativelink_test]
+async fn supplied_wall_clock_drives_dispatch_and_late_worker_result() -> Result<(), Error> {
+    MockClock::set_time(Duration::from_secs(NOW_TIME));
+    let notify = Arc::new(Notify::new());
+    let wall = Arc::new(AtomicU64::new(NOW_TIME));
+    let clock = wall.clone();
+    let (scheduler, workers) = SimpleScheduler::new_with_resource_sketch_and_now(
+        &SimpleSpec {
+            supported_platform_properties: Some(HashMap::from([(
+                "memory_kb".to_string(),
+                PropertyType::Minimum,
+            )])),
+            attempt_timeout_s: 30,
+            ..SimpleSpec::default()
+        },
+        memory_awaited_action_db_factory(0, &notify, std::time::SystemTime::now),
+        notify,
+        None,
+        None,
+        Arc::new(move || UNIX_EPOCH + Duration::from_secs(clock.load(Ordering::SeqCst))),
+    );
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 33).await?;
+    scheduler.do_try_match_for_test().await?;
+    let dispatch = next_dispatch(&mut rx).await;
+    let deadline = UNIX_EPOCH + Duration::from_secs(NOW_TIME + 30);
+    assert_eq!(dispatch.attempt_deadline, Some(deadline.into()));
+    assert_eq!(
+        workers.worker_snapshot().await[0].latest_attempt_deadline,
+        Some(deadline)
+    );
+    wall.store(NOW_TIME + 30, Ordering::SeqCst);
+    complete(workers.as_ref(), &dispatch.operation_id).await?;
+    assert_eq!(
+        wait_for_completion(&mut listener).await.error.unwrap().code,
+        nativelink_error::Code::DeadlineExceeded
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn attempt_deadline_is_stamped_at_dispatch_and_expires_terminally() -> Result<(), Error> {
+    let (scheduler, workers) = make_scheduler_with_attempt_timeout(3, 0, 30);
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 31).await?;
+    scheduler.do_try_match_for_test().await?;
+    let deadline = UNIX_EPOCH + Duration::from_secs(NOW_TIME + 30);
+    // Delivery and acknowledgement can happen later without resetting the stamp.
+    MockClock::advance(Duration::from_secs(10));
+    let dispatch = next_dispatch(&mut rx).await;
+    assert_eq!(dispatch.attempt_deadline, Some(deadline.into()));
+    assert_eq!(
+        workers.worker_snapshot().await[0].latest_attempt_deadline,
+        Some(deadline)
+    );
+    workers
+        .worker_dispatch_accepted(
+            &worker_id(),
+            &OperationId::from(dispatch.operation_id.as_str()),
+        )
+        .await?;
+    workers
+        .expire_attempts(deadline - Duration::from_secs(1))
+        .await?;
+    assert_eq!(workers.worker_snapshot().await[0].running_actions, 1);
+    workers.expire_attempts(deadline).await?;
+    let result = wait_for_completion(&mut listener).await;
+    assert_eq!(
+        result.error.unwrap().code,
+        nativelink_error::Code::DeadlineExceeded
+    );
+    assert_eq!(workers.worker_snapshot().await[0].running_actions, 0);
+    let kill = rx.recv().await.unwrap();
+    assert!(matches!(
+        kill.update,
+        Some(update_for_worker::Update::KillOperationRequest(_))
+    ));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn retry_gets_a_fresh_deadline_and_success_releases_ownership() -> Result<(), Error> {
+    let (scheduler, workers) = make_scheduler_with_attempt_timeout(3, 0, 30);
+    let mut rx = add_worker(&scheduler).await?;
+    let mut listener = add_action(&scheduler, 32).await?;
+    scheduler.do_try_match_for_test().await?;
+    let first = next_dispatch(&mut rx).await;
+    assert_eq!(
+        first.attempt_deadline,
+        Some((UNIX_EPOCH + Duration::from_secs(NOW_TIME + 30)).into())
+    );
+    MockClock::advance(Duration::from_secs(5));
+    workers
+        .worker_dispatch_declined(
+            &worker_id(),
+            &OperationId::from(first.operation_id.as_str()),
+            "busy".to_string(),
+            None,
+        )
+        .await?;
+    keepalive(workers.as_ref(), NOW_TIME + 5, None).await?;
+    scheduler.do_try_match_for_test().await?;
+    let second = next_dispatch(&mut rx).await;
+    assert_eq!(
+        second.attempt_deadline,
+        Some((UNIX_EPOCH + Duration::from_secs(NOW_TIME + 35)).into())
+    );
+    complete(workers.as_ref(), &second.operation_id).await?;
+    assert!(wait_for_completion(&mut listener).await.error.is_none());
+    assert_eq!(
+        workers.worker_snapshot().await[0].latest_attempt_deadline,
+        None
+    );
+    Ok(())
 }
 
 /// A decline sends the action back untried: with a retry cap of one, two

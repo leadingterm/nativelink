@@ -40,7 +40,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     ActionAttemptEnded, ActionResourceUsage, AttemptEndReason, ResourceOutcome, WorkerLoad,
 };
 use nativelink_util::action_messages::{
-    ActionStage, ActionUniqueQualifier, MISSING_INPUT_ERROR_TIP, OperationId, WorkerId,
+    ActionResult, ActionStage, ActionUniqueQualifier, MISSING_INPUT_ERROR_TIP, OperationId,
+    WorkerId,
 };
 use nativelink_util::metrics::{
     WorkerDisconnectReason, record_dispatch_requeue, record_execution_cpu_time,
@@ -523,6 +524,7 @@ struct ApiWorkerSchedulerImpl {
     /// depends only on what workers registered with, so it holds until the
     /// fleet changes, at which point the map is emptied.
     static_verdicts: HashMap<PropertyShape, Option<Arc<UnsatisfiableReason>>>,
+    now_fn: Box<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
 /// Whether peer-absence can be trusted to fail an action, given the census
@@ -1670,8 +1672,33 @@ impl ApiWorkerSchedulerImpl {
         &mut self,
         worker_id: &WorkerId,
         operation_id: &OperationId,
-        update: UpdateOperationType,
+        mut update: UpdateOperationType,
     ) -> Result<(), Error> {
+        let expired = self
+            .workers
+            .peek(worker_id)
+            .and_then(|worker| worker.running_action_infos.get(operation_id))
+            .and_then(|pending| pending.attempt_deadline)
+            .is_some_and(|deadline| deadline <= (self.now_fn)());
+        if expired
+            && !matches!(
+                update,
+                UpdateOperationType::KeepAlive | UpdateOperationType::ExecutionComplete
+            )
+        {
+            if let Some(worker) = self.workers.get_mut(worker_id) {
+                let _ = worker.kill_unknown_operation(operation_id);
+                worker.clear_kill_request(operation_id);
+            }
+            update =
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
+                    error: Some(make_err!(
+                        Code::DeadlineExceeded,
+                        "Dispatch attempt deadline exceeded"
+                    )),
+                    ..ActionResult::default()
+                }));
+        }
         // Any word from the worker about an action it was sent, other than
         // sending it back, is the worker taking it: a hold for it ends as
         // placed. A decline or a disconnect requeues the action, and its
@@ -1809,6 +1836,19 @@ impl ApiWorkerSchedulerImpl {
         if !is_finished {
             return update_operation_res;
         }
+        // Keep deadline-enabled attempts owned after a failed state write;
+        // the deadline sweep retries terminal publication.
+        if update_operation_res.is_err()
+            && worker
+                .running_action_infos
+                .get(operation_id)
+                .is_some_and(|pending| pending.attempt_deadline.is_some())
+        {
+            if let Some(pending) = worker.running_action_infos.get_mut(operation_id) {
+                pending.terminal_publication_failed = true;
+            }
+            return update_operation_res;
+        }
         // The worker is done with this action even if the state-manager update
         // failed (e.g. the operation was already torn down after its clients
         // timed out). The worker bookkeeping below must still run, or the
@@ -1853,6 +1893,7 @@ impl ApiWorkerSchedulerImpl {
         operation_id: OperationId,
         action_info: ActionInfoWithProps,
         dispatched_at: WorkerTimestamp,
+        attempt_deadline: Option<SystemTime>,
     ) -> Result<(), Error> {
         if let Some(worker) = self.workers.get_mut(&worker_id) {
             let notify_worker_result = worker
@@ -1860,6 +1901,7 @@ impl ApiWorkerSchedulerImpl {
                     operation_id.clone(),
                     action_info.clone(),
                     dispatched_at,
+                    attempt_deadline,
                 ))))
                 .await;
 
@@ -2221,25 +2263,62 @@ impl ApiWorkerSchedulerImpl {
             // action running on it did nothing wrong: it is a worker loss
             // with its own budget, not an attempt the action spent.
             let update = UpdateOperationType::UpdateWithDisconnect;
-            for (operation_id, pending) in worker.running_action_infos.drain() {
+            let pending_actions = std::mem::take(&mut worker.running_action_infos);
+            let now = (self.now_fn)();
+            for (operation_id, pending) in pending_actions {
+                // A result whose publication failed must not be converted to
+                // a worker-loss retry merely because the stream closed.
+                if pending.terminal_publication_failed
+                    && pending
+                        .attempt_deadline
+                        .is_some_and(|deadline| deadline > now)
+                {
+                    worker.running_action_infos.insert(operation_id, pending);
+                    continue;
+                }
                 // The worker can still hold an operation the executing sweep
                 // already timed out or that finished; that attempt was
                 // reported where it ended.
-                if matches!(
-                    self.worker_state_manager
-                        .is_executing_on_worker(&operation_id, worker_id)
-                        .await,
-                    Ok(false)
-                ) {
+                if !pending.terminal_publication_failed
+                    && matches!(
+                        self.worker_state_manager
+                            .is_executing_on_worker(&operation_id, worker_id)
+                            .await,
+                        Ok(false)
+                    )
+                {
                     continue;
                 }
+                let attempt_expired = pending
+                    .attempt_deadline
+                    .is_some_and(|deadline| deadline <= now);
+                let attempt_update = if attempt_expired {
+                    UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                        ActionResult {
+                            error: Some(make_err!(
+                                Code::DeadlineExceeded,
+                                "Dispatch attempt deadline exceeded"
+                            )),
+                            ..ActionResult::default()
+                        },
+                    ))
+                } else {
+                    update.clone()
+                };
                 let update_res = self
                     .worker_state_manager
-                    .update_operation(&operation_id, worker_id, update.clone())
+                    .update_operation(&operation_id, worker_id, attempt_update)
                     .await;
+                if update_res.is_err() && pending.attempt_deadline.is_some() {
+                    let mut pending = pending;
+                    pending.terminal_publication_failed = true;
+                    worker.running_action_infos.insert(operation_id, pending);
+                    result = result.merge(update_res);
+                    continue;
+                }
                 // An operation the worker was told to kill was already
                 // given up on; its loss is not a lost attempt.
-                if update_res.is_ok() && pending.kill_requested_at.is_none() {
+                if update_res.is_ok() && !attempt_expired && pending.kill_requested_at.is_none() {
                     publish_attempt_ended(
                         self.attempt_events.as_ref(),
                         &pending.action_info,
@@ -2250,6 +2329,13 @@ impl ApiWorkerSchedulerImpl {
                     );
                 }
                 result = result.merge(update_res);
+            }
+            if !worker.running_action_infos.is_empty() {
+                // Keep the disconnected ledger visible to drain and deadline
+                // expiry, but never offer this worker more work.
+                worker.is_draining = true;
+                worker.disconnected = true;
+                self.workers.put(worker_id.clone(), worker);
             }
         }
         // Note: Calling this many time is very cheap, it'll only trigger `do_try_match` once.
@@ -2370,6 +2456,46 @@ impl ApiWorkerScheduler {
         record_ttl: Duration,
         scheduler_id: String,
     ) -> Arc<Self> {
+        Self::new_with_clock(
+            worker_state_manager,
+            platform_property_manager,
+            allocation_strategy,
+            live_memory_veto,
+            resource_escalation,
+            reservation_hold,
+            worker_change_notify,
+            worker_timeout_s,
+            unacknowledged_kill_timeout_s,
+            dispatch_ack_timeout_s,
+            worker_registry,
+            maybe_origin_event_tx,
+            resource_sketch,
+            has_peers,
+            record_ttl,
+            scheduler_id,
+            Box::new(SystemTime::now),
+        )
+    }
+
+    pub fn new_with_clock(
+        worker_state_manager: Arc<dyn WorkerStateManager>,
+        platform_property_manager: Arc<PlatformPropertyManager>,
+        allocation_strategy: WorkerAllocationStrategy,
+        live_memory_veto: Option<String>,
+        resource_escalation: Option<ResourceEscalationSpec>,
+        reservation_hold: Option<ReservationHoldSpec>,
+        worker_change_notify: Arc<Notify>,
+        worker_timeout_s: u64,
+        unacknowledged_kill_timeout_s: u64,
+        dispatch_ack_timeout_s: u64,
+        worker_registry: SharedWorkerRegistry,
+        maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
+        resource_sketch: Option<Arc<ResourceSketch>>,
+        has_peers: bool,
+        record_ttl: Duration,
+        scheduler_id: String,
+        now_fn: Box<dyn Fn() -> SystemTime + Send + Sync>,
+    ) -> Arc<Self> {
         debug_assert!(
             !record_ttl.is_zero(),
             "record_ttl must be non-zero; a zero TTL degenerates the census warm-up/staleness checks"
@@ -2417,6 +2543,7 @@ impl ApiWorkerScheduler {
                 peer_fleet_last_refresh: None,
                 local_fleet_change_notify: local_fleet_change_notify.clone(),
                 static_verdicts: HashMap::new(),
+                now_fn,
             }),
             platform_property_manager,
             worker_timeout_s,
@@ -2468,13 +2595,20 @@ impl ApiWorkerScheduler {
         operation_id: OperationId,
         action_info: ActionInfoWithProps,
         dispatched_at: WorkerTimestamp,
+        attempt_deadline: Option<SystemTime>,
     ) -> Result<(), Error> {
         self.metrics
             .actions_dispatched
             .fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.lock().await;
         inner
-            .worker_notify_run_action(worker_id, operation_id, action_info, dispatched_at)
+            .worker_notify_run_action(
+                worker_id,
+                operation_id,
+                action_info,
+                dispatched_at,
+                attempt_deadline,
+            )
             .await
     }
 
@@ -3154,6 +3288,11 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 platform_properties: as_strings(&worker.total_platform_properties),
                 available_platform_properties: as_strings(&worker.platform_properties),
                 free_memory_kb: worker.last_load.map(|load| load.free_memory_kb),
+                latest_attempt_deadline: worker
+                    .running_action_infos
+                    .values()
+                    .filter_map(|pending| pending.attempt_deadline)
+                    .max(),
             })
             .collect()
     }
@@ -3161,6 +3300,59 @@ impl WorkerScheduler for ApiWorkerScheduler {
     async fn set_drain_worker(&self, worker_id: &WorkerId, is_draining: bool) -> Result<(), Error> {
         let mut inner = self.inner.lock().await;
         inner.set_drain_worker(worker_id, is_draining)
+    }
+
+    async fn expire_attempts(&self, now: SystemTime) -> Result<(), Error> {
+        let mut inner = self.inner.lock().await;
+        let expired: Vec<_> = inner
+            .workers
+            .iter()
+            .flat_map(|(worker_id, worker)| {
+                worker
+                    .running_action_infos
+                    .iter()
+                    .filter_map(move |(operation_id, pending)| {
+                        pending
+                            .attempt_deadline
+                            .filter(|deadline| *deadline <= now)
+                            .map(|_| (worker_id.clone(), operation_id.clone()))
+                    })
+            })
+            .collect();
+        let mut result = Ok(());
+        for (worker_id, operation_id) in expired {
+            if let Some(worker) = inner.workers.get_mut(&worker_id) {
+                if let Err(err) = worker.kill_unknown_operation(&operation_id) {
+                    warn!(?worker_id, %operation_id, ?err, "Could not send deadline kill");
+                }
+                worker.clear_kill_request(&operation_id);
+            }
+            result = result.merge(
+                inner
+                    .update_action(
+                        &worker_id,
+                        &operation_id,
+                        UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                            ActionResult {
+                                error: Some(make_err!(
+                                    Code::DeadlineExceeded,
+                                    "Dispatch attempt deadline exceeded"
+                                )),
+                                ..ActionResult::default()
+                            },
+                        )),
+                    )
+                    .await,
+            );
+            if inner
+                .workers
+                .peek(&worker_id)
+                .is_some_and(|worker| worker.disconnected && worker.running_action_infos.is_empty())
+            {
+                inner.remove_worker(&worker_id);
+            }
+        }
+        result
     }
 
     async fn kill_revoked_operations(&self) -> Result<(), Error> {

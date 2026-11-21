@@ -444,6 +444,9 @@ pub struct StartExecute {
     pub request_metadata: ::core::option::Option<
         super::super::super::super::super::build::bazel::remote::execution::v2::RequestMetadata,
     >,
+    /// / Absolute controller-origin deadline for the whole dispatch attempt.
+    #[prost(message, optional, tag = "9")]
+    pub attempt_deadline: ::core::option::Option<::prost_types::Timestamp>,
 }
 /// / This is a special message used to save actions into the CAS that can be used
 /// / by programs like bb_browser to inspect the history of a build.
