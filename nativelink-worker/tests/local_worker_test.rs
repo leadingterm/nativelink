@@ -272,6 +272,7 @@ async fn reconnects_when_action_stuck_in_transit_on_disconnect() -> Result<(), E
 
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -372,6 +373,7 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -492,6 +494,7 @@ async fn start_action_lifecycle_test(single_use: bool) -> Result<(), Error> {
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -679,6 +682,7 @@ async fn upload_failure_response_test(killed: bool, cleanup_fails: bool) -> Resu
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -971,6 +975,7 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -1069,6 +1074,7 @@ async fn kill_action_request_kills_action() -> Result<(), Error> {
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -1176,6 +1182,7 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -1307,6 +1314,7 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -1575,6 +1583,7 @@ async fn a_hung_acknowledgement_does_not_block_the_loop() -> Result<(), Error> {
 
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -1681,6 +1690,7 @@ async fn a_failed_acknowledgement_leaves_a_single_use_worker_unspent() -> Result
 
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -1820,6 +1830,7 @@ async fn disconnect_with_action_in_transit(single_use: bool) -> Result<(), Error
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -1936,6 +1947,7 @@ async fn a_worker_at_capacity_declines_the_next_dispatch() -> Result<(), Error> 
 
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -2031,6 +2043,7 @@ async fn send_update(test_context: &TestContext, update: &UpdateForWorker) -> Re
 fn start_reserving(operation_id: &str, memory_kb: u64) -> UpdateForWorker {
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),

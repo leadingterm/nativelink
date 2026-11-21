@@ -18,9 +18,10 @@ use std::time::SystemTime;
 use hex::FromHex;
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
+use nativelink_proto::build::bazel::remote::execution::v2::{Action, ExecuteRequest, digest_function};
 use nativelink_proto::google::rpc::PreconditionFailure;
 use nativelink_util::action_messages::{
-    ActionInfo, ActionResult, ActionStage, ActionUniqueKey, ActionUniqueQualifier,
+    ActionInfo, ActionReservation, ActionResult, ActionStage, ActionUniqueKey, ActionUniqueQualifier,
     ExecutionMetadata, INTERNAL_ERROR_EXIT_CODE, TypeUrl, to_execute_response,
 };
 use nativelink_util::common::DigestInfo;
@@ -60,6 +61,64 @@ fn old_unique_qualifier_uncachable_works() {
         action_info.unique_qualifier,
         ActionUniqueQualifier::Uncacheable(make_key())
     );
+}
+
+#[nativelink_test]
+fn pre_fit_reservation_is_backward_compatible_and_round_trips() {
+    let contents = include_str!("data/action_message_cachable_060.json");
+    let mut action: ActionInfo = serde_json::from_str(contents).unwrap();
+    assert_eq!(action.pre_fit_reservation, None);
+    let absent = serde_json::to_value(&action).unwrap();
+    assert!(absent.get("pre_fit_reservation").is_none());
+    assert_eq!(serde_json::from_value::<ActionInfo>(absent).unwrap(), action);
+
+    let reservation = ActionReservation {
+        cpu_millicores: 1500,
+        memory_bytes: 2_000_000,
+    };
+    action.pre_fit_reservation = Some(reservation);
+    let serialized = serde_json::to_value(&action).unwrap();
+    assert_eq!(serialized["pre_fit_reservation"]["cpu_millicores"], 1500);
+    assert_eq!(serialized["pre_fit_reservation"]["memory_bytes"], 2_000_000);
+    assert_eq!(
+        serde_json::from_value::<ActionInfo>(serialized).unwrap(),
+        action
+    );
+
+    let updated = ActionInfo {
+        platform_properties: HashMap::from([("cpu".to_string(), "1".to_string())]),
+        ..action.clone()
+    };
+    assert_eq!(updated.pre_fit_reservation, Some(reservation));
+}
+
+#[nativelink_test]
+fn execute_request_conversion_has_no_pre_fit_reservation() {
+    let digest = DigestInfo::zero_digest();
+    let request = ExecuteRequest {
+        action_digest: Some(digest.into()),
+        digest_function: digest_function::Value::Sha256.into(),
+        ..Default::default()
+    };
+    let action = Action {
+        command_digest: Some(digest.into()),
+        input_root_digest: Some(digest.into()),
+        ..Default::default()
+    };
+    let mut info = ActionInfo::try_from_action_and_execute_request(
+        request,
+        action,
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+    )
+    .unwrap();
+    assert_eq!(info.pre_fit_reservation, None);
+    let without_reservation = ExecuteRequest::from(&info);
+    info.pre_fit_reservation = Some(ActionReservation {
+        cpu_millicores: 1500,
+        memory_bytes: 2_000_000,
+    });
+    assert_eq!(ExecuteRequest::from(&info), without_reservation);
 }
 
 #[nativelink_test]

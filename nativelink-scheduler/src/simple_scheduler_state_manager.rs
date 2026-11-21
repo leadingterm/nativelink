@@ -1994,6 +1994,7 @@ mod queued_memory_refit_tests {
             );
             let digest = DigestInfo::zero_digest();
             let info = Arc::new(ActionInfo {
+                pre_fit_reservation: None,
                 memory_reservation: Some(MemoryReservation {
                     minimum_kb: Some(50),
                     desired_kb: Some(200),
@@ -2125,6 +2126,7 @@ mod queued_memory_refit_tests {
         );
         let digest = DigestInfo::zero_digest();
         let info = Arc::new(ActionInfo {
+            pre_fit_reservation: None,
             memory_reservation: Some(MemoryReservation {
                 minimum_kb: Some(0),
                 desired_kb: Some(200),

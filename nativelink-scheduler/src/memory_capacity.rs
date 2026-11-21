@@ -342,6 +342,7 @@ mod tests {
             platform_properties.insert("cpu".to_owned(), cpu.to_string());
         }
         ActionInfo {
+            pre_fit_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
             timeout: Duration::from_secs(60),

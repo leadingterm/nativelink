@@ -305,6 +305,17 @@ pub struct MemoryReservation {
     pub fitted_revision: Option<Uuid>,
 }
 
+/// CPU and memory reservation before fitting the action to the fleet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, MetricsComponent)]
+pub struct ActionReservation {
+    /// Requested CPU reservation in millicores.
+    #[metric(help = "Requested CPU reservation in millicores.")]
+    pub cpu_millicores: u64,
+    /// Requested memory reservation in bytes.
+    #[metric(help = "Requested memory reservation in bytes.")]
+    pub memory_bytes: u64,
+}
+
 /// Information needed to execute an action, including scheduler-owned
 /// execution metadata in addition to the remote execution request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, MetricsComponent)]
@@ -324,6 +335,11 @@ pub struct ActionInfo {
     /// Controller-owned memory fitting intent; absent for ordinary actions.
     #[serde(default)]
     pub memory_reservation: Option<MemoryReservation>,
+    /// Initial learned, cold, or requested reservation before fleet fitting.
+    /// Retained for diagnostics; consumers decide whether fitting reduced it.
+    /// Not used for matching, dispatch, or cache identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_fit_reservation: Option<ActionReservation>,
     /// The priority of the action. Higher value means it should execute faster.
     #[metric(help = "The priority of the action. Higher value means it should execute faster.")]
     pub priority: i32,
@@ -398,6 +414,7 @@ impl ActionInfo {
                         .append("Failed convert proto duration to system duration")
                 })?,
             platform_properties,
+            pre_fit_reservation: None,
             priority: execute_request
                 .execution_policy
                 .unwrap_or_default()

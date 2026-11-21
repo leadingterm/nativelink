@@ -347,6 +347,7 @@ pub async fn server_does_not_timeout_if_execute_complete_test()
     let action_digest = DigestInfo::new([7u8; 32], 123);
     let action_info = Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([0u8; 32], 0),
         input_root_digest: DigestInfo::new([0u8; 32], 0),
         timeout: Duration::MAX,
@@ -450,6 +451,7 @@ pub async fn stream_end_requeues_running_actions_as_disconnect_test()
     let action_digest = DigestInfo::new([8u8; 32], 123);
     let action_info = Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([0u8; 32], 0),
         input_root_digest: DigestInfo::new([0u8; 32], 0),
         timeout: Duration::MAX,
@@ -686,6 +688,7 @@ pub async fn execution_response_success_test() -> Result<(), Box<dyn core::error
     });
     let action_info = Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([0u8; 32], 0),
         input_root_digest: DigestInfo::new([0u8; 32], 0),
         timeout: Duration::MAX,
@@ -983,6 +986,7 @@ pub async fn workers_only_allow_max_tasks() -> Result<(), Box<dyn core::error::E
 
     let action_info = Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([0u8; 32], 0),
         input_root_digest: DigestInfo::new([0u8; 32], 0),
         timeout: Duration::MAX,
@@ -1057,6 +1061,7 @@ pub async fn acknowledgement_is_recorded_before_the_sweep_it_carries_test()
     let action_digest = DigestInfo::new([8u8; 32], 123);
     let action_info = Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([0u8; 32], 0),
         input_root_digest: DigestInfo::new([0u8; 32], 0),
         timeout: Duration::MAX,
@@ -1124,6 +1129,7 @@ pub async fn acknowledgement_is_recorded_before_the_sweep_it_carries_test()
 fn uncacheable_action(seed: u8) -> Arc<ActionInfo> {
     Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_reservation: None,
         command_digest: DigestInfo::new([0u8; 32], 0),
         input_root_digest: DigestInfo::new([0u8; 32], 0),
         timeout: Duration::MAX,
