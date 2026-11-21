@@ -330,12 +330,14 @@ impl Lease {
             inner.pool.config.shutdown_grace
         };
         // Cancellation of release must not cancel reaping or strand the ack.
-        let _ = background_spawn!("persistent_worker_release", async move {
-            inner.worker.shutdown(grace).await;
-            count_slot.decrement_now();
-            inner.attempt.lock().stop();
-        })
-        .await;
+        drop(
+            background_spawn!("persistent_worker_release", async move {
+                inner.worker.shutdown(grace).await;
+                count_slot.decrement_now();
+                inner.attempt.lock().stop();
+            })
+            .await,
+        );
     }
 }
 
