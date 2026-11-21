@@ -176,6 +176,7 @@ struct FinishedActionResult {
 struct AttemptResources<A> {
     action: Mutex<Option<Arc<A>>>,
     cleanup_started: AtomicBool,
+    cleanup_finished: tokio::sync::Notify,
     precondition: Option<Mutex<CommandRegistration>>,
 }
 
@@ -184,6 +185,7 @@ impl<A> AttemptResources<A> {
         Self {
             action: Mutex::new(action),
             cleanup_started: AtomicBool::new(false),
+            cleanup_finished: tokio::sync::Notify::new(),
             precondition,
         }
     }
@@ -231,16 +233,19 @@ async fn run_attempt<U: RunningActionsManager>(
         error!(?err, %operation_id, "Action attempt failed while expiring");
     }
     let retained = resources.action.lock().take().or(registered);
-    if let Some(action) = retained
-        && !resources.cleanup_started.swap(true, Ordering::AcqRel)
-    {
-        // Real cleanup retains the action and its reservations even when an
-        // I/O teardown stalls. It is not a post-deadline execution allowance.
-        background_spawn!("expired_attempt_cleanup", async move {
-            if let Err(err) = action.cleanup().await {
-                warn!(?err, %operation_id, "Expired attempt cleanup failed");
-            }
-        });
+    if let Some(action) = retained {
+        if !resources.cleanup_started.swap(true, Ordering::AcqRel) {
+            let cleanup_resources = resources.clone();
+            // Cleanup retains its owner if this waiter is cancelled. Terminal
+            // publication still waits for reservations to be released.
+            drop(background_spawn!("expired_attempt_cleanup", async move {
+                if let Err(err) = action.cleanup().await {
+                    warn!(?err, %operation_id, "Expired attempt cleanup failed");
+                }
+                cleanup_resources.cleanup_finished.notify_one();
+            }));
+        }
+        resources.cleanup_finished.notified().await;
     }
     Ok(true)
 }
@@ -903,9 +908,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     ok => ok,
                                                 };
                                                 resources.cleanup_started.store(true, Ordering::Release);
-                                                // A deadline during cleanup cancels only this waiter,
-                                                // never the cleanup owner itself.
-                                                let cleanup = background_spawn!("action_cleanup", action.cleanup());
+                                                // Cancellation drops only the waiter; expiry
+                                                // joins the same cleanup through its completion ack.
+                                                let cleanup_resources = resources.clone();
+                                                let cleanup = background_spawn!("action_cleanup", async move {
+                                                    let result = action.cleanup().await;
+                                                    cleanup_resources.cleanup_finished.notify_one();
+                                                    result
+                                                });
                                                 if let Err(e) = cleanup.await.err_tip(|| "Could not join action cleanup").and_then(|result| result) {
                                                     if result.as_ref().is_ok_and(|finished| is_killed(finished.resource_usage.as_ref())) {
                                                         warn!(?e, "Action cleanup failed after a classified kill");
@@ -1904,17 +1914,25 @@ mod attempt_tests {
         registration: Mutex<CommandRegistration>,
         reservation: AtomicBool,
         preparing: Notify,
+        cleanup_entered: Notify,
+        cleanup_allowed: Option<Arc<Notify>>,
         cleaned: Notify,
     }
 
     impl TestAction {
         fn new() -> Arc<Self> {
+            Self::with_cleanup_gate(None)
+        }
+
+        fn with_cleanup_gate(cleanup_allowed: Option<Arc<Notify>>) -> Arc<Self> {
             Arc::new(Self {
                 operation_id: "attempt".into(),
                 directory: String::new(),
                 registration: Mutex::new(CommandRegistration::new(None, SystemTime::now)),
                 reservation: AtomicBool::new(true),
                 preparing: Notify::new(),
+                cleanup_entered: Notify::new(),
+                cleanup_allowed,
                 cleaned: Notify::new(),
             })
         }
@@ -1938,6 +1956,10 @@ mod attempt_tests {
             Ok(ActionResult::default())
         }
         async fn cleanup(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+            self.cleanup_entered.notify_one();
+            if let Some(allowed) = &self.cleanup_allowed {
+                allowed.notified().await;
+            }
             assert!(
                 self.reservation.swap(false, Ordering::AcqRel),
                 "cleanup runs once"
@@ -2170,6 +2192,80 @@ mod attempt_tests {
     }
 
     #[nativelink_test(start_paused = true)]
+    async fn expiry_waits_for_reservation_cleanup_before_terminal_publication() {
+        for cleanup_already_started in [false, true] {
+            let allow_cleanup = Arc::new(Notify::new());
+            let action = TestAction::with_cleanup_gate(Some(allow_cleanup.clone()));
+            let manager = TestManager::new(Some(action.clone()));
+            let resources = retained(Some(action.clone()));
+            let published = Arc::new(AtomicBool::new(false));
+            let future = {
+                let action = action.clone();
+                let resources = resources.clone();
+                async move {
+                    if cleanup_already_started {
+                        resources.cleanup_started.store(true, Ordering::Release);
+                        let cleanup = background_spawn!("test_action_cleanup", async move {
+                            let result = action.cleanup().await;
+                            resources.cleanup_finished.notify_one();
+                            result
+                        });
+                        cleanup.await.unwrap()?;
+                    } else {
+                        action.prepare_action().await?;
+                    }
+                    core::future::pending::<Result<(), Error>>().await
+                }
+                .boxed()
+            };
+            let terminal = {
+                let action = action.clone();
+                let published = published.clone();
+                async move {
+                    assert!(
+                        run_attempt(
+                            manager,
+                            action.operation_id.clone(),
+                            Some(UNIX_EPOCH + Duration::from_secs(10)),
+                            resources,
+                            DigestHasherFunc::Sha256,
+                            future,
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    assert!(!action.reservation.load(Ordering::Acquire));
+                    let execute_result::Result::ExecuteResponse(response) = execution_failure(
+                        make_err!(Code::DeadlineExceeded, "Dispatch deadline exceeded"),
+                    ) else {
+                        panic!("expiry must publish a terminal result");
+                    };
+                    published.store(true, Ordering::Release);
+                    assert_eq!(response.status.unwrap().code, Code::DeadlineExceeded as i32);
+                }
+            };
+            tokio::pin!(terminal);
+            assert!(futures::poll!(&mut terminal).is_pending());
+            if cleanup_already_started {
+                action.cleanup_entered.notified().await;
+            } else {
+                action.preparing.notified().await;
+            }
+            time::advance(Duration::from_secs(10)).await;
+            assert!(futures::poll!(&mut terminal).is_pending());
+            if !cleanup_already_started {
+                action.cleanup_entered.notified().await;
+            }
+            assert!(action.reservation.load(Ordering::Acquire));
+            assert!(!published.load(Ordering::Acquire));
+            allow_cleanup.notify_one();
+            terminal.await;
+            assert!(published.load(Ordering::Acquire));
+            assert!(!action.reservation.load(Ordering::Acquire));
+        }
+    }
+
+    #[nativelink_test(start_paused = true)]
     async fn predeadline_completion_remains_success_and_releases_bookkeeping() {
         let action = TestAction::new();
         let manager = TestManager::new(Some(action.clone()));
@@ -2190,6 +2286,7 @@ mod attempt_tests {
                 assert!(result.error.is_none());
                 resources.cleanup_started.store(true, Ordering::Release);
                 action.cleanup().await?;
+                resources.cleanup_finished.notify_one();
                 published.store(true, Ordering::Release);
                 Ok(())
             }

@@ -1539,7 +1539,7 @@ impl SimpleScheduler {
             resource_sketch,
             has_peers,
             record_ttl,
-            scheduler_id.clone(),
+            scheduler_id,
             worker_now_fn,
         );
         if spec.attempt_timeout_s != 0 {
