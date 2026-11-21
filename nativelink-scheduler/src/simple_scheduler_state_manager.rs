@@ -1452,10 +1452,16 @@ where
                                 .platform_properties
                                 .insert(cpu_property.clone(), cpu_value.to_string());
                         }
-                        if escalation.resource == "memory" {
-                            if let Some(reservation) = &mut action_info.memory_reservation {
+                        if let Some(reservation) = &mut action_info.memory_reservation {
+                            // Any raised minimum can select a different
+                            // correlated row, invalidating the memory fit.
+                            reservation.fitted_revision = None;
+                            if escalation.resource == "memory" {
                                 reservation.desired_kb = Some(escalation.value);
-                                reservation.fitted_revision = None;
+                            } else if let Some((_, cpu_value)) = &escalation.cpu {
+                                // Disk's CPU reservation is independent intent,
+                                // not a temporary whole-memory CPU promotion.
+                                reservation.cpu_before_memory_fit = Some(*cpu_value);
                             }
                         }
                         awaited_action.set_action_info(Arc::new(action_info));
@@ -1943,6 +1949,164 @@ mod queued_memory_refit_tests {
 
     use super::*;
     use crate::default_scheduler_factory::memory_awaited_action_db_factory;
+
+    #[nativelink_test]
+    async fn disk_escalation_invalidates_memory_fit_and_retains_independent_cpu()
+    -> Result<(), Error> {
+        use nativelink_config::schedulers::{PropertyType, ResourceEscalationSpec};
+        use nativelink_util::operation_state_manager::Escalation;
+
+        use crate::memory_capacity::fit_memory;
+        use crate::platform_property_manager::PlatformPropertyManager;
+        use crate::worker_scheduler::ResourceCapacitySnapshot;
+
+        MockClock::set_time(Duration::from_secs(10_000));
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000);
+        let policy: ResourceEscalationSpec = serde_json::from_value(serde_json::json!({
+            "memory": { "property": "memory_kb", "percent": 200, "max_steps": 10 },
+            "disk": { "property": "disk_kb", "percent": 200, "max_steps": 10 },
+            "headroom_percent": 10,
+            "cpu_property": "cpu_count",
+            "capacities": [
+                { "minimum": { "memory_kb": 200, "disk_kb": 200, "cpu_count": 8 } },
+                { "minimum": { "memory_kb": 300, "disk_kb": 1000, "cpu_count": 12 } }
+            ]
+        }))
+        .unwrap();
+        let snapshot = ResourceCapacitySnapshot::new(policy.capacities.clone());
+        let properties = PlatformPropertyManager::new(HashMap::from([
+            ("memory_kb".to_string(), PropertyType::Minimum),
+            ("disk_kb".to_string(), PropertyType::Minimum),
+            ("cpu_count".to_string(), PropertyType::Minimum),
+        ]));
+        // Without an independent disk CPU reservation, retain the baseline
+        // rather than capturing the old whole-memory promotion (8).
+        for disk_cpu in [None, Some(6)] {
+            let notify = Arc::new(Notify::new());
+            let manager = SimpleSchedulerStateManager::new(
+                3,
+                Duration::from_secs(10),
+                Duration::from_secs(300),
+                Duration::from_secs(15),
+                memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
+                MockInstantWrapped::default,
+                None,
+            );
+            let digest = DigestInfo::zero_digest();
+            let info = Arc::new(ActionInfo {
+                memory_reservation: Some(MemoryReservation {
+                    minimum_kb: Some(50),
+                    desired_kb: Some(200),
+                    cpu_before_memory_fit: Some(2),
+                    fitted_revision: Some(snapshot.revision),
+                }),
+                command_digest: digest,
+                input_root_digest: digest,
+                timeout: Duration::from_secs(60),
+                platform_properties: HashMap::from([
+                    ("memory_kb".to_string(), "200".to_string()),
+                    ("disk_kb".to_string(), "100".to_string()),
+                    ("cpu_count".to_string(), "8".to_string()),
+                ]),
+                priority: 7,
+                load_timestamp: started,
+                insert_timestamp: started,
+                unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+                    execution_scope: None,
+                    instance_name: "disk-refit".to_string(),
+                    digest_function: DigestHasherFunc::Sha256,
+                    digest,
+                }),
+            });
+            let subscriber = manager
+                .action_db
+                .add_action(OperationId::default(), info, Duration::from_secs(10))
+                .await?;
+            let mut record = subscriber.borrow().await?;
+            let operation_id = record.operation_id().clone();
+            let worker_id = WorkerId::from("disk-worker".to_string());
+            record.attempts = 1;
+            record.worker_losses = 2;
+            record.store_losses = 3;
+            record.memory_escalations = 4;
+            record.disk_escalations = 5;
+            let mut state = (**record.state()).clone();
+            state.stage = ActionStage::Executing;
+            record.worker_set_state(Arc::new(state), started);
+            record.set_worker_id(Some(worker_id.clone()), started);
+            manager.action_db.update_awaited_action(record).await?;
+
+            manager
+                .update_operation(
+                    &operation_id,
+                    &worker_id,
+                    UpdateOperationType::UpdateWithEscalation(Escalation {
+                        resource: "disk",
+                        property: "disk_kb".to_string(),
+                        value: 500,
+                        peak_kb: 450,
+                        capacity_kb: 1000,
+                        max_steps: 10,
+                        reason: make_err!(Code::ResourceExhausted, "disk limit exceeded"),
+                        cpu: disk_cpu.map(|cpu| ("cpu_count".to_string(), cpu)),
+                    }),
+                )
+                .await?;
+            let queued = subscriber.borrow().await?;
+            assert_eq!(queued.state().stage, ActionStage::Queued);
+            assert_eq!(queued.worker_id(), None);
+            let current = queued.action_info();
+            let reservation = current.memory_reservation.as_ref().unwrap();
+            assert_eq!(reservation.fitted_revision, None);
+            assert_eq!(reservation.minimum_kb, Some(50));
+            assert_eq!(reservation.desired_kb, Some(200));
+            assert_eq!(
+                reservation.cpu_before_memory_fit,
+                Some(disk_cpu.unwrap_or(2))
+            );
+            assert_eq!(current.platform_properties["disk_kb"], "500");
+            assert_eq!(
+                (queued.attempts, queued.worker_losses, queued.store_losses),
+                (1, 2, 3)
+            );
+            assert_eq!((queued.memory_escalations, queued.disk_escalations), (4, 6));
+
+            // The raised disk minimum excludes the old 200-KiB memory row.
+            // On the 300-KiB row, 200 KiB is not full memory: restore the
+            // independent disk CPU intent, not the old baseline or promotion.
+            let fit = fit_memory(current, &policy, &snapshot, &properties)?;
+            assert_eq!(fit.memory_kb, Some(200));
+            assert_eq!(fit.cpu, Some(disk_cpu.unwrap_or(2)));
+            let QueuedMemoryRefit::Updated(updated) = manager
+                .refit_queued_memory(&operation_id, current, "memory_kb", "cpu_count", fit)
+                .await?
+            else {
+                panic!("disk escalation must accept a recomputed memory fit");
+            };
+            assert_eq!(
+                updated.platform_properties["cpu_count"],
+                disk_cpu.unwrap_or(2).to_string()
+            );
+            assert_eq!(
+                updated.memory_reservation.as_ref().unwrap().fitted_revision,
+                Some(snapshot.revision)
+            );
+            let persisted = subscriber.borrow().await?;
+            assert_eq!(
+                (persisted.memory_escalations, persisted.disk_escalations),
+                (4, 6)
+            );
+            assert_eq!(
+                (
+                    persisted.attempts,
+                    persisted.worker_losses,
+                    persisted.store_losses
+                ),
+                (1, 2, 3)
+            );
+        }
+        Ok(())
+    }
 
     #[nativelink_test]
     async fn queued_refit_preserves_record_and_rejects_escalated_or_executing_state()
