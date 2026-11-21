@@ -79,6 +79,11 @@ pub(crate) struct MockWorkerApiClient {
     rx_resp: Arc<Mutex<mpsc::UnboundedReceiver<WorkerClientApiReturns>>>,
     tx_resp: mpsc::UnboundedSender<WorkerClientApiReturns>,
     keep_alives_count: u8,
+    keep_alive_requests: Arc<Mutex<mpsc::UnboundedReceiver<KeepAliveRequest>>>,
+    keep_alive_requests_tx: mpsc::UnboundedSender<KeepAliveRequest>,
+    pub keep_alive_succeeds: Arc<std::sync::atomic::AtomicBool>,
+    pub keep_alive_gated: Arc<std::sync::atomic::AtomicBool>,
+    pub keep_alive_ack: Arc<tokio::sync::Semaphore>,
     /// A keepalive that never completes: a send waiting its turn on a
     /// stalled connection. `keep_alives_hanging` counts the ones held.
     pub keep_alive_hangs: Arc<std::sync::atomic::AtomicBool>,
@@ -92,12 +97,18 @@ impl MockWorkerApiClient {
     pub(crate) fn new() -> Self {
         let (tx_call, rx_call) = mpsc::unbounded_channel();
         let (tx_resp, rx_resp) = mpsc::unbounded_channel();
+        let (keep_alive_requests_tx, keep_alive_requests) = mpsc::unbounded_channel();
         Self {
             rx_call: Arc::new(Mutex::new(rx_call)),
             tx_call,
             rx_resp: Arc::new(Mutex::new(rx_resp)),
             tx_resp,
             keep_alives_count: 0,
+            keep_alive_requests: Arc::new(Mutex::new(keep_alive_requests)),
+            keep_alive_requests_tx,
+            keep_alive_succeeds: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            keep_alive_gated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            keep_alive_ack: Arc::new(tokio::sync::Semaphore::new(0)),
             keep_alive_hangs: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             keep_alives_hanging: Arc::new(AtomicU64::new(0)),
             going_away_count: Arc::new(AtomicU64::new(0)),
@@ -114,6 +125,10 @@ impl Default for MockWorkerApiClient {
 }
 
 impl MockWorkerApiClient {
+    pub(crate) async fn next_keep_alive(&self) -> KeepAliveRequest {
+        self.keep_alive_requests.lock().await.recv().await.unwrap()
+    }
+
     pub(crate) async fn expect_connect_worker(
         &self,
         result: Result<Response<Streaming<UpdateForWorker>>, Status>,
@@ -216,13 +231,19 @@ impl WorkerApiClientTrait for MockWorkerApiClient {
         }
     }
 
-    async fn keep_alive(&mut self, _request: KeepAliveRequest) -> Result<(), Error> {
+    async fn keep_alive(&mut self, request: KeepAliveRequest) -> Result<(), Error> {
         debug!("Got KeepAlive");
+        self.keep_alive_requests_tx.send(request).unwrap();
         if self.keep_alive_hangs.load(Ordering::Acquire) {
             self.keep_alives_hanging.fetch_add(1, Ordering::AcqRel);
             core::future::pending::<()>().await;
         }
-        if self.keep_alives_count == 0 {
+        if self.keep_alive_gated.load(Ordering::Acquire) {
+            self.keep_alive_ack.acquire().await.unwrap().forget();
+        }
+        if self.keep_alive_succeeds.load(Ordering::Acquire) {
+            Ok(())
+        } else if self.keep_alives_count == 0 {
             self.keep_alives_count += 1;
             Ok(())
         } else {

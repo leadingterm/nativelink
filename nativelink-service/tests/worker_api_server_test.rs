@@ -31,7 +31,9 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_scheduler::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    execute_declined, execute_result, update_for_worker, ConnectWorkerRequest, ExecuteAccepted, ExecuteComplete, ExecuteDeclined, ExecuteResult, GoingAwayRequest, KeepAliveRequest, UpdateForScheduler, WorkerLoad
+    CacheStats, ConnectWorkerRequest, ExecuteAccepted, ExecuteComplete, ExecuteDeclined,
+    ExecuteResult, GoingAwayRequest, KeepAliveRequest, UpdateForScheduler, WorkerLoad,
+    execute_declined, execute_result, update_for_worker,
 };
 use nativelink_proto::google::rpc::Status as ProtoStatus;
 use nativelink_scheduler::api_worker_scheduler::ApiWorkerScheduler;
@@ -1197,6 +1199,41 @@ async fn summary_after_report(test_context: &TestContext, free_kb: u64) -> Worke
     panic!("the keepalive reporting {free_kb} KiB was never taken in");
 }
 
+#[nativelink_test]
+pub async fn cache_reports_are_forwarded_and_missing_reports_clear()
+-> Result<(), Box<dyn core::error::Error>> {
+    let context = setup_api_server(BASE_WORKER_TIMEOUT_S, Box::new(static_now_fn)).await?;
+    let first = CacheStats {
+        local_read_requests: 1,
+        local_read_bytes: 2,
+        slow_read_requests: 3,
+        slow_read_bytes: 4,
+        evictions: 5,
+        evicted_bytes: 6,
+        size_bytes: 7,
+        budget_bytes: 8,
+    };
+    let second = CacheStats {
+        evictions: 9,
+        ..first
+    };
+    for (free_kb, cache_stats) in [(1, Some(first)), (2, Some(second)), (3, None)] {
+        context
+            .worker_stream
+            .send(Update::KeepAliveRequest(KeepAliveRequest {
+                load: Some(WorkerLoad {
+                    free_memory_kb: free_kb,
+                }),
+                running_operations: None,
+                cache_stats,
+            }))
+            .await?;
+        let summary = summary_after_report(&context, free_kb).await;
+        assert_eq!(summary.cache, cache_stats.map(Into::into));
+    }
+    Ok(())
+}
+
 /// A decline pauses the worker. The liveness refresh the decline carries
 /// must not lift that pause, or the next matching pass hands the worker
 /// the same action straight back; only a keepalive reporting enough room
@@ -1237,6 +1274,7 @@ pub async fn a_decline_keeps_the_worker_paused_until_a_keepalive_test()
                 free_memory_kb: 1_000,
             }),
             running_operations: None,
+            cache_stats: None,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending keepalive {e}"))?;
@@ -1254,6 +1292,7 @@ pub async fn a_decline_keeps_the_worker_paused_until_a_keepalive_test()
                 free_memory_kb: 5_000,
             }),
             running_operations: None,
+            cache_stats: None,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending keepalive {e}"))?;
@@ -1371,6 +1410,7 @@ pub async fn a_slow_result_does_not_stop_the_stream_reads_test()
                 .send(Update::KeepAliveRequest(KeepAliveRequest {
                     load: Some(WorkerLoad { free_memory_kb }),
                     running_operations: None,
+                    cache_stats: None,
                 })),
         )
         .await

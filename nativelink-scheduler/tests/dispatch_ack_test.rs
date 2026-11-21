@@ -178,6 +178,7 @@ async fn keepalive(
             &worker_id(),
             at,
             free_memory_kb.map(|free_memory_kb| WorkerLoad { free_memory_kb }),
+            None,
         )
         .await?;
     tokio::task::yield_now().await;

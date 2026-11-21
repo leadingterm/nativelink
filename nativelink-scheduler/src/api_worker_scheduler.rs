@@ -37,7 +37,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::events::{
     Event, OriginEvent, ResponseEvent, event, response_event,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ActionAttemptEnded, ActionResourceUsage, AttemptEndReason, ResourceOutcome, WorkerLoad,
+    ActionAttemptEnded, ActionResourceUsage, AttemptEndReason, CacheStats, ResourceOutcome,
+    WorkerLoad,
 };
 use nativelink_util::action_messages::{
     ActionInfo, ActionResult, ActionStage, ActionUniqueQualifier, MISSING_INPUT_ERROR_TIP,
@@ -608,6 +609,7 @@ impl ApiWorkerSchedulerImpl {
         worker_id: &WorkerId,
         timestamp: WorkerTimestamp,
         load: Option<WorkerLoad>,
+        cache_stats: Option<CacheStats>,
         keepalive: bool,
     ) -> Result<(), Error> {
         let worker = self.workers.0.peek_mut(worker_id).ok_or_else(|| {
@@ -639,6 +641,7 @@ impl ApiWorkerSchedulerImpl {
         if !keepalive {
             return Ok(());
         }
+        worker.cache = cache_stats.map(Into::into);
         // A keepalive without a load (an older worker) leaves the last
         // report in place. A report with
         // more room than the last one can make a vetoed action eligible
@@ -2730,12 +2733,13 @@ impl ApiWorkerScheduler {
         worker_id: &WorkerId,
         timestamp: WorkerTimestamp,
         load: Option<WorkerLoad>,
+        cache_stats: Option<CacheStats>,
         keepalive: bool,
     ) -> Result<(), Error> {
         {
             let mut inner = self.inner.lock().await;
             inner
-                .refresh_lifetime(worker_id, timestamp, load, keepalive)
+                .refresh_lifetime(worker_id, timestamp, load, cache_stats, keepalive)
                 .err_tip(|| "Error refreshing lifetime in worker_keep_alive_received()")?;
             if self.dispatch_ack_timeout_s > 0 {
                 let stale = inner.unacknowledged_dispatches(
@@ -3202,8 +3206,10 @@ impl WorkerScheduler for ApiWorkerScheduler {
         worker_id: &WorkerId,
         timestamp: WorkerTimestamp,
         load: Option<WorkerLoad>,
+        cache_stats: Option<CacheStats>,
     ) -> Result<(), Error> {
-        self.refresh_worker(worker_id, timestamp, load, true).await
+        self.refresh_worker(worker_id, timestamp, load, cache_stats, true)
+            .await
     }
 
     async fn worker_running_operations_reported(
@@ -3224,7 +3230,8 @@ impl WorkerScheduler for ApiWorkerScheduler {
         worker_id: &WorkerId,
         timestamp: WorkerTimestamp,
     ) -> Result<(), Error> {
-        self.refresh_worker(worker_id, timestamp, None, false).await
+        self.refresh_worker(worker_id, timestamp, None, None, false)
+            .await
     }
 
     async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error> {
@@ -3419,6 +3426,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
                     .values()
                     .filter_map(|pending| pending.attempt_deadline)
                     .max(),
+                cache: worker.cache,
             })
             .collect()
     }

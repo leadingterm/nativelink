@@ -178,6 +178,9 @@ pub struct Worker {
     /// `None` until it reports, and for workers that never do.
     pub last_load: Option<WorkerLoad>,
 
+    /// Cache stats from the most recent keepalive, if reported.
+    pub cache: Option<crate::worker_scheduler::WorkerCacheStats>,
+
     /// Stats about the worker.
     #[metric]
     metrics: Arc<Metrics>,
@@ -263,6 +266,7 @@ impl Worker {
             disconnected: false,
             max_inflight_tasks,
             last_load: None,
+            cache: None,
             metrics: Arc::new(Metrics {
                 connected_timestamp: SystemTime::now()
                     .duration_since(UNIX_EPOCH)

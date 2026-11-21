@@ -387,6 +387,7 @@ impl WorkerConnection {
                 &self.worker_id,
                 (self.now_fn)()?.as_secs(),
                 keep_alive_request.load,
+                keep_alive_request.cache_stats,
             )
             .await
             .err_tip(|| "Could not process keep_alive from worker in inner_keep_alive()")?;

@@ -239,6 +239,7 @@ async fn report_free(scheduler: &SimpleScheduler, worker: &str, free_kb: u64) ->
             Some(WorkerLoad {
                 free_memory_kb: free_kb,
             }),
+            None,
         )
         .await?;
     tokio::task::yield_now().await;

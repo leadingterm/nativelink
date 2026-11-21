@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::join_all;
 use nativelink_config::stores::{
-    CompressionAlgorithm, CompressionSpec, FastSlowSpec, FilesystemSpec, Lz4Config, MemorySpec,
-    NoopSpec, StoreDirection, StoreSpec,
+    CompressionAlgorithm, CompressionSpec, EvictionPolicy, FastSlowSpec, FilesystemSpec, Lz4Config,
+    MemorySpec, NoopSpec, StoreDirection, StoreSpec,
 };
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
@@ -97,6 +97,147 @@ async fn check_data(
 }
 
 const VALID_HASH: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
+
+async fn filesystem_metrics_store(
+    budget: usize,
+    bypass: u64,
+) -> Result<(Arc<FastSlowStore>, Store, Arc<AtomicUsize>), Error> {
+    let filesystem_spec = FilesystemSpec {
+        content_path: make_temp_path("metrics_content"),
+        temp_path: make_temp_path("metrics_temp"),
+        block_size: 1,
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: budget,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let fast = Store::new(FilesystemStore::<FileEntryImpl>::new(&filesystem_spec).await?);
+    let memory = MemoryStore::new(&MemorySpec::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let slow = Store::new(Arc::new(CountingSlowStore {
+        inner: memory,
+        get_part_calls: calls.clone(),
+    }));
+    let store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Filesystem(filesystem_spec),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            bypass_dedup_threshold_bytes: bypass,
+        },
+        fast,
+        slow.clone(),
+    );
+    Ok((store, slow, calls))
+}
+
+#[nativelink_test]
+async fn filesystem_cache_stats_track_fills_hits_and_evictions() -> Result<(), Error> {
+    let (driver, slow, calls) = filesystem_metrics_store(5, 0).await?;
+    let store = Store::new(driver.clone());
+    let first = DigestInfo::try_new(VALID_HASH, 3)?;
+    let second = DigestInfo::try_new(VALID_HASH_B, 4)?;
+    slow.update_oneshot(first, Bytes::from_static(b"abc"))
+        .await?;
+    slow.update_oneshot(second, Bytes::from_static(b"defg"))
+        .await?;
+    assert_eq!(driver.cache_stats().unwrap().budget_bytes, 5);
+    assert_eq!(
+        store.get_part_unchunked(first, 0, None).await?,
+        Bytes::from_static(b"abc")
+    );
+    assert_eq!(
+        store.get_part_unchunked(first, 0, None).await?,
+        Bytes::from_static(b"abc")
+    );
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!((stats.slow_read_requests, stats.slow_read_bytes), (1, 3));
+    assert_eq!((stats.local_read_requests, stats.local_read_bytes), (1, 3));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    driver.populate_fast_store(first.into()).await?;
+    driver.get_file_entry_for_digest(&first).await?;
+    assert!(driver.get_file_entry_for_digest(&second).await.is_err());
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!((stats.local_read_requests, stats.local_read_bytes), (3, 9));
+    driver
+        .fast_store()
+        .downcast_ref::<FilesystemStore>(None)
+        .unwrap()
+        .get_executable_hardlink_source(&first)
+        .await?;
+    let sources = driver
+        .get_executable_hardlink_sources(&[first, second])
+        .await;
+    assert_eq!(sources.len(), 2);
+    assert!(sources[0].is_ok());
+    assert!(sources[1].is_err());
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!((stats.local_read_requests, stats.local_read_bytes), (4, 12));
+
+    assert_eq!(
+        store.get_part_unchunked(second, 0, None).await?,
+        Bytes::from_static(b"defg")
+    );
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!((stats.slow_read_requests, stats.slow_read_bytes), (2, 7));
+    assert_eq!(
+        (
+            stats.evictions,
+            stats.evicted_bytes,
+            stats.size_bytes,
+            stats.budget_bytes
+        ),
+        (1, 3, 4, 5)
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn filesystem_cache_stats_track_bypassed_reads() -> Result<(), Error> {
+    let (driver, slow, calls) = filesystem_metrics_store(100, 1).await?;
+    let store = Store::new(driver.clone());
+    let digest = DigestInfo::try_new(VALID_HASH, 4)?;
+    slow.update_oneshot(digest, Bytes::from_static(b"abcd"))
+        .await?;
+    assert_eq!(
+        store.get_part_unchunked(digest, 1, Some(2)).await?,
+        Bytes::from_static(b"bc")
+    );
+    let missing = DigestInfo::try_new(VALID_HASH_B, 4)?;
+    assert!(store.get_part_unchunked(missing, 0, None).await.is_err());
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!((stats.slow_read_requests, stats.slow_read_bytes), (1, 2));
+    assert_eq!((stats.local_read_requests, stats.local_read_bytes), (0, 0));
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn cache_stats_count_successful_empty_slow_reads() -> Result<(), Error> {
+    let (driver, slow, _) = filesystem_metrics_store(100, 0).await?;
+    let store = Store::new(driver.clone());
+    let key = StoreKey::new_str("empty-metrics-entry");
+    slow.update_oneshot(key.borrow(), Bytes::new()).await?;
+    assert_eq!(
+        store.get_part_unchunked(key.borrow(), 0, None).await?,
+        Bytes::new()
+    );
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!((stats.slow_read_requests, stats.slow_read_bytes), (1, 0));
+
+    let (non_filesystem, _, _) = make_stores();
+    assert!(
+        non_filesystem
+            .downcast_ref::<FastSlowStore>(None)
+            .unwrap()
+            .cache_stats()
+            .is_none()
+    );
+    Ok(())
+}
 
 #[nativelink_test]
 async fn filesystem_fast_tier_recovers_missing_files_on_upload_and_read() -> Result<(), Error> {
@@ -968,6 +1109,60 @@ impl StoreDriver for InstrumentedSlowStore {
 }
 
 default_health_status_indicator!(InstrumentedSlowStore);
+
+#[nativelink_test]
+async fn concurrent_populates_count_one_remote_fill_and_one_local_read() -> Result<(), Error> {
+    let data = b"deduplicated populate";
+    let digest = DigestInfo::try_new(VALID_HASH, data.len())?;
+    let filesystem_spec = FilesystemSpec {
+        content_path: make_temp_path("populate_metrics_content"),
+        temp_path: make_temp_path("populate_metrics_temp"),
+        block_size: 1,
+        ..Default::default()
+    };
+    let fast = Store::new(FilesystemStore::<FileEntryImpl>::new(&filesystem_spec).await?);
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+    let slow = Arc::new(InstrumentedSlowStore {
+        digest,
+        data: data.to_vec(),
+        get_part_count: AtomicU64::new(0),
+        gate: Mutex::new(Some(gate_rx)),
+    });
+    let driver = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Filesystem(filesystem_spec),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            bypass_dedup_threshold_bytes: 0,
+        },
+        fast,
+        Store::new(slow.clone()),
+    );
+    let leader = driver.populate_fast_store(digest.into());
+    let follower = driver.populate_fast_store(digest.into());
+    tokio::pin!(leader, follower);
+    assert!(futures::poll!(&mut leader).is_pending());
+    assert_eq!(slow.get_part_count.load(Ordering::Acquire), 1);
+    assert!(futures::poll!(&mut follower).is_pending());
+    gate_tx
+        .send(())
+        .map_err(|()| make_err!(Code::Internal, "Slow gate closed"))?;
+    let (leader_result, follower_result) = futures::join!(leader, follower);
+    leader_result?;
+    follower_result?;
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!(slow.get_part_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        (stats.slow_read_requests, stats.slow_read_bytes),
+        (1, data.len() as u64)
+    );
+    assert_eq!(
+        (stats.local_read_requests, stats.local_read_bytes),
+        (1, data.len() as u64)
+    );
+    Ok(())
+}
 
 fn make_fast_slow_with_instrumented_slow(
     digest: DigestInfo,
@@ -2271,6 +2466,36 @@ impl StoreDriver for PartialThenGoneStore {
 }
 
 default_health_status_indicator!(PartialThenGoneStore);
+
+#[nativelink_test]
+async fn bypassed_partial_slow_read_counts_delivered_bytes() -> Result<(), Error> {
+    let filesystem_spec = FilesystemSpec {
+        content_path: make_temp_path("partial_metrics_content"),
+        temp_path: make_temp_path("partial_metrics_temp"),
+        block_size: 1,
+        ..Default::default()
+    };
+    let fast = Store::new(FilesystemStore::<FileEntryImpl>::new(&filesystem_spec).await?);
+    let driver = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Filesystem(filesystem_spec),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            bypass_dedup_threshold_bytes: 1,
+        },
+        fast,
+        Store::new(Arc::new(PartialThenGoneStore {
+            bytes_before_error: 3,
+        })),
+    );
+    let store = Store::new(driver.clone());
+    let digest = DigestInfo::try_new(VALID_HASH, 5)?;
+    assert!(store.get_part_unchunked(digest, 0, None).await.is_err());
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!((stats.slow_read_requests, stats.slow_read_bytes), (1, 3));
+    Ok(())
+}
 
 /// A `NotFound` the slow store raises under the read names the digest, the
 /// way one for a blob that was never there does, so the worker reports the

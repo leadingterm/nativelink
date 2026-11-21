@@ -41,7 +41,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::Platform;
 use nativelink_proto::build::bazel::remote::execution::v2::platform::Property;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ActionResourceUsage, ConnectWorkerRequest, ConnectionResult, ExecuteResult,
+    ActionResourceUsage, CacheStats, ConnectWorkerRequest, ConnectionResult, ExecuteResult,
     KillOperationRequest, Reservation, ResourceOutcome, StartExecute, UpdateForWorker,
     execute_declined, execute_result,
 };
@@ -1408,6 +1408,66 @@ async fn preconditions_met_extra_envs() -> Result<(), Error> {
     )
     .await?;
     assert!(logs_contain("test_value_for_demo_env"));
+    Ok(())
+}
+
+#[nativelink_test(start_paused = true)]
+async fn keep_alive_reports_fresh_optional_cache_stats() -> Result<(), Error> {
+    let config = LocalWorkerConfig {
+        worker_api_endpoint: EndpointConfig {
+            timeout: Some(0.2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut context = setup_local_worker_with_config(config).await;
+    context
+        .client
+        .keep_alive_succeeds
+        .store(true, Ordering::Release);
+    context
+        .client
+        .keep_alive_gated
+        .store(true, Ordering::Release);
+    let response = context.maybe_streaming_response.take().unwrap();
+    context.client.expect_connect_worker(Ok(response)).await;
+    let tx_stream = context.maybe_tx_stream.take().unwrap();
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::ConnectionResult(ConnectionResult {
+                    worker_id: "foobar".to_string(),
+                    dispatch_ack: false,
+                    memory_property: String::new(),
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    let next = || async {
+        tokio::time::timeout(Duration::from_secs(2), context.client.next_keep_alive())
+            .await
+            .expect("keepalive should arrive")
+    };
+    assert_eq!(next().await.cache_stats, None);
+    *context.actions_manager.cache_snapshot.lock().unwrap() = Some(CacheStats::default());
+    context.client.keep_alive_ack.add_permits(1);
+    assert_eq!(next().await.cache_stats, Some(CacheStats::default()));
+    let stats = CacheStats {
+        local_read_requests: 1,
+        local_read_bytes: 2,
+        slow_read_requests: 3,
+        slow_read_bytes: 4,
+        evictions: 5,
+        evicted_bytes: 6,
+        size_bytes: 7,
+        budget_bytes: 8,
+    };
+    *context.actions_manager.cache_snapshot.lock().unwrap() = Some(stats);
+    context.client.keep_alive_ack.add_permits(1);
+    assert_eq!(next().await.cache_stats, Some(stats));
     Ok(())
 }
 

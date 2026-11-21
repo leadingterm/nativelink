@@ -22,7 +22,7 @@ use nativelink_config::schedulers::{PropertyType, SimpleSpec};
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    UpdateForWorker, WorkerLoad, update_for_worker,
+    CacheStats, UpdateForWorker, WorkerLoad, update_for_worker,
 };
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
 use nativelink_scheduler::simple_scheduler::SimpleScheduler;
@@ -119,6 +119,64 @@ fn memory_action(kb: u64) -> HashMap<String, String> {
     HashMap::from([("memory_kb".to_string(), kb.to_string())])
 }
 
+#[nativelink_test]
+async fn cache_reports_follow_worker_connection_and_keepalives() -> Result<(), Error> {
+    let scheduler = make_scheduler(&SimpleSpec::default());
+    let id = WorkerId("cache-worker".to_string());
+    let _rx = add_worker(&scheduler, "cache-worker", HashMap::new()).await?;
+    assert_eq!(scheduler.worker_snapshot().await[0].cache, None);
+
+    let first = CacheStats {
+        local_read_requests: 1,
+        local_read_bytes: 2,
+        slow_read_requests: 3,
+        slow_read_bytes: 4,
+        evictions: 5,
+        evicted_bytes: 6,
+        size_bytes: 7,
+        budget_bytes: 8,
+    };
+    scheduler
+        .worker_keep_alive_received(&id, NOW_TIME + 1, None, Some(first))
+        .await?;
+    assert_eq!(
+        scheduler.worker_snapshot().await[0].cache,
+        Some(first.into())
+    );
+
+    scheduler
+        .worker_liveness_refreshed(&id, NOW_TIME + 2)
+        .await?;
+    assert_eq!(
+        scheduler.worker_snapshot().await[0].cache,
+        Some(first.into())
+    );
+
+    let second = CacheStats {
+        local_read_requests: 9,
+        ..first
+    };
+    scheduler
+        .worker_keep_alive_received(&id, NOW_TIME + 3, None, Some(second))
+        .await?;
+    assert_eq!(
+        scheduler.worker_snapshot().await[0].cache,
+        Some(second.into())
+    );
+
+    scheduler
+        .worker_keep_alive_received(&id, NOW_TIME + 4, None, None)
+        .await?;
+    assert_eq!(scheduler.worker_snapshot().await[0].cache, None);
+    scheduler
+        .worker_keep_alive_received(&id, NOW_TIME + 5, None, Some(first))
+        .await?;
+    scheduler.remove_worker(&id).await?;
+    let _reconnected = add_worker(&scheduler, "cache-worker", HashMap::new()).await?;
+    assert_eq!(scheduler.worker_snapshot().await[0].cache, None);
+    Ok(())
+}
+
 /// Two workers with the same advertised memory. One reports on its keepalive
 /// that it has almost nothing left; with the veto on, an action asking for
 /// more than that goes to the other. A worker that never reports is never
@@ -143,6 +201,7 @@ async fn live_memory_veto_skips_a_worker_that_reports_no_room() -> Result<(), Er
             Some(WorkerLoad {
                 free_memory_kb: 1_000,
             }),
+            None,
         )
         .await?;
     scheduler
@@ -152,6 +211,7 @@ async fn live_memory_veto_skips_a_worker_that_reports_no_room() -> Result<(), Er
             Some(WorkerLoad {
                 free_memory_kb: 50_000,
             }),
+            None,
         )
         .await?;
 
@@ -171,7 +231,7 @@ async fn live_memory_veto_skips_a_worker_that_reports_no_room() -> Result<(), Er
     // without a load leaves `full` at its last report.
     let mut silent = add_worker(&scheduler, "silent", memory_worker(100_000)).await?;
     scheduler
-        .worker_keep_alive_received(&WorkerId("full".to_string()), NOW_TIME + 2, None)
+        .worker_keep_alive_received(&WorkerId("full".to_string()), NOW_TIME + 2, None, None)
         .await?;
     add_action(&scheduler, 3, memory_action(2_000)).await?;
     assert_eq!(
@@ -238,6 +298,7 @@ async fn a_load_report_with_room_again_wakes_the_matcher() -> Result<(), Error> 
             Some(WorkerLoad {
                 free_memory_kb: 1_000,
             }),
+            None,
         )
         .await?;
     add_action(&scheduler, 1, memory_action(2_000)).await?;
@@ -255,6 +316,7 @@ async fn a_load_report_with_room_again_wakes_the_matcher() -> Result<(), Error> 
             Some(WorkerLoad {
                 free_memory_kb: 50_000,
             }),
+            None,
         )
         .await?;
     for _ in 0..4 {
@@ -287,6 +349,7 @@ async fn without_the_veto_a_worker_reporting_no_room_still_gets_actions() -> Res
             Some(WorkerLoad {
                 free_memory_kb: 1_000,
             }),
+            None,
         )
         .await?;
     add_action(&scheduler, 1, memory_action(2_000)).await?;
