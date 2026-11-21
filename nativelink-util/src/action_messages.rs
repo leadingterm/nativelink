@@ -292,11 +292,21 @@ impl Display for ActionUniqueKey {
     }
 }
 
+/// CPU and memory reservation before fitting the action to the fleet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, MetricsComponent)]
+pub struct ActionReservation {
+    /// Requested CPU reservation in millicores.
+    #[metric(help = "Requested CPU reservation in millicores.")]
+    pub cpu_millicores: u64,
+    /// Requested memory reservation in bytes.
+    #[metric(help = "Requested memory reservation in bytes.")]
+    pub memory_bytes: u64,
+}
+
 /// Information needed to execute an action. This struct is used over bazel's proto `Action`
 /// for simplicity and offers a `salt`, which is useful to ensure during hashing (for dicts)
 /// to ensure we never match against another `ActionInfo` (when a task should never be cached).
-/// This struct must be 100% compatible with `ExecuteRequest` struct in `remote_execution.proto`
-/// except for the salt field.
+/// The `ExecuteRequest` fields are supplemented with internal scheduling metadata.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, MetricsComponent)]
 pub struct ActionInfo {
     /// Digest of the underlying `Command`.
@@ -311,6 +321,11 @@ pub struct ActionInfo {
     /// The properties rules that must be applied when finding a worker that can run this action.
     #[metric(group = "platform_properties")]
     pub platform_properties: HashMap<String, String>,
+    /// Learned, cold, or requested reservation before fleet fitting, retained only
+    /// when fitting lowers CPU or memory. Diagnostic only; not used for matching,
+    /// dispatch, or cache identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_fit_reservation: Option<ActionReservation>,
     /// The priority of the action. Higher value means it should execute faster.
     #[metric(help = "The priority of the action. Higher value means it should execute faster.")]
     pub priority: i32,
@@ -384,6 +399,7 @@ impl ActionInfo {
                         .append("Failed convert proto duration to system duration")
                 })?,
             platform_properties,
+            pre_fit_reservation: None,
             priority: execute_request
                 .execution_policy
                 .unwrap_or_default()

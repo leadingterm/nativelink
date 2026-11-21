@@ -301,6 +301,7 @@ impl InstanceInfo {
         };
 
         Ok(ActionInfo {
+            pre_fit_reservation: None,
             command_digest,
             input_root_digest,
             timeout,

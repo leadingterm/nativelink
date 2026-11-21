@@ -101,6 +101,7 @@ fn make_awaited_action(operation_id: &str) -> AwaitedAction {
     AwaitedAction::new(
         operation_id.into(),
         Arc::new(ActionInfo {
+            pre_fit_reservation: None,
             command_digest: DigestInfo::zero_digest(),
             input_root_digest: DigestInfo::zero_digest(),
             timeout: Duration::from_secs(1),
@@ -265,6 +266,7 @@ async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
     const SUB_CHANNEL: &str = "sub_channel";
 
     let action_info = Arc::new(ActionInfo {
+        pre_fit_reservation: None,
         command_digest: DigestInfo::zero_digest(),
         input_root_digest: DigestInfo::zero_digest(),
         timeout: Duration::from_secs(1),
@@ -568,6 +570,7 @@ async fn add_action_attaches_ttl_to_cid_mapping() -> Result<(), Error> {
     const SUB_CHANNEL: &str = "sub_channel";
 
     let action_info = Arc::new(ActionInfo {
+        pre_fit_reservation: None,
         command_digest: DigestInfo::zero_digest(),
         input_root_digest: DigestInfo::zero_digest(),
         timeout: Duration::from_secs(1),
