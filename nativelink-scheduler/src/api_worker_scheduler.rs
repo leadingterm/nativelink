@@ -37,7 +37,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::events::{
     Event, OriginEvent, ResponseEvent, event, response_event,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ActionAttemptEnded, ActionResourceUsage, AttemptEndReason, CacheStats, ResourceOutcome, WorkerLoad,
+    ActionAttemptEnded, ActionResourceUsage, AttemptEndReason, CacheStats, ResourceOutcome,
+    WorkerLoad,
 };
 use nativelink_util::action_messages::{
     ActionInfo, ActionStage, ActionUniqueQualifier, MISSING_INPUT_ERROR_TIP, OperationId, WorkerId,
@@ -3073,7 +3074,8 @@ impl WorkerScheduler for ApiWorkerScheduler {
         load: Option<WorkerLoad>,
         cache_stats: Option<CacheStats>,
     ) -> Result<(), Error> {
-        self.refresh_worker(worker_id, timestamp, load, cache_stats, true).await
+        self.refresh_worker(worker_id, timestamp, load, cache_stats, true)
+            .await
     }
 
     async fn worker_running_operations_reported(
@@ -3094,7 +3096,8 @@ impl WorkerScheduler for ApiWorkerScheduler {
         worker_id: &WorkerId,
         timestamp: WorkerTimestamp,
     ) -> Result<(), Error> {
-        self.refresh_worker(worker_id, timestamp, None, None, false).await
+        self.refresh_worker(worker_id, timestamp, None, None, false)
+            .await
     }
 
     async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error> {

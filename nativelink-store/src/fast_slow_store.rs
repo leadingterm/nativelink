@@ -231,12 +231,21 @@ impl FastSlowStore {
     /// Returns lifetime read counters and the current filesystem cache snapshot.
     /// Non-filesystem fast tiers do not provide cache capacity information.
     pub fn cache_stats(&self) -> Option<FastSlowStoreStats> {
-        let snapshot = self.fast_store.downcast_ref::<FilesystemStore>(None)?.eviction_snapshot();
+        let snapshot = self
+            .fast_store
+            .downcast_ref::<FilesystemStore>(None)?
+            .eviction_snapshot();
         Some(FastSlowStoreStats {
             local_read_requests: self.metrics.fast_store_hit_count.load(Ordering::Relaxed),
-            local_read_bytes: self.metrics.fast_store_downloaded_bytes.load(Ordering::Relaxed),
+            local_read_bytes: self
+                .metrics
+                .fast_store_downloaded_bytes
+                .load(Ordering::Relaxed),
             slow_read_requests: self.metrics.slow_store_hit_count.load(Ordering::Relaxed),
-            slow_read_bytes: self.metrics.slow_store_downloaded_bytes.load(Ordering::Relaxed),
+            slow_read_bytes: self
+                .metrics
+                .slow_store_downloaded_bytes
+                .load(Ordering::Relaxed),
             evictions: snapshot.evicted_items,
             evicted_bytes: snapshot.evicted_bytes,
             size_bytes: snapshot.current_bytes,
@@ -245,15 +254,24 @@ impl FastSlowStore {
     }
 
     fn record_local_read(&self, bytes: u64) {
-        self.metrics.fast_store_hit_count.fetch_add(1, Ordering::Relaxed);
-        self.metrics.fast_store_downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.metrics
+            .fast_store_hit_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .fast_store_downloaded_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
         record_store_tier_read("fast", "hit");
         record_store_tier_io("fast", "read", bytes);
     }
 
     /// Resolve an already-resident filesystem entry and account for the read.
-    pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<FileEntryImpl>, Error> {
-        let filesystem = self.fast_store.downcast_ref::<FilesystemStore>(None)
+    pub async fn get_file_entry_for_digest(
+        &self,
+        digest: &DigestInfo,
+    ) -> Result<Arc<FileEntryImpl>, Error> {
+        let filesystem = self
+            .fast_store
+            .downcast_ref::<FilesystemStore>(None)
             .ok_or_else(|| make_err!(Code::Internal, "Fast store is not a filesystem store"))?;
         let entry = filesystem.get_file_entry_for_digest(digest).await?;
         self.record_local_read(digest.size_bytes());
@@ -261,9 +279,20 @@ impl FastSlowStore {
     }
 
     /// Resolve resident executable sources, counting only successful lookups.
-    pub async fn get_executable_hardlink_sources(&self, digests: &[DigestInfo]) -> Vec<Result<OsString, Error>> {
+    pub async fn get_executable_hardlink_sources(
+        &self,
+        digests: &[DigestInfo],
+    ) -> Vec<Result<OsString, Error>> {
         let Some(filesystem) = self.fast_store.downcast_ref::<FilesystemStore>(None) else {
-            return digests.iter().map(|_| Err(make_err!(Code::Internal, "Fast store is not a filesystem store"))).collect();
+            return digests
+                .iter()
+                .map(|_| {
+                    Err(make_err!(
+                        Code::Internal,
+                        "Fast store is not a filesystem store"
+                    ))
+                })
+                .collect();
         };
         let results = filesystem.get_executable_hardlink_sources(digests).await;
         for (digest, result) in digests.iter().zip(&results) {
@@ -282,12 +311,19 @@ impl FastSlowStore {
         length: Option<u64>,
     ) -> Result<(), Error> {
         let bytes_before = writer.get_bytes_written();
-        let result = self.slow_store.get_part(key, writer.borrow_mut(), offset, length).await;
+        let result = self
+            .slow_store
+            .get_part(key, writer.borrow_mut(), offset, length)
+            .await;
         let bytes = writer.get_bytes_written() - bytes_before;
-        self.metrics.slow_store_downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.metrics
+            .slow_store_downloaded_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
         record_store_tier_io("slow", "read", bytes);
         if result.is_ok() || bytes > 0 {
-            self.metrics.slow_store_hit_count.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .slow_store_hit_count
+                .fetch_add(1, Ordering::Relaxed);
             record_store_tier_read("slow", "hit");
         }
         result
@@ -472,7 +508,9 @@ impl FastSlowStore {
             // so we perform it as the very last action in this method.
             {
                 if !counted_hit && slow_res.is_ok() {
-                    self.metrics.slow_store_hit_count.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .slow_store_hit_count
+                        .fetch_add(1, Ordering::Relaxed);
                     record_store_tier_read("slow", "hit");
                 }
                 fast_eof_res.merge(fast_res).merge(slow_res).merge(
@@ -536,7 +574,10 @@ impl FastSlowStore {
         if !populated_here {
             let size = match Self::digest_size_bytes(&key) {
                 Some(size) => Some(size),
-                None => self.fast_store.has(key.borrow()).await
+                None => self
+                    .fast_store
+                    .has(key.borrow())
+                    .await
                     .err_tip(|| "While querying populated fast store")?,
             };
             if let Some(size) = size {
@@ -1007,8 +1048,7 @@ impl StoreDriver for FastSlowStore {
             }
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if e.code == Code::NotFound && sent == 0 =>
-                {
+                Err(e) if e.code == Code::NotFound && sent == 0 => {
                     self.metrics
                         .fast_store_stale_map_falls_through
                         .fetch_add(1, Ordering::Acquire);
@@ -1060,7 +1100,9 @@ impl StoreDriver for FastSlowStore {
                 .huge_blob_dedup_bypasses
                 .fetch_add(1, Ordering::Acquire);
             debug!(%key, threshold_bytes = self.bypass_dedup_threshold_bytes, "Bypassing dedup for huge blob");
-            return self.read_slow_part(key, writer, offset, length).await
+            return self
+                .read_slow_part(key, writer, offset, length)
+                .await
                 .err_tip(|| "In FastSlowStore::get_part huge-blob bypass");
         }
 

@@ -1785,24 +1785,22 @@ async fn resolve_plain_files(
     let mut tasks = Vec::with_capacity(files.len());
     for file in files {
         tasks.push(async move {
-            let file_entry = if let Ok(entry) = cas_store
-                .get_file_entry_for_digest(&file.digest)
-                .await
-            {
-                record_input_file(&file.digest, true);
-                entry
-            } else {
-                let _permit = acquire_download_permit(downloads).await?;
-                let entry = fetch_and_resolve(
-                    file.digest,
-                    || cas_store.populate_fast_store(file.digest.into()),
-                    || filesystem_store.get_file_entry_for_digest(&file.digest),
-                )
-                .await
-                .err_tip(|| "During hard link")?;
-                record_input_file(&file.digest, false);
-                entry
-            };
+            let file_entry =
+                if let Ok(entry) = cas_store.get_file_entry_for_digest(&file.digest).await {
+                    record_input_file(&file.digest, true);
+                    entry
+                } else {
+                    let _permit = acquire_download_permit(downloads).await?;
+                    let entry = fetch_and_resolve(
+                        file.digest,
+                        || cas_store.populate_fast_store(file.digest.into()),
+                        || filesystem_store.get_file_entry_for_digest(&file.digest),
+                    )
+                    .await
+                    .err_tip(|| "During hard link")?;
+                    record_input_file(&file.digest, false);
+                    entry
+                };
             // TODO: add a test for #2051: deadlock with large number of files
             let src_path = file_entry
                 .get_file_path_locked(|src| async move { Ok(src) })
@@ -1846,9 +1844,7 @@ async fn resolve_exec_files(
     downloads: &Semaphore,
 ) -> Result<Vec<PendingLink>, Error> {
     let digests: Vec<DigestInfo> = files.iter().map(|file| file.digest).collect();
-    let sources = cas_store
-        .get_executable_hardlink_sources(&digests)
-        .await;
+    let sources = cas_store.get_executable_hardlink_sources(&digests).await;
 
     let mut tasks = Vec::with_capacity(files.len());
     for (file, source) in files.into_iter().zip(sources) {
@@ -3952,8 +3948,10 @@ impl RunningActionImpl {
             if let Err(error) = root_builder.create(side_root).await
                 && error.kind() != std::io::ErrorKind::AlreadyExists
             {
-                return Err(Error::from(error)
-                    .append(format!("Creating side channel root {}", side_root.display())));
+                return Err(Error::from(error).append(format!(
+                    "Creating side channel root {}",
+                    side_root.display()
+                )));
             }
             let metadata = tokio::fs::symlink_metadata(side_root)
                 .await

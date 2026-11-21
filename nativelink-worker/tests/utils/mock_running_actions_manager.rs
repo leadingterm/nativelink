@@ -149,7 +149,7 @@ impl RunningActionsManager for MockRunningActionsManager {
     type RunningAction = MockRunningAction;
 
     fn cache_stats(&self) -> Option<CacheStats> {
-        self.cache_snapshot.lock().unwrap().clone()
+        *self.cache_snapshot.lock().unwrap()
     }
 
     async fn create_and_add_action(

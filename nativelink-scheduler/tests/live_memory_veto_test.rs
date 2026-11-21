@@ -136,19 +136,41 @@ async fn cache_reports_follow_worker_connection_and_keepalives() -> Result<(), E
         size_bytes: 7,
         budget_bytes: 8,
     };
-    scheduler.worker_keep_alive_received(&id, NOW_TIME + 1, None, Some(first)).await?;
-    assert_eq!(scheduler.worker_snapshot().await[0].cache, Some(first.into()));
+    scheduler
+        .worker_keep_alive_received(&id, NOW_TIME + 1, None, Some(first))
+        .await?;
+    assert_eq!(
+        scheduler.worker_snapshot().await[0].cache,
+        Some(first.into())
+    );
 
-    scheduler.worker_liveness_refreshed(&id, NOW_TIME + 2).await?;
-    assert_eq!(scheduler.worker_snapshot().await[0].cache, Some(first.into()));
+    scheduler
+        .worker_liveness_refreshed(&id, NOW_TIME + 2)
+        .await?;
+    assert_eq!(
+        scheduler.worker_snapshot().await[0].cache,
+        Some(first.into())
+    );
 
-    let second = CacheStats { local_read_requests: 9, ..first };
-    scheduler.worker_keep_alive_received(&id, NOW_TIME + 3, None, Some(second)).await?;
-    assert_eq!(scheduler.worker_snapshot().await[0].cache, Some(second.into()));
+    let second = CacheStats {
+        local_read_requests: 9,
+        ..first
+    };
+    scheduler
+        .worker_keep_alive_received(&id, NOW_TIME + 3, None, Some(second))
+        .await?;
+    assert_eq!(
+        scheduler.worker_snapshot().await[0].cache,
+        Some(second.into())
+    );
 
-    scheduler.worker_keep_alive_received(&id, NOW_TIME + 4, None, None).await?;
+    scheduler
+        .worker_keep_alive_received(&id, NOW_TIME + 4, None, None)
+        .await?;
     assert_eq!(scheduler.worker_snapshot().await[0].cache, None);
-    scheduler.worker_keep_alive_received(&id, NOW_TIME + 5, None, Some(first)).await?;
+    scheduler
+        .worker_keep_alive_received(&id, NOW_TIME + 5, None, Some(first))
+        .await?;
     scheduler.remove_worker(&id).await?;
     let _reconnected = add_worker(&scheduler, "cache-worker", HashMap::new()).await?;
     assert_eq!(scheduler.worker_snapshot().await[0].cache, None);

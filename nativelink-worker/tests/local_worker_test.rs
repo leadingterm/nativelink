@@ -1414,8 +1414,14 @@ async fn keep_alive_reports_fresh_optional_cache_stats() -> Result<(), Error> {
         ..Default::default()
     };
     let mut context = setup_local_worker_with_config(config).await;
-    context.client.keep_alive_succeeds.store(true, Ordering::Release);
-    context.client.keep_alive_gated.store(true, Ordering::Release);
+    context
+        .client
+        .keep_alive_succeeds
+        .store(true, Ordering::Release);
+    context
+        .client
+        .keep_alive_gated
+        .store(true, Ordering::Release);
     let response = context.maybe_streaming_response.take().unwrap();
     context.client.expect_connect_worker(Ok(response)).await;
     let tx_stream = context.maybe_tx_stream.take().unwrap();
@@ -1452,7 +1458,7 @@ async fn keep_alive_reports_fresh_optional_cache_stats() -> Result<(), Error> {
         size_bytes: 7,
         budget_bytes: 8,
     };
-    *context.actions_manager.cache_snapshot.lock().unwrap() = Some(stats.clone());
+    *context.actions_manager.cache_snapshot.lock().unwrap() = Some(stats);
     context.client.keep_alive_ack.add_permits(1);
     assert_eq!(next().await.cache_stats, Some(stats));
     Ok(())

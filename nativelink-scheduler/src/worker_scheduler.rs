@@ -77,7 +77,6 @@ impl From<CacheStats> for WorkerCacheStats {
     }
 }
 
-
 /// `WorkerScheduler` interface is responsible for interactions between the scheduler
 /// and worker related operations.
 /// One connected worker, as the admin API reports it. Property values are
