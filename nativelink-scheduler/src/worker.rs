@@ -405,12 +405,9 @@ impl Worker {
         }
     }
 
-    /// Takes a keepalive's report of what the worker is running and returns
-    /// the acknowledged operations it has left out of
-    /// [`LOST_AFTER_MISSED_REPORTS`] reports in a row. An operation the
-    /// worker was told to kill is on its way off and not counted; one it has
-    /// not acknowledged may still be in transit, which the acknowledgement
-    /// sweep covers.
+    /// Returns acknowledged operations omitted from consecutive reports.
+    /// Deadline-enabled attempts remain owned until their common deadline;
+    /// a missing report alone must not requeue them early.
     pub fn unreported_operations(&mut self, reported: &HashSet<OperationId>) -> Vec<OperationId> {
         let mut lost = Vec::new();
         for (operation_id, pending) in &mut self.running_action_infos {
@@ -420,6 +417,7 @@ impl Worker {
             }
             if !pending.accepted
                 || pending.kill_requested_at.is_some()
+                || pending.attempt_deadline.is_some()
                 || pending.terminal_publication_failed
             {
                 continue;
@@ -432,13 +430,14 @@ impl Worker {
         lost
     }
 
-    /// Operations dispatched at or before `cutoff` that the worker never
-    /// acknowledged.
+    /// Deadline-free operations dispatched at or before `cutoff` that the
+    /// worker never acknowledged.
     pub fn unacknowledged(&self, cutoff: WorkerTimestamp) -> Vec<OperationId> {
         self.running_action_infos
             .iter()
             .filter(|(_, pending)| {
                 !pending.accepted
+                    && pending.attempt_deadline.is_none()
                     && !pending.terminal_publication_failed
                     && pending.dispatched_at <= cutoff
             })
