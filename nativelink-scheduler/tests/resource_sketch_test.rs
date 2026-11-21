@@ -14,7 +14,7 @@
 
 use core::time::Duration;
 
-use nativelink_config::schedulers::SizeClassSpec;
+use nativelink_config::schedulers::{CpuReservationPercentile, SizeClassSpec};
 use nativelink_scheduler::resource_sketch::{
     Budget, ENTRY_BYTES, Entry, Family, Half, Hist, Observation, Policy, ResourceSketch,
     SAMPLER_GENERATION, SketchKey, Snapshot,
@@ -33,7 +33,7 @@ fn class(name: &str, cpu_count: u64, memory_kb: u64, disk_kb: u64) -> SizeClassS
 const fn policy(headroom_percent: u64, classes: Vec<SizeClassSpec>) -> Policy {
     Policy {
         headroom_percent,
-        cpu_reservation_percentile: 95,
+        cpu_reservation_percentile: CpuReservationPercentile::new(95).expect("95 is valid"),
         classes,
         reserve_cpu: true,
         reserve_memory: true,
@@ -120,16 +120,31 @@ fn p95_is_the_upper_bound_of_the_95th_samples_bucket() {
 }
 
 #[test]
+fn p95_and_p100_select_different_buckets() {
+    let mut previous = Hist::default();
+    let mut current = Hist::default();
+    for _ in 0..20 {
+        previous.add(1500);
+    }
+    current.add(100_000);
+    assert_eq!(previous.p95_upper_with(&current), 2000);
+    assert_eq!(
+        previous.percentile_upper_with(&current, CpuReservationPercentile::new(100).unwrap()),
+        128_000
+    );
+}
+
+#[test]
 fn cpu_percentile_uses_both_windows_and_preserves_other_dimensions() {
     let mut median_policy = policy(0, vec![]);
-    median_policy.cpu_reservation_percentile = 50;
+    median_policy.cpu_reservation_percentile = CpuReservationPercentile::new(50).unwrap();
     let median = sketch(median_policy, small_budget());
     let p95 = sketch(policy(0, vec![]), small_budget());
     let mut max_policy = policy(0, vec![]);
-    max_policy.cpu_reservation_percentile = 100;
+    max_policy.cpu_reservation_percentile = CpuReservationPercentile::new(100).unwrap();
     let maximum = sketch(max_policy, small_budget());
     let key = target("//bursty", "X");
-    let half_window = 7 * 86_400 / 2;
+    let boundary = NOW;
     for i in 0..20 {
         let observation = Observation {
             cpu_millicores: Some(if i < 18 { 1000 } else { 12_000 }),
@@ -138,13 +153,13 @@ fn cpu_percentile_uses_both_windows_and_preserves_other_dimensions() {
             killed_peak_memory_kb: (i == 19).then_some(15_000),
             killed_peak_disk_kb: (i == 19).then_some(17_000),
             killed: i == 19,
-            now_s: if i < 10 { half_window - 1 } else { half_window },
+            now_s: if i < 10 { boundary - 1 } else { boundary },
         };
         median.observe(key.clone(), &observation);
         p95.observe(key.clone(), &observation);
         maximum.observe(key.clone(), &observation);
     }
-    let entry = median.lookup(&key, half_window).unwrap();
+    let entry = median.lookup(&key, boundary).unwrap();
     assert!(entry.previous.cpu.total() > 0);
     assert!(entry.current.cpu.total() > 0);
     let shaped = median.shape(&entry);
@@ -160,7 +175,7 @@ fn cpu_percentile_uses_both_windows_and_preserves_other_dimensions() {
 #[test]
 fn cpu_percentile_caps_steady_samples_and_handles_zero_and_missing() {
     let mut configured = policy(20, vec![]);
-    configured.cpu_reservation_percentile = 50;
+    configured.cpu_reservation_percentile = CpuReservationPercentile::new(50).unwrap();
     let sketch = sketch(configured, small_budget());
     for (name, cpu, expected) in [
         ("//steady", Some(1500), 1800),
@@ -168,32 +183,43 @@ fn cpu_percentile_caps_steady_samples_and_handles_zero_and_missing() {
         ("//missing", None, 0),
     ] {
         let key = target(name, "X");
-        sketch.observe(key.clone(), &Observation {
-            cpu_millicores: cpu,
-            peak_memory_kb: 1000,
-            now_s: NOW,
-            ..Observation::default()
-        });
-        assert_eq!(sketch.shape(&sketch.lookup(&key, NOW).unwrap()).cpu_count, expected);
+        sketch.observe(
+            key.clone(),
+            &Observation {
+                cpu_millicores: cpu,
+                peak_memory_kb: 1000,
+                now_s: NOW,
+                ..Observation::default()
+            },
+        );
+        assert_eq!(
+            sketch.shape(&sketch.lookup(&key, NOW).unwrap()).cpu_count,
+            expected
+        );
     }
 }
 
 #[test]
 fn snapshot_reinterprets_cpu_percentile_without_changing_snapshot() {
     let mut median_policy = policy(0, vec![]);
-    median_policy.cpu_reservation_percentile = 50;
+    median_policy.cpu_reservation_percentile = CpuReservationPercentile::new(50).unwrap();
     let median = sketch(median_policy, small_budget());
     let key = target("//snapshot", "X");
     for i in 0..20 {
-        median.observe(key.clone(), &Observation {
-            cpu_millicores: Some(if i < 18 { 1000 } else { 12_000 }),
-            now_s: NOW,
-            ..Observation::default()
-        });
+        median.observe(
+            key.clone(),
+            &Observation {
+                cpu_millicores: Some(if i < 18 { 1000 } else { 12_000 }),
+                now_s: NOW,
+                ..Observation::default()
+            },
+        );
     }
     let bytes = median.encode_snapshot(NOW);
     let restored = sketch(policy(0, vec![]), small_budget());
-    restored.load(Snapshot::decode(&bytes, usize::MAX).unwrap(), NOW).unwrap();
+    restored
+        .load(Snapshot::decode(&bytes, usize::MAX).unwrap(), NOW)
+        .unwrap();
     let original = median.lookup(&key, NOW).unwrap();
     let loaded = restored.lookup(&key, NOW).unwrap();
     assert_eq!(original, loaded);

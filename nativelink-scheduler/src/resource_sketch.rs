@@ -32,7 +32,7 @@ use std::hash::DefaultHasher;
 use std::sync::Arc;
 
 use lru::LruCache;
-use nativelink_config::schedulers::SizeClassSpec;
+use nativelink_config::schedulers::{CpuReservationPercentile, SizeClassSpec};
 use nativelink_error::{Code, Error, make_err};
 use parking_lot::Mutex;
 
@@ -187,12 +187,14 @@ impl Hist {
 
     /// The same over the samples of `self` and `other` together.
     pub fn p95_upper_with(&self, other: &Self) -> u64 {
-        self.percentile_upper_with(other, 95)
+        self.percentile_upper_with(
+            other,
+            CpuReservationPercentile::new(95).expect("95 is a valid CPU reservation percentile"),
+        )
     }
 
     /// Upper bound of the selected percentile bucket across both histograms.
-    /// The percentile must be in 1..=100.
-    pub fn percentile_upper_with(&self, other: &Self, percentile: u8) -> u64 {
+    pub fn percentile_upper_with(&self, other: &Self, percentile: CpuReservationPercentile) -> u64 {
         let total: u128 = self
             .0
             .iter()
@@ -202,7 +204,7 @@ impl Hist {
         if total == 0 {
             return 0;
         }
-        let target = (total * u128::from(percentile)).div_ceil(100);
+        let target = (total * u128::from(percentile.get())).div_ceil(100);
         let mut seen = 0u128;
         for (i, (&a, &b)) in self.0.iter().zip(other.0.iter()).enumerate() {
             seen += u128::from(a) + u128::from(b);
@@ -290,7 +292,7 @@ impl Shaped {
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub headroom_percent: u64,
-    pub cpu_reservation_percentile: u8,
+    pub cpu_reservation_percentile: CpuReservationPercentile,
     pub classes: Vec<SizeClassSpec>,
     /// Which dimensions the fleet reserves: a number on one it does not
     /// would be a minimum no worker advertises.
@@ -987,10 +989,10 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
     // A zero or missing CPU measurement must not impose a CPU minimum.
     let mut cpu = with_headroom(
         percentile_capped(
-            entry.current.cpu.percentile_upper_with(
-                &entry.previous.cpu,
-                policy.cpu_reservation_percentile,
-            ),
+            entry
+                .current
+                .cpu
+                .percentile_upper_with(&entry.previous.cpu, policy.cpu_reservation_percentile),
             entry.max_cpu_millicores(),
         ),
         headroom,

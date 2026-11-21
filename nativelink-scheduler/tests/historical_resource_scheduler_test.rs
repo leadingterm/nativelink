@@ -24,8 +24,8 @@ mod utils {
 
 use futures::join;
 use nativelink_config::schedulers::{
-    ColdStartSpec, HistoricalResourceSpec, SchedulerSpec, SimpleSpec, SizeClassSpec,
-    TimeoutClassSpec,
+    ColdStartSpec, CpuReservationPercentile, HistoricalResourceSpec, SchedulerSpec, SimpleSpec,
+    SizeClassSpec, TimeoutClassSpec,
 };
 use nativelink_config::stores::{MemorySpec, SizePartitioningSpec, StoreSpec};
 use nativelink_error::Error;
@@ -79,7 +79,7 @@ fn base_spec(hints_file: String, cold_start: Option<ColdStartSpec>) -> Historica
         learn_from_workers: true,
         // No headroom, so a seeded number comes back as stated.
         headroom_percent: 0,
-        cpu_reservation_percentile: 95,
+        cpu_reservation_percentile: CpuReservationPercentile::new(95).unwrap(),
         window_days: 7,
         memory_budget_bytes: 16 << 20,
         snapshot_store: None,
@@ -824,7 +824,7 @@ fn existing_configuration_does_not_enable_learning() {
     }))
     .unwrap();
     assert!(!spec.learn_from_workers);
-    assert_eq!(spec.cpu_reservation_percentile, 95);
+    assert_eq!(spec.cpu_reservation_percentile.get(), 95);
     assert_eq!(spec.refresh_interval_s, 30);
     let empty = HistoricalResourceScheduler::sketch_from_spec(&spec);
     assert!(
@@ -835,18 +835,33 @@ fn existing_configuration_does_not_enable_learning() {
 
 #[test]
 fn cpu_reservation_percentile_is_validated_and_forwarded() {
+    assert_eq!(CpuReservationPercentile::new(0), None);
+    assert_eq!(CpuReservationPercentile::new(101), None);
     for percentile in [1, 50, 95, 100] {
         let spec: HistoricalResourceSpec = serde_json::from_value(serde_json::json!({
             "cpu_reservation_percentile": percentile,
             "scheduler": {"simple": {}}
         }))
         .unwrap();
-        assert_eq!(spec.cpu_reservation_percentile, percentile);
+        assert_eq!(spec.cpu_reservation_percentile.get(), percentile);
         assert_eq!(
-            HistoricalResourceScheduler::sketch_from_spec(&spec).policy().cpu_reservation_percentile,
+            serde_json::to_value(spec.cpu_reservation_percentile).unwrap(),
+            percentile
+        );
+        assert_eq!(
+            HistoricalResourceScheduler::sketch_from_spec(&spec)
+                .policy()
+                .cpu_reservation_percentile
+                .get(),
             percentile
         );
     }
+    let spec: HistoricalResourceSpec = serde_json::from_value(serde_json::json!({
+        "cpu_reservation_percentile": "95",
+        "scheduler": {"simple": {}}
+    }))
+    .unwrap();
+    assert_eq!(spec.cpu_reservation_percentile.get(), 95);
     for value in [
         serde_json::json!(0),
         serde_json::json!(101),

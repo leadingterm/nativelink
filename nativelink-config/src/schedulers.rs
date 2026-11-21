@@ -532,20 +532,42 @@ const fn default_historical_resource_headroom_percent() -> u64 {
     20
 }
 
-const fn default_historical_resource_cpu_reservation_percentile() -> u8 {
-    95
+/// A CPU reservation percentile in the inclusive range 1 through 100.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct CpuReservationPercentile(u8);
+
+impl CpuReservationPercentile {
+    /// Constructs a percentile, rejecting values outside 1 through 100.
+    pub const fn new(value: u8) -> Option<Self> {
+        if value >= 1 && value <= 100 {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the validated percentile.
+    pub const fn get(self) -> u8 {
+        self.0
+    }
 }
 
-fn deserialize_cpu_reservation_percentile<'de, D>(deserializer: D) -> Result<u8, D::Error>
+const fn default_historical_resource_cpu_reservation_percentile() -> CpuReservationPercentile {
+    CpuReservationPercentile::new(95).expect("95 is a valid CPU reservation percentile")
+}
+
+fn deserialize_cpu_reservation_percentile<'de, D>(
+    deserializer: D,
+) -> Result<CpuReservationPercentile, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let percentile = convert_numeric_with_shellexpand(deserializer)?;
-    if (1..=100).contains(&percentile) {
-        Ok(percentile)
-    } else {
-        Err(serde::de::Error::custom("CPU reservation percentile must be between 1 and 100"))
-    }
+    CpuReservationPercentile::new(percentile).ok_or_else(|| {
+        serde::de::Error::custom("CPU reservation percentile must be between 1 and 100")
+    })
 }
 
 const fn default_historical_resource_window_days() -> u64 {
@@ -782,7 +804,7 @@ pub struct HistoricalResourceSpec {
         default = "default_historical_resource_cpu_reservation_percentile",
         deserialize_with = "deserialize_cpu_reservation_percentile"
     )]
-    pub cpu_reservation_percentile: u8,
+    pub cpu_reservation_percentile: CpuReservationPercentile,
 
     /// A key not measured for this many days is forgotten. Within the
     /// window, two half-window histograms retain each sample for between
