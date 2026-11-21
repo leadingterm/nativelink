@@ -578,7 +578,7 @@ pub struct ResourceEscalationSpec {
 }
 
 /// Platform properties declared by a configured worker type.
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct ResourceCapacity {

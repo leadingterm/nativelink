@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use nativelink_config::schedulers::ResourceCapacity;
 use nativelink_error::Error;
 use nativelink_metric::RootMetricsComponent;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
@@ -24,9 +26,30 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::operation_state_manager::UpdateOperationType;
 use nativelink_util::shutdown_guard::ShutdownGuard;
+use tokio::sync::watch;
+use uuid::Uuid;
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::worker::{Worker, WorkerTimestamp};
+
+/// Conservative correlated fleet capacity rows at a particular revision.
+#[derive(Debug, Clone)]
+pub struct ResourceCapacitySnapshot {
+    /// Changes whenever a new snapshot is constructed.
+    pub revision: Uuid,
+    /// Physical capacities and their per-action ceilings.
+    pub capacities: Arc<[ResourceCapacity]>,
+}
+
+impl ResourceCapacitySnapshot {
+    /// Construct a snapshot with a fresh revision.
+    pub fn new(capacities: Vec<ResourceCapacity>) -> Self {
+        Self {
+            revision: Uuid::new_v4(),
+            capacities: capacities.into(),
+        }
+    }
+}
 
 /// `WorkerScheduler` interface is responsible for interactions between the scheduler
 /// and worker related operations.
@@ -55,6 +78,9 @@ pub struct WorkerSummary {
 pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static {
     /// Returns the platform property manager.
     fn get_platform_property_manager(&self) -> &PlatformPropertyManager;
+
+    /// Subscribe to observed physical capacities, if this scheduler supports them.
+    fn resource_capacity_updates(&self) -> Option<watch::Receiver<Arc<ResourceCapacitySnapshot>>>;
 
     /// Adds a worker to the scheduler and begin using it to execute actions (when able).
     async fn add_worker(&self, worker: Worker) -> Result<(), Error>;

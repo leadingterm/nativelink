@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 pub use awaited_action::{AwaitedAction, AwaitedActionSortKey, PersistedSortKey};
 use futures::{Future, Stream};
+use nativelink_config::schedulers::ResourceCapacity;
 use nativelink_error::{Error, ResultExt, make_input_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::action_messages::{ActionInfo, ActionStage, OperationId};
@@ -199,14 +200,13 @@ pub trait AwaitedActionDb: Send + Sync + MetricsComponent + Unpin + 'static {
 
     /// Tells other schedulers on the same state what the workers connected
     /// here can run, and returns, per peer scheduler, what the workers
-    /// connected to it can run. `local` holds the properties each distinct
-    /// kind of worker registered with, and stays visible to peers for
-    /// `ttl`. Only shared-state implementations need it; the default shares
-    /// nothing and sees nothing.
+    /// connected to it can run. `local` includes distinct worker shapes and
+    /// optional observed physical capacities, and stays visible for `ttl`.
+    /// Only shared-state implementations need it; the default shares nothing
+    /// and sees nothing.
     fn exchange_fleet_capabilities(
         &self,
-        _scheduler_id: &str,
-        _local: Vec<PlatformProperties>,
+        _local: PeerScheduler,
         _ttl: Duration,
     ) -> impl Future<Output = Result<Vec<PeerScheduler>, Error>> + Send {
         async { Ok(Vec::new()) }
@@ -227,4 +227,6 @@ pub struct PeerScheduler {
     /// The properties each distinct kind of worker connected to the peer
     /// registered with.
     pub workers: Vec<PlatformProperties>,
+    /// Conservative correlated physical capacity rows known to this peer.
+    pub resource_capacities: Option<Arc<[ResourceCapacity]>>,
 }

@@ -40,8 +40,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     ActionAttemptEnded, ActionResourceUsage, AttemptEndReason, ResourceOutcome, WorkerLoad,
 };
 use nativelink_util::action_messages::{
-    ActionResult, ActionStage, ActionUniqueQualifier, MISSING_INPUT_ERROR_TIP, OperationId,
-    WorkerId,
+    ActionInfo, ActionResult, ActionStage, ActionUniqueQualifier, MISSING_INPUT_ERROR_TIP,
+    OperationId, WorkerId,
 };
 use nativelink_util::metrics::{
     WorkerDisconnectReason, record_dispatch_requeue, record_execution_cpu_time,
@@ -50,12 +50,12 @@ use nativelink_util::metrics::{
     record_worker_keepalive_gap, record_worker_state,
 };
 use nativelink_util::operation_state_manager::{
-    Decline, Escalation, UpdateOperationType, WorkerStateManager,
+    Decline, Escalation, QueuedMemoryFit, UpdateOperationType, WorkerStateManager,
 };
 use nativelink_util::origin_event::get_node_id;
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use nativelink_util::shutdown_guard::ShutdownGuard;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tonic::async_trait;
 use tracing::{debug, error, info, trace, warn};
 
@@ -286,12 +286,15 @@ use crate::awaited_action_db::PeerScheduler;
 use crate::match_outcome::{
     MatchOutcome, PropertyShape, UnsatisfiableReason, explain_unsatisfiable,
 };
+use crate::memory_capacity::{
+    CapacityProperty, eligible_capacity, fit_memory, observe_capacities, peer_memory, worker_memory,
+};
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::resource_sketch::{Observation, ResourceSketch, SketchKey};
 use crate::worker::{ActionInfoWithProps, Worker, WorkerTimestamp, WorkerUpdate};
 use crate::worker_capability_index::WorkerCapabilityIndex;
 use crate::worker_registry::SharedWorkerRegistry;
-use crate::worker_scheduler::{WorkerScheduler, WorkerSummary};
+use crate::worker_scheduler::{ResourceCapacitySnapshot, WorkerScheduler, WorkerSummary};
 
 #[derive(Debug)]
 struct Workers(LruCache<WorkerId, Worker>);
@@ -332,6 +335,8 @@ impl MetricsComponent for Workers {
 struct Hold {
     /// The action the worker is kept for.
     action: ActionUniqueQualifier,
+    /// Shape at acquisition; refitting invalidates a hold for the old request.
+    shape: PropertyShape,
     /// When the hold is given up.
     until: SystemTime,
     /// The last matching pass that read the action, by `pass_generation`.
@@ -431,8 +436,10 @@ struct ApiWorkerSchedulerImpl {
     /// The `minimum` property compared against each worker's reported free
     /// memory before placement; unset means no veto.
     live_memory_veto: Option<String>,
-    /// Resource kill retry policy and declared capacities.
-    resource_escalation: Option<ResourceEscalationSpec>,
+    /// Immutable resource-kill policy, shared with submission and queued fitting.
+    resource_escalation: Option<Arc<ResourceEscalationSpec>>,
+    /// Retained physical memory minima, independent of connected workers.
+    resource_capacity_tx: Option<watch::Sender<Arc<ResourceCapacitySnapshot>>>,
     /// How a queued action that keeps finding no room gets a worker held
     /// for it; unset means never.
     reservation_hold: Option<ReservationHoldSpec>,
@@ -693,6 +700,17 @@ impl ApiWorkerSchedulerImpl {
     /// Adds a worker to the pool.
     /// Note: This function will not do any task matching.
     fn add_worker(&mut self, worker: Worker) -> Result<(), Error> {
+        if let (Some(policy), Some(sender)) =
+            (&self.resource_escalation, &self.resource_capacity_tx)
+        {
+            observe_capacities(sender, &policy.memory.property, |row| {
+                worker_memory(
+                    row,
+                    &policy.memory.property,
+                    &worker.total_platform_properties,
+                )
+            });
+        }
         let worker_id = worker.id.clone();
         let platform_properties = worker.action_platform_properties.clone();
         // A replacement is one out and one in, so the gauge only moves for a
@@ -786,6 +804,24 @@ impl ApiWorkerSchedulerImpl {
     }
 
     fn set_peer_fleet(&mut self, peers: Option<Vec<PeerScheduler>>, now: SystemTime) {
+        if let (Some(policy), Some(sender), Some(peers)) = (
+            &self.resource_escalation,
+            &self.resource_capacity_tx,
+            &peers,
+        ) {
+            if observe_capacities(sender, &policy.memory.property, |row| {
+                peers
+                    .iter()
+                    .filter_map(|peer| peer.resource_capacities.as_deref())
+                    .flatten()
+                    .filter_map(|peer| peer_memory(row, &policy.memory.property, peer))
+                    .min()
+            }) {
+                // Publish before waking the queue or the outgoing peer census.
+                self.capacity_changed();
+                self.local_fleet_change_notify.notify_one();
+            }
+        }
         // Peers list their workers in no particular order and may share
         // shapes, so sort and dedup before comparing, or an unchanged fleet
         // would look changed on every exchange and empty `static_verdicts`.
@@ -1072,6 +1108,7 @@ impl ApiWorkerSchedulerImpl {
             worker_id.clone(),
             Hold {
                 action: action.clone(),
+                shape: PropertyShape::from(platform_properties),
                 until: now.checked_add(hold_duration(spec)).unwrap_or(now),
                 seen_in: self.pass_generation,
                 dispatched: false,
@@ -1399,6 +1436,14 @@ impl ApiWorkerSchedulerImpl {
         asking: Option<&ActionUniqueQualifier>,
     ) -> MatchOutcome {
         if let Some(action) = asking {
+            let refitted = self
+                .holds_by_action
+                .get(action)
+                .and_then(|worker| self.holds.get(worker))
+                .is_some_and(|hold| hold.shape != PropertyShape::from(platform_properties));
+            if refitted {
+                self.end_hold_for_action(action, "released");
+            }
             self.note_held_action_seen(action);
         }
         if self.workers.is_empty() {
@@ -1463,60 +1508,28 @@ impl ApiWorkerSchedulerImpl {
         MatchOutcome::WaitingForCapacity
     }
 
-    /// Largest capacity matching requested exact and other minimum properties.
+    /// Largest current capacity matching original intent and other properties.
     fn eligible_capacity(
+        &self,
         policy: &ResourceEscalationSpec,
         properties: &PlatformProperties,
         property: &str,
+        reservation: Option<&nativelink_util::action_messages::MemoryReservation>,
     ) -> Option<(u64, u64, u64)> {
-        policy
-            .capacities
-            .iter()
-            .filter(|capacity| {
-                properties.properties.iter().all(|(name, value)| {
-                    policy.capacity_ignored_properties.contains(name)
-                        || match value {
-                            PlatformPropertyValue::Minimum(_) if name == property => true,
-                            PlatformPropertyValue::Minimum(needed) => {
-                                capacity.minimum.get(name).is_some_and(|physical| {
-                                    *needed
-                                        <= (*physical).min(
-                                            capacity
-                                                .action_ceilings
-                                                .get(name)
-                                                .copied()
-                                                .unwrap_or(*physical),
-                                        )
-                                })
-                            }
-                            PlatformPropertyValue::Exact(needed) => capacity
-                                .exact
-                                .get(name)
-                                .is_some_and(|available| available == needed),
-                            _ => true,
-                        }
-                })
-            })
-            .filter_map(|capacity| {
-                let physical = *capacity.minimum.get(property)?;
-                let ceiling = physical.min(
-                    capacity
-                        .action_ceilings
-                        .get(property)
-                        .copied()
-                        .unwrap_or(physical),
-                );
-                let cpu = *capacity.minimum.get(&policy.cpu_property)?;
-                let cpu = cpu.min(
-                    capacity
-                        .action_ceilings
-                        .get(&policy.cpu_property)
-                        .copied()
-                        .unwrap_or(cpu),
-                );
-                Some((ceiling, physical, cpu))
-            })
-            .max()
+        let snapshot = self.resource_capacity_tx.as_ref()?.borrow();
+        // Already-parsed platform properties cannot fail conversion.
+        eligible_capacity(
+            policy,
+            &snapshot.capacities,
+            properties
+                .properties
+                .iter()
+                .map(|(name, value)| Ok((name.as_str(), CapacityProperty::from(value)))),
+            property,
+            reservation,
+        )
+        .ok()
+        .flatten()
     }
 
     /// Requeues a resource-killed action with a larger reservation when
@@ -1582,9 +1595,12 @@ impl ApiWorkerSchedulerImpl {
                 }
             })
             .unwrap_or(0);
-        let Some((ceiling_kb, physical_kb, fleet_cpu)) =
-            Self::eligible_capacity(policy, &pending.action_info.platform_properties, property)
-        else {
+        let Some((ceiling_kb, physical_kb, fleet_cpu)) = self.eligible_capacity(
+            policy,
+            &pending.action_info.platform_properties,
+            property,
+            pending.action_info.inner.memory_reservation.as_ref(),
+        ) else {
             let mut failed = result.clone();
             failed.error = Some(make_err!(
                 Code::FailedPrecondition,
@@ -2354,6 +2370,10 @@ pub struct ApiWorkerScheduler {
     capacity_generation: Arc<AtomicU64>,
     /// See `ApiWorkerSchedulerImpl::scheduler_id`; read here without the lock.
     scheduler_id: String,
+    /// Readable without acquiring the asynchronous worker mutex.
+    resource_capacity_rx: Option<watch::Receiver<Arc<ResourceCapacitySnapshot>>>,
+    /// The same immutable policy held by the inner worker state.
+    resource_escalation: Option<Arc<ResourceEscalationSpec>>,
     #[metric(group = "platform_property_manager")]
     platform_property_manager: Arc<PlatformPropertyManager>,
 
@@ -2512,13 +2532,24 @@ impl ApiWorkerScheduler {
         let disk_property = resource_escalation
             .as_ref()
             .and_then(|policy| policy.disk.as_ref().map(|disk| disk.property.clone()));
+        let resource_escalation = resource_escalation.map(Arc::new);
+        let (resource_capacity_tx, resource_capacity_rx) = resource_escalation
+            .as_ref()
+            .map(|policy| {
+                let (sender, receiver) = watch::channel(Arc::new(ResourceCapacitySnapshot::new(
+                    policy.capacities.clone(),
+                )));
+                (Some(sender), Some(receiver))
+            })
+            .unwrap_or((None, None));
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
                 worker_state_manager,
                 allocation_strategy,
                 live_memory_veto,
-                resource_escalation,
+                resource_escalation: resource_escalation.clone(),
+                resource_capacity_tx,
                 reservation_hold,
                 attempt_events: maybe_origin_event_tx.clone(),
                 lost_results: LostResults::default(),
@@ -2558,7 +2589,30 @@ impl ApiWorkerScheduler {
             local_fleet_change_notify,
             capacity_generation,
             scheduler_id,
+            resource_capacity_rx,
+            resource_escalation,
         })
+    }
+
+    /// Compute against one immutable observed snapshot and return the shared
+    /// policy for applying the fit without cloning its configured rows.
+    pub(crate) async fn memory_fit(
+        &self,
+        info: &ActionInfo,
+    ) -> Result<Option<(QueuedMemoryFit, Arc<ResourceEscalationSpec>)>, Error> {
+        let (Some(reservation), Some(receiver), Some(policy)) = (
+            &info.memory_reservation,
+            &self.resource_capacity_rx,
+            &self.resource_escalation,
+        ) else {
+            return Ok(None);
+        };
+        let snapshot = receiver.borrow().clone();
+        if reservation.fitted_revision == Some(snapshot.revision) {
+            return Ok(None);
+        }
+        let fit = fit_memory(info, policy, &snapshot, &self.platform_property_manager)?;
+        Ok(Some((fit, policy.clone())))
     }
 
     /// The id this scheduler publishes to its peers under.
@@ -2817,6 +2871,10 @@ impl ApiWorkerScheduler {
 impl WorkerScheduler for ApiWorkerScheduler {
     fn get_platform_property_manager(&self) -> &PlatformPropertyManager {
         self.platform_property_manager.as_ref()
+    }
+
+    fn resource_capacity_updates(&self) -> Option<watch::Receiver<Arc<ResourceCapacitySnapshot>>> {
+        self.resource_capacity_rx.clone()
     }
 
     async fn record_action_resource_usage(
@@ -3460,7 +3518,7 @@ mod escalation_capacity_tests {
     use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
     use serde_json::json;
 
-    use super::ApiWorkerSchedulerImpl;
+    use crate::memory_capacity::{CapacityProperty, eligible_capacity};
 
     #[test]
     fn ignored_properties_only_affect_capacity_selection() {
@@ -3489,11 +3547,18 @@ mod escalation_capacity_tests {
             ]))
         };
         let eligible = |policy: &ResourceEscalationSpec, environment, isa| {
-            ApiWorkerSchedulerImpl::eligible_capacity(
+            let properties = properties(environment, isa);
+            eligible_capacity(
                 policy,
-                &properties(environment, isa),
+                &policy.capacities,
+                properties
+                    .properties
+                    .iter()
+                    .map(|(name, value)| Ok((name.as_str(), CapacityProperty::from(value)))),
                 "memory",
+                None,
             )
+            .expect("typed properties")
         };
         assert_eq!(eligible(&policy, "new", "arm64"), Some((1024, 1024, 4)));
         assert_eq!(eligible(&policy, "old", "arm64"), None);
