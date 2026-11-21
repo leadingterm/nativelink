@@ -40,8 +40,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     ActionAttemptEnded, ActionResourceUsage, AttemptEndReason, ResourceOutcome, WorkerLoad,
 };
 use nativelink_util::action_messages::{
-    ActionInfo, ActionResult, ActionStage, ActionUniqueQualifier, MISSING_INPUT_ERROR_TIP, OperationId,
-    WorkerId,
+    ActionInfo, ActionResult, ActionStage, ActionUniqueQualifier, MISSING_INPUT_ERROR_TIP,
+    OperationId, WorkerId,
 };
 use nativelink_util::metrics::{
     WorkerDisconnectReason, record_dispatch_requeue, record_execution_cpu_time,
