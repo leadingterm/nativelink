@@ -1687,7 +1687,7 @@ impl ApiWorkerSchedulerImpl {
             )
         {
             if let Some(worker) = self.workers.get_mut(worker_id) {
-                let _ = worker.kill_unknown_operation(operation_id);
+                drop(worker.kill_unknown_operation(operation_id));
                 worker.clear_kill_request(operation_id);
             }
             update =

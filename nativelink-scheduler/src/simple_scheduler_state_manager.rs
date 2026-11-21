@@ -545,7 +545,7 @@ where
     /// Prevent legacy execution timeouts from requeuing locally owned attempts
     /// whose whole-attempt deadline is enforced by the worker scheduler.
     pub(crate) fn set_deadline_scheduler(&self, scheduler: &Arc<ApiWorkerScheduler>) {
-        let _ = self.deadline_scheduler.set(Arc::downgrade(scheduler));
+        drop(self.deadline_scheduler.set(Arc::downgrade(scheduler)));
     }
 
     /// Retires queued actions whose client has stopped listening.
