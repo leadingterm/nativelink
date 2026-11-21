@@ -2320,6 +2320,7 @@ mod deadline_timeout_tests {
     use nativelink_util::common::DigestInfo;
     use nativelink_util::digest_hasher::DigestHasherFunc;
     use nativelink_util::instant_wrapper::MockInstantWrapped;
+    use nativelink_util::platform_properties::PlatformProperties;
     use tokio::sync::{Notify, mpsc};
 
     use super::*;
