@@ -6373,6 +6373,7 @@ impl RunningActionsManagerImpl {
                 let _ = tx.send(result);
             });
             rx.await
+                .map_err(|e| make_err!(Code::Internal, "{e}"))
                 .err_tip(|| "Could not join action directory creation")?
         })
     }
