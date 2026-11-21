@@ -346,6 +346,7 @@ mod tests {
             input_root_digest: digest,
             timeout: Duration::from_secs(60),
             platform_properties,
+            pre_fit_cpu_millicores: None,
             memory_reservation: Some(MemoryReservation {
                 minimum_kb: minimum,
                 desired_kb: desired,

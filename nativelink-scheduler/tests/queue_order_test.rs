@@ -52,6 +52,7 @@ fn action(seed: u8, priority: i32, insert_ms: u64) -> Arc<ActionInfo> {
     let insert = SystemTime::UNIX_EPOCH + Duration::from_millis(insert_ms);
     Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_cpu_millicores: None,
         command_digest: DigestInfo::new([seed; 32], 1),
         input_root_digest: DigestInfo::new([seed; 32], 2),
         timeout: Duration::from_secs(1),

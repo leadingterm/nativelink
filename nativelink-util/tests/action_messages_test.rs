@@ -18,10 +18,11 @@ use std::time::SystemTime;
 use hex::FromHex;
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
+use nativelink_proto::build::bazel::remote::execution::v2::{Action, ExecuteRequest};
 use nativelink_proto::google::rpc::PreconditionFailure;
 use nativelink_util::action_messages::{
     ActionInfo, ActionResult, ActionStage, ActionUniqueKey, ActionUniqueQualifier,
-    ExecutionMetadata, INTERNAL_ERROR_EXIT_CODE, TypeUrl, to_execute_response,
+    ExecutionMetadata, INTERNAL_ERROR_EXIT_CODE, MemoryReservation, TypeUrl, to_execute_response,
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -46,6 +47,8 @@ fn make_key() -> ActionUniqueKey {
 fn old_unique_qualifier_cachable_works() {
     let contents = include_str!("data/action_message_cachable_060.json");
     let action_info: ActionInfo = serde_json::from_str(contents).unwrap();
+    assert_eq!(action_info.pre_fit_cpu_millicores, None);
+    assert!(!serde_json::to_string(&action_info).unwrap().contains("pre_fit_cpu_millicores"));
     assert_eq!(
         action_info.unique_qualifier,
         ActionUniqueQualifier::Cacheable(make_key())
@@ -60,6 +63,44 @@ fn old_unique_qualifier_uncachable_works() {
         action_info.unique_qualifier,
         ActionUniqueQualifier::Uncacheable(make_key())
     );
+}
+
+#[nativelink_test]
+fn pre_fit_cpu_metadata_roundtrips_and_does_not_change_execute_request() {
+    let contents = include_str!("data/action_message_cachable_060.json");
+    let mut action: ActionInfo = serde_json::from_str(contents).unwrap();
+    let request_without_metadata = ExecuteRequest::from(&action);
+    action.pre_fit_cpu_millicores = Some(3_500);
+    action.memory_reservation = Some(MemoryReservation {
+        minimum_kb: Some(100),
+        desired_kb: Some(200),
+        cpu_before_memory_fit: Some(2),
+        fitted_revision: None,
+    });
+
+    let serialized = serde_json::to_string(&action).unwrap();
+    let restored: ActionInfo = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(restored, action);
+    assert_eq!(ExecuteRequest::from(&restored), request_without_metadata);
+    let constructed = ActionInfo::try_from_action_and_execute_request(
+        request_without_metadata.clone(),
+        Action {
+            command_digest: Some(action.command_digest.into()),
+            input_root_digest: Some(action.input_root_digest.into()),
+            ..Default::default()
+        },
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+    )
+    .unwrap();
+    assert_eq!(constructed.pre_fit_cpu_millicores, None);
+
+    let mut updated = restored.clone();
+    updated.platform_properties.insert("cpu_count".into(), "1".into());
+    updated.memory_reservation.as_mut().unwrap().desired_kb = Some(150);
+    assert_eq!(updated.pre_fit_cpu_millicores, Some(3_500));
+    assert_eq!(restored.pre_fit_cpu_millicores, Some(3_500));
+    assert_eq!(ExecuteRequest::from(&updated), request_without_metadata);
 }
 
 #[nativelink_test]

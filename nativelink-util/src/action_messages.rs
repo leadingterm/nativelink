@@ -324,6 +324,10 @@ pub struct ActionInfo {
     /// Controller-owned memory fitting intent; absent for ordinary actions.
     #[serde(default)]
     pub memory_reservation: Option<MemoryReservation>,
+    /// Learned CPU reservation in millicores before fleet fitting, when clamped.
+    /// This is diagnostic metadata and does not affect dispatch or cache identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_fit_cpu_millicores: Option<u64>,
     /// The priority of the action. Higher value means it should execute faster.
     #[metric(help = "The priority of the action. Higher value means it should execute faster.")]
     pub priority: i32,
@@ -381,6 +385,7 @@ impl ActionInfo {
 
         Ok(Self {
             memory_reservation: None,
+            pre_fit_cpu_millicores: None,
             command_digest: action
                 .command_digest
                 .err_tip(|| "Expected command_digest to exist on Action")?

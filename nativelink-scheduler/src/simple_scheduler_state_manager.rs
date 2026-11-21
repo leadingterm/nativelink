@@ -2016,6 +2016,7 @@ mod queued_memory_refit_tests {
             );
             let digest = DigestInfo::zero_digest();
             let info = Arc::new(ActionInfo {
+                pre_fit_cpu_millicores: None,
                 memory_reservation: Some(MemoryReservation {
                     minimum_kb: Some(50),
                     desired_kb: Some(200),
@@ -2147,6 +2148,7 @@ mod queued_memory_refit_tests {
         );
         let digest = DigestInfo::zero_digest();
         let info = Arc::new(ActionInfo {
+            pre_fit_cpu_millicores: Some(3_500),
             memory_reservation: Some(MemoryReservation {
                 minimum_kb: Some(0),
                 desired_kb: Some(200),
@@ -2204,6 +2206,7 @@ mod queued_memory_refit_tests {
         assert_eq!(persisted.action_info(), &updated);
         assert_eq!(updated.platform_properties["memory_kb"], "150");
         assert_eq!(updated.platform_properties["cpu_count"], "8");
+        assert_eq!(updated.pre_fit_cpu_millicores, Some(3_500));
         let mut expected_metadata = info.memory_reservation.unwrap();
         expected_metadata.fitted_revision = Some(fit.revision);
         assert_eq!(
@@ -2376,6 +2379,7 @@ mod deadline_timeout_tests {
             .await?;
         let digest = DigestInfo::zero_digest();
         let action_info = Arc::new(ActionInfo {
+            pre_fit_cpu_millicores: None,
             memory_reservation: None,
             command_digest: digest,
             input_root_digest: digest,

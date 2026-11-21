@@ -147,6 +147,7 @@ async fn test_inner_update_awaited_action() -> Result<(), Error> {
     let action_digest = DigestInfo::new([3u8; 32], 10);
     let action_info = ActionInfo {
         memory_reservation: None,
+        pre_fit_cpu_millicores: None,
         command_digest: DigestInfo::new([1u8; 32], 10),
         input_root_digest: DigestInfo::new([2u8; 32], 10),
         timeout: Duration::from_secs(1),
@@ -189,6 +190,7 @@ async fn test_inner_update_awaited_action() -> Result<(), Error> {
 fn make_cacheable_action_info() -> Arc<ActionInfo> {
     Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_cpu_millicores: None,
         command_digest: DigestInfo::zero_digest(),
         input_root_digest: DigestInfo::zero_digest(),
         timeout: Duration::from_secs(1),

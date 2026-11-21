@@ -302,6 +302,7 @@ impl InstanceInfo {
 
         Ok(ActionInfo {
             memory_reservation: None,
+            pre_fit_cpu_millicores: None,
             command_digest,
             input_root_digest,
             timeout,

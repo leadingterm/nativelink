@@ -42,6 +42,7 @@ pub(crate) fn make_base_action_info(
 ) -> Arc<ActionInfo> {
     Arc::new(ActionInfo {
         memory_reservation: None,
+        pre_fit_cpu_millicores: None,
         command_digest: DigestInfo::new([0u8; 32], 0),
         input_root_digest: DigestInfo::new([0u8; 32], 0),
         timeout: Duration::MAX,
