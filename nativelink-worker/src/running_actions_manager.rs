@@ -6370,7 +6370,7 @@ impl RunningActionsManagerImpl {
                 .await;
                 // The guard also survives a successful send whose receiver is
                 // dropped before consuming it.
-                let _ = tx.send(result);
+                drop(tx.send(result));
             });
             rx.await
                 .map_err(|e| make_err!(Code::Internal, "{e}"))
@@ -7113,7 +7113,7 @@ impl RunningActionsManager for RunningActionsManagerImpl {
         // The command select owns hard-kill and reaping. Keep its task alive
         // until acknowledgement, then the caller may abort a stalled upload.
         if let Some(mut stopped) = stopped {
-            let _ = stopped.wait_for(|stopped| *stopped).await;
+            drop(stopped.wait_for(|stopped| *stopped).await);
         }
         Some(action)
     }
