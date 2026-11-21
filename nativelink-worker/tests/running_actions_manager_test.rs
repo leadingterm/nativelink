@@ -1807,6 +1807,7 @@ mod tests {
                         queued_timestamp: None,
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -1942,6 +1943,7 @@ mod tests {
                         queued_timestamp: None,
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -2092,6 +2094,7 @@ mod tests {
                         queued_timestamp: None,
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -2282,6 +2285,7 @@ mod tests {
                         queued_timestamp: None,
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -2475,6 +2479,7 @@ mod tests {
                         queued_timestamp: Some(queued_timestamp.into()),
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -2716,6 +2721,7 @@ mod tests {
                         queued_timestamp: Some(queued_timestamp.into()),
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -2873,6 +2879,7 @@ mod tests {
                         queued_timestamp: Some(queued_timestamp.into()),
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -3027,6 +3034,7 @@ mod tests {
                         queued_timestamp: Some(queued_timestamp.into()),
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -3186,6 +3194,7 @@ mod tests {
                     queued_timestamp: Some(make_system_time(1000).into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -3394,6 +3403,7 @@ exit 0
                     queued_timestamp: Some(make_system_time(1000).into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -3597,6 +3607,7 @@ exit 0
                     queued_timestamp: Some(make_system_time(1000).into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -4241,6 +4252,7 @@ exit 0
                         }],
                     }),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -6211,6 +6223,7 @@ exit 0
                         }],
                     }),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -7363,6 +7376,7 @@ exit 0
                         }],
                     }),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -7731,6 +7745,7 @@ exit 1
                     queued_timestamp: Some(make_system_time(1000).into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -8347,6 +8362,7 @@ exit 1
                         queued_timestamp: Some(make_system_time(1000).into()),
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .and_then(|action| {
@@ -8444,6 +8460,7 @@ exit 1
                         queued_timestamp: Some(make_system_time(1000).into()),
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .and_then(|action| {
@@ -8541,6 +8558,7 @@ exit 1
                         queued_timestamp: Some(make_system_time(1000).into()),
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .and_then(|action| {
@@ -8683,6 +8701,7 @@ exit 1
                     queued_timestamp: Some(make_system_time(1000).into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .and_then(|action| {
@@ -8845,6 +8864,7 @@ exit 1
                     queued_timestamp: Some(make_system_time(1000).into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -9503,6 +9523,7 @@ exit 1
                     queued_timestamp: Some(queued_timestamp.into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -10051,6 +10072,7 @@ done
                         queued_timestamp: None,
                         platform: action.platform.clone(),
                         worker_id: WORKER_ID.to_string(),
+                        attempt_deadline: None,
                     },
                 )
                 .await?;
@@ -10243,6 +10265,7 @@ done
                     queued_timestamp: Some(make_system_time(1000).into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -10642,6 +10665,7 @@ done
                     queued_timestamp: None,
                     platform: action.platform.clone(),
                     worker_id: "foo_worker_id".to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -10933,6 +10957,7 @@ done
                     queued_timestamp: Some(make_system_time(1000).into()),
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .and_then(|action| action.prepare_action().and_then(RunningAction::execute))
@@ -11160,6 +11185,7 @@ done
                     queued_timestamp: None,
                     platform: action.platform.clone(),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
@@ -11464,6 +11490,7 @@ done
                         }],
                     }),
                     worker_id: WORKER_ID.to_string(),
+                    attempt_deadline: None,
                 },
             )
             .await?;
