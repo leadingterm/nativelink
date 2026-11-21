@@ -810,8 +810,6 @@ impl ApiWorkerSchedulerImpl {
             |row| {
                 self.workers
                     .iter()
-                    // Disconnected entries only retain failed-publication ledgers.
-                    .filter(|(_, worker)| !worker.disconnected)
                     .filter_map(|(_, worker)| {
                         worker_memory(
                             row,
