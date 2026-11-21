@@ -202,7 +202,7 @@ pub trait WorkerStateManager: Sync + Send + MetricsComponent {
 }
 
 /// Capacity fit to apply atomically to a queued action.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueuedMemoryFit {
     /// Fitted memory reservation, or absence of the property.
     pub memory_kb: Option<u64>,

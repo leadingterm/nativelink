@@ -22,7 +22,6 @@ use nativelink_error::{Code, Error, make_err};
 use nativelink_util::action_messages::{ActionInfo, MemoryReservation};
 use nativelink_util::operation_state_manager::QueuedMemoryFit;
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
-use tokio::sync::watch;
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::worker_scheduler::ResourceCapacitySnapshot;
@@ -230,34 +229,30 @@ pub(crate) fn apply_memory_fit(
     }
 }
 
-/// Allocate and publish only if at least one physical memory minimum decreases.
-/// The sender owns retained knowledge independently of worker/census liveness.
+/// Recompute from current facts, bounded by the baseline's physical capacities.
+/// An unobserved row uses its baseline estimate; unchanged values share storage.
+/// Both slices retain the immutable policy's row ordering and non-memory fields.
 pub(crate) fn observe_capacities(
-    sender: &watch::Sender<Arc<ResourceCapacitySnapshot>>,
+    baseline: &[ResourceCapacity],
+    current: &[ResourceCapacity],
     memory_property: &str,
     mut observed: impl FnMut(&ResourceCapacity) -> Option<u64>,
-) -> bool {
-    let current = sender.borrow();
-    let mut lowered: Option<Vec<ResourceCapacity>> = None;
-    for (index, row) in current.capacities.iter().enumerate() {
-        let Some(previous) = row.minimum.get(memory_property) else {
+) -> Option<Arc<[ResourceCapacity]>> {
+    let mut updated: Option<Vec<ResourceCapacity>> = None;
+    for (index, row) in baseline.iter().enumerate() {
+        let Some(&estimate) = row.minimum.get(memory_property) else {
             continue;
         };
-        let Some(memory) = observed(row).filter(|memory| memory < previous) else {
+        let memory = observed(row).unwrap_or(estimate).min(estimate);
+        if current[index].minimum.get(memory_property) == Some(&memory) {
             continue;
-        };
-        let rows = lowered.get_or_insert_with(|| current.capacities.to_vec());
+        }
+        let rows = updated.get_or_insert_with(|| current.to_vec());
         if let Some(value) = rows[index].minimum.get_mut(memory_property) {
             *value = memory;
         }
     }
-    drop(current);
-    if let Some(rows) = lowered {
-        sender.send_replace(Arc::new(ResourceCapacitySnapshot::new(rows)));
-        true
-    } else {
-        false
-    }
+    updated.map(Arc::from)
 }
 
 pub(crate) fn worker_memory(
@@ -380,7 +375,7 @@ mod tests {
         let policy = policy();
         let snapshot = measured(&policy);
         let mut info = action(None, Some(ESTIMATE), Some(1));
-        let original = info.memory_reservation.clone().expect("intent");
+        let original = info.memory_reservation.expect("intent");
         let fit = fit_memory(&info, &policy, &snapshot, &manager()).expect("eligible fleet");
         assert_eq!(fit.memory_kb, Some(ACTUAL));
         assert_eq!(fit.cpu, Some(8));
@@ -463,56 +458,114 @@ mod tests {
         }
     }
 
+    fn worker(fleet: &str, memory: u64, cpu: u64) -> PlatformProperties {
+        PlatformProperties::new(HashMap::from([
+            (
+                "fleet".to_owned(),
+                PlatformPropertyValue::Exact(fleet.to_owned()),
+            ),
+            ("memory".to_owned(), PlatformPropertyValue::Minimum(memory)),
+            ("cpu".to_owned(), PlatformPropertyValue::Minimum(cpu)),
+            ("disk".to_owned(), PlatformPropertyValue::Minimum(1024)),
+        ]))
+    }
+
     #[test]
-    fn conservative_observations_are_correlated_retained_and_publish_only_changes() {
+    fn current_worker_observations_recover_and_reobserve_after_removal() {
         let policy = policy();
-        let (sender, receiver) = watch::channel(Arc::new(ResourceCapacitySnapshot::new(
-            policy.capacities.clone(),
-        )));
-        let worker = |fleet: &str, memory: u64, cpu: u64| {
-            PlatformProperties::new(HashMap::from([
-                (
-                    "fleet".to_owned(),
-                    PlatformPropertyValue::Exact(fleet.to_owned()),
-                ),
-                ("memory".to_owned(), PlatformPropertyValue::Minimum(memory)),
-                ("cpu".to_owned(), PlatformPropertyValue::Minimum(cpu)),
-                ("disk".to_owned(), PlatformPropertyValue::Minimum(1024)),
-            ]))
-        };
-        let original = receiver.borrow().clone();
-        assert!(!observe_capacities(&sender, "memory", |row| {
-            worker_memory(row, "memory", &worker("other", ACTUAL, 8))
-        }));
-        assert!(!observe_capacities(&sender, "memory", |row| {
-            worker_memory(row, "memory", &worker("compile", ACTUAL, 7))
-        }));
-        assert!(Arc::ptr_eq(&original, &receiver.borrow()));
-        assert!(observe_capacities(&sender, "memory", |row| {
-            worker_memory(row, "memory", &worker("compile", ACTUAL, 8))
-        }));
-        let learned = receiver.borrow().clone();
-        assert_ne!(learned.revision, original.revision);
-        assert_eq!(learned.capacities[0].minimum["memory"], ACTUAL);
-        // No workers, a same-fleet reconnect, or a higher observation all keep
-        // retained knowledge and the identical immutable snapshot allocation.
-        for observed in [None, Some(ACTUAL), Some(ESTIMATE)] {
-            assert!(!observe_capacities(&sender, "memory", |_| observed));
-            assert!(Arc::ptr_eq(&learned, &receiver.borrow()));
-            assert_eq!(learned.revision, receiver.borrow().revision);
+        let original: Arc<[ResourceCapacity]> = policy.capacities.clone().into();
+        for totals in [worker("other", ACTUAL, 8), worker("compile", ACTUAL, 7)] {
+            assert!(
+                observe_capacities(&policy.capacities, &original, "memory", |row| {
+                    worker_memory(row, "memory", &totals)
+                })
+                .is_none()
+            );
         }
-        let mut peer = policy.capacities[0].clone();
-        peer.minimum.insert("memory".to_owned(), ACTUAL - 1);
-        peer.action_ceilings.insert("memory".to_owned(), 1);
-        assert!(observe_capacities(&sender, "memory", |row| {
-            peer_memory(row, "memory", &peer)
-        }));
-        assert_eq!(
-            receiver.borrow().capacities[0].minimum["memory"],
-            ACTUAL - 1
+        let totals = worker("compile", ACTUAL, 8);
+        let learned = observe_capacities(&policy.capacities, &original, "memory", |row| {
+            worker_memory(row, "memory", &totals)
+        })
+        .expect("actual memory is below the estimate");
+        assert_eq!(learned[0].minimum["memory"], ACTUAL);
+        assert!(
+            observe_capacities(&policy.capacities, &learned, "memory", |row| {
+                worker_memory(row, "memory", &totals)
+            })
+            .is_none()
         );
-        assert!(receiver.borrow().capacities[0].action_ceilings.is_empty());
-        assert_eq!(receiver.borrow().capacities[0].minimum["cpu"], 8);
-        assert_eq!(receiver.borrow().capacities[0].minimum["disk"], 1024);
+        let restored = observe_capacities(&policy.capacities, &learned, "memory", |_| None)
+            .expect("removing the last observation restores the estimate");
+        assert_eq!(restored, original);
+        let reobserved = observe_capacities(&policy.capacities, &restored, "memory", |row| {
+            worker_memory(row, "memory", &totals)
+        })
+        .expect("the same worker's current totals are observed on reconnect");
+        assert_eq!(reobserved, learned);
+        let higher = observe_capacities(&policy.capacities, &learned, "memory", |_| {
+            Some(ESTIMATE + 1)
+        })
+        .expect("a higher replacement raises capacity, bounded by configuration");
+        assert_eq!(higher, original);
+    }
+
+    #[test]
+    fn current_observations_keep_distinct_rows_and_other_minima_correlated() {
+        let mut policy = policy();
+        let mut other = policy.capacities[0].clone();
+        other.exact.insert("fleet".to_owned(), "other".to_owned());
+        policy.capacities.push(other);
+        let local = observe_capacities(&policy.capacities, &policy.capacities, "memory", |row| {
+            worker_memory(row, "memory", &worker("compile", ACTUAL, 8))
+        })
+        .expect("compile row changes");
+        assert_eq!(local[0].minimum["memory"], ACTUAL);
+        assert_eq!(local[1].minimum["memory"], ESTIMATE);
+        let both = observe_capacities(&policy.capacities, &local, "memory", |row| {
+            [worker("compile", ACTUAL, 8), worker("other", ACTUAL - 1, 8)]
+                .iter()
+                .filter_map(|totals| worker_memory(row, "memory", totals))
+                .min()
+        })
+        .expect("only the second row changes");
+        assert_eq!(both[0].minimum["memory"], ACTUAL);
+        assert_eq!(both[1].minimum["memory"], ACTUAL - 1);
+        let remaining = observe_capacities(&policy.capacities, &both, "memory", |row| {
+            worker_memory(row, "memory", &worker("other", ACTUAL - 1, 8))
+        })
+        .expect("only the compile row returns to its estimate");
+        assert_eq!(remaining[0].minimum["memory"], ESTIMATE);
+        assert_eq!(remaining[1].minimum["memory"], ACTUAL - 1);
+        for row in remaining.iter() {
+            assert_eq!(row.minimum["cpu"], 8);
+            assert_eq!(row.minimum["disk"], 1024);
+        }
+    }
+
+    #[test]
+    fn peer_local_facts_do_not_become_local_knowledge_or_sticky_history() {
+        let policy = policy();
+        let local: Arc<[ResourceCapacity]> = policy.capacities.clone().into();
+        let mut peer = policy.capacities[0].clone();
+        peer.minimum.insert("memory".to_owned(), ACTUAL);
+        peer.action_ceilings.insert("memory".to_owned(), 1);
+        let global = observe_capacities(&local, &local, "memory", |row| {
+            peer_memory(row, "memory", &peer)
+        })
+        .expect("peer's lower physical memory changes the global rows");
+        assert_eq!(global[0].minimum["memory"], ACTUAL);
+        assert_eq!(local[0].minimum["memory"], ESTIMATE);
+        assert!(global[0].action_ceilings.is_empty());
+        assert_eq!(global[0].minimum["cpu"], 8);
+        assert_eq!(global[0].minimum["disk"], 1024);
+        assert!(
+            observe_capacities(&local, &global, "memory", |row| {
+                peer_memory(row, "memory", &peer)
+            })
+            .is_none()
+        );
+        let recovered = observe_capacities(&local, &global, "memory", |_| None)
+            .expect("unknown, removed or expired peer facts are no longer observations");
+        assert_eq!(recovered, local);
     }
 }

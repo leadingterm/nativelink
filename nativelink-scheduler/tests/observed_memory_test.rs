@@ -455,7 +455,7 @@ async fn larger_unobserved_fleet_keeps_the_original_floor_eligible_and_restores_
 }
 
 #[nativelink_test]
-async fn observations_survive_reconnect_and_do_not_turn_action_ceilings_into_physical_memory()
+async fn reconnect_restores_observation_without_turning_action_ceilings_into_physical_memory()
 -> Result<(), Error> {
     for baseline_cpu in [Some(2), None] {
         let mut limited = capacity("compile", ESTIMATE_KB);
@@ -474,18 +474,32 @@ async fn observations_survive_reconnect_and_do_not_turn_action_ceilings_into_phy
         scheduler
             .remove_worker(&WorkerId("first".to_string()))
             .await?;
-        assert!(Arc::ptr_eq(&observed, &current_capacity(worker.as_ref())));
-        let mut rx = add_worker(&scheduler, "reconnected", "compile", ESTIMATE_KB).await?;
-        assert!(
-            Arc::ptr_eq(&observed, &current_capacity(worker.as_ref())),
-            "larger later advertisement cannot erase knowledge"
+        let unobserved = current_capacity(worker.as_ref());
+        assert_ne!(observed.revision, unobserved.revision);
+        assert_eq!(unobserved.capacities[0].minimum["memory_kb"], ESTIMATE_KB);
+        assert_eq!(
+            unobserved.capacities[0].action_ceilings["memory_kb"],
+            4 * GIB_KB
         );
+        assert_eq!(unobserved.capacities[1].minimum["memory_kb"], ESTIMATE_KB);
         let listener = scheduler
             .add_action(
                 OperationId::from("logical-ceiling"),
                 action(5, Some("compile"), None, NOMINAL_KB, baseline_cpu),
             )
             .await?;
+        scheduler.do_try_match_for_test().await?;
+        assert_eq!(listener.as_state().await?.0.stage, ActionStage::Queued);
+        let queued = listener.as_action_info().await?.0;
+        assert_eq!(
+            queued.memory_reservation.as_ref().unwrap().fitted_revision,
+            Some(unobserved.revision)
+        );
+        let mut rx = add_worker(&scheduler, "reconnected", "compile", OBSERVED_KB).await?;
+        let reobserved = current_capacity(worker.as_ref());
+        assert_ne!(unobserved.revision, reobserved.revision);
+        assert_eq!(reobserved.capacities[0].minimum["memory_kb"], OBSERVED_KB);
+        assert_eq!(reobserved.capacities[1].minimum["memory_kb"], ESTIMATE_KB);
         let start = dispatch(&scheduler, &mut rx).await;
         assert_eq!(dispatched_property(&start, "memory_kb"), Some(4 * GIB_KB));
         assert_eq!(
@@ -498,10 +512,59 @@ async fn observations_survive_reconnect_and_do_not_turn_action_ceilings_into_phy
             baseline_cpu
         );
         assert_eq!(
+            listener
+                .as_action_info()
+                .await?
+                .0
+                .memory_reservation
+                .as_ref()
+                .unwrap()
+                .fitted_revision,
+            Some(reobserved.revision)
+        );
+        assert_eq!(
             current_capacity(worker.as_ref()).capacities[0].minimum["memory_kb"],
             OBSERVED_KB
         );
     }
+    let (scheduler, worker) = make_scheduler(vec![capacity("compile", ESTIMATE_KB)]);
+    let _first_rx = add_worker(&scheduler, "first", "compile", OBSERVED_KB).await?;
+    scheduler
+        .remove_worker(&WorkerId("first".to_string()))
+        .await?;
+    let unobserved = current_capacity(worker.as_ref());
+    assert_eq!(unobserved.capacities[0].minimum["memory_kb"], ESTIMATE_KB);
+    let listener = scheduler
+        .add_action(
+            OperationId::from("reconnect-refit"),
+            action(7, Some("compile"), None, NOMINAL_KB, Some(1)),
+        )
+        .await?;
+    scheduler.do_try_match_for_test().await?;
+    let queued = listener.as_action_info().await?.0;
+    assert_eq!(fitted_property(&queued, "memory_kb"), Some(ESTIMATE_KB));
+    assert_eq!(
+        queued.memory_reservation.as_ref().unwrap().fitted_revision,
+        Some(unobserved.revision)
+    );
+    let mut rx = add_worker(&scheduler, "reconnected", "compile", OBSERVED_KB).await?;
+    let reobserved = current_capacity(worker.as_ref());
+    assert_eq!(reobserved.capacities[0].minimum["memory_kb"], OBSERVED_KB);
+    assert_ne!(unobserved.revision, reobserved.revision);
+    let start = dispatch(&scheduler, &mut rx).await;
+    assert_eq!(dispatched_property(&start, "memory_kb"), Some(OBSERVED_KB));
+    assert_eq!(dispatched_property(&start, "cpu_count"), Some(PHYSICAL_CPU));
+    assert_eq!(
+        listener
+            .as_action_info()
+            .await?
+            .0
+            .memory_reservation
+            .as_ref()
+            .unwrap()
+            .fitted_revision,
+        Some(reobserved.revision)
+    );
     Ok(())
 }
 
@@ -558,16 +621,18 @@ async fn remote_only_capacity_publication_updates_watch_without_conflating_peer_
     );
     receiver.set_peer_schedulers_for_test(vec![]).await;
     receiver.set_peers_unknown_for_test().await;
-    assert!(Arc::ptr_eq(
-        &observed,
-        &current_capacity(receiver_worker.as_ref())
-    ));
-    let mut stale = published;
-    stale.resource_capacities = Some(before.capacities.clone());
-    receiver.set_peer_schedulers_for_test(vec![stale]).await;
+    let without_peer = current_capacity(receiver_worker.as_ref());
+    assert_ne!(observed.revision, without_peer.revision);
+    assert_eq!(without_peer.capacities[0].minimum["memory_kb"], ESTIMATE_KB);
+    assert_eq!(without_peer.capacities[1].minimum["memory_kb"], ESTIMATE_KB);
+    let mut estimated_peer = published;
+    estimated_peer.resource_capacities = Some(before.capacities.clone());
+    receiver
+        .set_peer_schedulers_for_test(vec![estimated_peer])
+        .await;
     assert!(
-        Arc::ptr_eq(&observed, &current_capacity(receiver_worker.as_ref())),
-        "stale higher peer estimate cannot raise a learned minimum"
+        Arc::ptr_eq(&without_peer, &current_capacity(receiver_worker.as_ref())),
+        "an unchanged current estimate does not publish a new snapshot"
     );
     Ok(())
 }

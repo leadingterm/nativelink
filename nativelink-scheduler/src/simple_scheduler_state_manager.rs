@@ -41,7 +41,6 @@ use nativelink_util::operation_state_manager::{
     UpdateOperationType, WorkerStateManager,
 };
 use nativelink_util::origin_event::OriginMetadata;
-use nativelink_util::platform_properties::PlatformProperties;
 use opentelemetry::KeyValue;
 use tracing::{debug, info, trace, warn};
 
@@ -1874,7 +1873,7 @@ where
             }
             // Mutate only the fit on the current version. In particular, do
             // not reconstruct the record and lose retry counters or clocks.
-            current.refit_memory(memory_property, cpu_property, fit.clone());
+            current.refit_memory(memory_property, cpu_property, fit);
             let updated = current.action_info().clone();
             match self.action_db.update_awaited_action(current).await {
                 Ok(()) => return Ok(QueuedMemoryRefit::Updated(updated)),
@@ -1938,6 +1937,7 @@ mod queued_memory_refit_tests {
     use nativelink_util::common::DigestInfo;
     use nativelink_util::digest_hasher::DigestHasherFunc;
     use nativelink_util::instant_wrapper::MockInstantWrapped;
+    use nativelink_util::platform_properties::PlatformProperties;
     use tokio::sync::Notify;
     use uuid::Uuid;
 
@@ -2009,7 +2009,7 @@ mod queued_memory_refit_tests {
             revision: Uuid::new_v4(),
         };
         let QueuedMemoryRefit::Updated(updated) = manager
-            .refit_queued_memory(&operation_id, &info, "memory_kb", "cpu_count", fit.clone())
+            .refit_queued_memory(&operation_id, &info, "memory_kb", "cpu_count", fit)
             .await?
         else {
             panic!("unchanged queued action must accept a fit");
@@ -2018,7 +2018,7 @@ mod queued_memory_refit_tests {
         assert_eq!(persisted.action_info(), &updated);
         assert_eq!(updated.platform_properties["memory_kb"], "150");
         assert_eq!(updated.platform_properties["cpu_count"], "8");
-        let mut expected_metadata = info.memory_reservation.clone().unwrap();
+        let mut expected_metadata = info.memory_reservation.unwrap();
         expected_metadata.fitted_revision = Some(fit.revision);
         assert_eq!(
             updated.memory_reservation.as_ref(),
@@ -2052,13 +2052,7 @@ mod queued_memory_refit_tests {
         manager.action_db.update_awaited_action(escalated).await?;
         let escalated = subscriber.borrow().await?;
         let QueuedMemoryRefit::Stale(current) = manager
-            .refit_queued_memory(
-                &operation_id,
-                &updated,
-                "memory_kb",
-                "cpu_count",
-                fit.clone(),
-            )
+            .refit_queued_memory(&operation_id, &updated, "memory_kb", "cpu_count", fit)
             .await?
         else {
             panic!("an escalated action must reject the old fit");
@@ -2084,13 +2078,7 @@ mod queued_memory_refit_tests {
             .await?;
         assert!(matches!(
             manager
-                .refit_queued_memory(
-                    &operation_id,
-                    &current,
-                    "memory_kb",
-                    "cpu_count",
-                    fit.clone()
-                )
+                .refit_queued_memory(&operation_id, &current, "memory_kb", "cpu_count", fit)
                 .await?,
             QueuedMemoryRefit::Stale(_)
         ));
@@ -2110,7 +2098,7 @@ mod queued_memory_refit_tests {
                     &executing_info,
                     "memory_kb",
                     "cpu_count",
-                    fit.clone()
+                    fit
                 )
                 .await?,
             QueuedMemoryRefit::NotQueued,

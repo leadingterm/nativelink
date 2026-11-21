@@ -26,7 +26,7 @@ use async_lock::Mutex;
 use futures::{StreamExt, future};
 use lru::LruCache;
 use nativelink_config::schedulers::{
-    ReservationHoldSpec, ResourceEscalationSpec, WorkerAllocationStrategy,
+    ReservationHoldSpec, ResourceCapacity, ResourceEscalationSpec, WorkerAllocationStrategy,
 };
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::{
@@ -437,8 +437,12 @@ struct ApiWorkerSchedulerImpl {
     live_memory_veto: Option<String>,
     /// Immutable resource-kill policy, shared with submission and queued fitting.
     resource_escalation: Option<Arc<ResourceEscalationSpec>>,
-    /// Retained physical memory minima, independent of connected workers.
+    /// Current local and peer-local physical capacities used for queued fitting.
     resource_capacity_tx: Option<watch::Sender<Arc<ResourceCapacitySnapshot>>>,
+    /// Current local facts only, or configured estimates for unobserved rows.
+    local_resource_capacities: Option<Arc<[ResourceCapacity]>>,
+    /// Current peer-local rows, kept separately so advertisements never echo peers.
+    peer_resource_capacities: Vec<Arc<[ResourceCapacity]>>,
     /// How a queued action that keeps finding no room gets a worker held
     /// for it; unset means never.
     reservation_hold: Option<ReservationHoldSpec>,
@@ -698,22 +702,12 @@ impl ApiWorkerSchedulerImpl {
     /// Adds a worker to the pool.
     /// Note: This function will not do any task matching.
     fn add_worker(&mut self, worker: Worker) -> Result<(), Error> {
-        if let (Some(policy), Some(sender)) =
-            (&self.resource_escalation, &self.resource_capacity_tx)
-        {
-            observe_capacities(sender, &policy.memory.property, |row| {
-                worker_memory(
-                    row,
-                    &policy.memory.property,
-                    &worker.total_platform_properties,
-                )
-            });
-        }
         let worker_id = worker.id.clone();
         let platform_properties = worker.action_platform_properties.clone();
         // A replacement is one out and one in, so the gauge only moves for a
         // genuinely new worker.
         let replaced = self.workers.put(worker_id.clone(), worker);
+        self.refresh_local_resource_capacities();
 
         // Add to capability index for fast matching
         self.capability_index
@@ -759,6 +753,7 @@ impl ApiWorkerSchedulerImpl {
         // Pop before recomputing the shapes, or the departing worker still
         // counts and a cached verdict that only it satisfied survives it.
         let result = self.workers.pop(worker_id);
+        self.refresh_local_resource_capacities();
         self.fleet_changed();
         self.local_fleet_change_notify.notify_one();
 
@@ -801,25 +796,71 @@ impl ApiWorkerSchedulerImpl {
             .collect()
     }
 
-    fn set_peer_fleet(&mut self, peers: Option<Vec<PeerScheduler>>, now: SystemTime) {
-        if let (Some(policy), Some(sender), Some(peers)) = (
-            &self.resource_escalation,
-            &self.resource_capacity_tx,
-            &peers,
-        ) {
-            if observe_capacities(sender, &policy.memory.property, |row| {
-                peers
+    /// Rebuild local facts from immutable worker totals, never free/busy memory.
+    fn refresh_local_resource_capacities(&mut self) {
+        let (Some(policy), Some(current)) =
+            (&self.resource_escalation, &self.local_resource_capacities)
+        else {
+            return;
+        };
+        if let Some(rows) = observe_capacities(
+            &policy.capacities,
+            current,
+            &policy.memory.property,
+            |row| {
+                self.workers
                     .iter()
-                    .filter_map(|peer| peer.resource_capacities.as_deref())
-                    .flatten()
+                    // Disconnected entries only retain failed-publication ledgers.
+                    .filter(|(_, worker)| !worker.disconnected)
+                    .filter_map(|(_, worker)| {
+                        worker_memory(
+                            row,
+                            &policy.memory.property,
+                            &worker.total_platform_properties,
+                        )
+                    })
+                    .min()
+            },
+        ) {
+            self.local_resource_capacities = Some(rows);
+            self.publish_resource_capacities();
+        }
+    }
+
+    /// Publish global current facts without making them local knowledge.
+    fn publish_resource_capacities(&self) -> bool {
+        let (Some(policy), Some(local), Some(sender)) = (
+            &self.resource_escalation,
+            &self.local_resource_capacities,
+            &self.resource_capacity_tx,
+        ) else {
+            return false;
+        };
+        let current = sender.borrow();
+        let updated = if self.peer_resource_capacities.is_empty() {
+            (current.capacities != *local).then(|| local.clone())
+        } else {
+            observe_capacities(local, &current.capacities, &policy.memory.property, |row| {
+                self.peer_resource_capacities
+                    .iter()
+                    .flat_map(|rows| rows.iter())
                     .filter_map(|peer| peer_memory(row, &policy.memory.property, peer))
                     .min()
-            }) {
-                // Publish before waking the queue or the outgoing peer census.
-                self.capacity_changed();
-                self.local_fleet_change_notify.notify_one();
-            }
+            })
+        };
+        drop(current);
+        if let Some(capacities) = updated {
+            sender.send_replace(Arc::new(ResourceCapacitySnapshot {
+                revision: Uuid::new_v4(),
+                capacities,
+            }));
+            true
+        } else {
+            false
         }
+    }
+
+    fn set_peer_fleet(&mut self, peers: Option<Vec<PeerScheduler>>, now: SystemTime) {
         // Peers list their workers in no particular order and may share
         // shapes, so sort and dedup before comparing, or an unchanged fleet
         // would look changed on every exchange and empty `static_verdicts`.
@@ -838,6 +879,19 @@ impl ApiWorkerSchedulerImpl {
         // even when the union of shapes did not move.
         let mut peer_schedulers = peers.unwrap_or_default();
         peer_schedulers.sort_unstable_by(|a, b| a.scheduler_id.cmp(&b.scheduler_id));
+        let resource_capacities_changed = !self.peer_resource_capacities.iter().eq(peer_schedulers
+            .iter()
+            .filter_map(|peer| peer.resource_capacities.as_ref()));
+        self.peer_resource_capacities.clear();
+        self.peer_resource_capacities.extend(
+            peer_schedulers
+                .iter_mut()
+                .filter_map(|peer| peer.resource_capacities.take()),
+        );
+        if resource_capacities_changed && self.publish_resource_capacities() {
+            // Wake queued refits, but do not advertise peer facts as local.
+            self.capacity_changed();
+        }
         self.peer_schedulers = peer_schedulers;
         // Freshness bookkeeping: update the warm-up /
         // staleness clocks BEFORE the unchanged-shapes early return, so a
@@ -2407,15 +2461,17 @@ impl ApiWorkerScheduler {
             .as_ref()
             .and_then(|policy| policy.disk.as_ref().map(|disk| disk.property.clone()));
         let resource_escalation = resource_escalation.map(Arc::new);
-        let (resource_capacity_tx, resource_capacity_rx) = resource_escalation
-            .as_ref()
-            .map(|policy| {
-                let (sender, receiver) = watch::channel(Arc::new(ResourceCapacitySnapshot::new(
-                    policy.capacities.clone(),
-                )));
-                (Some(sender), Some(receiver))
-            })
-            .unwrap_or((None, None));
+        let (resource_capacity_tx, resource_capacity_rx, local_resource_capacities) =
+            resource_escalation
+                .as_ref()
+                .map(|policy| {
+                    let snapshot =
+                        Arc::new(ResourceCapacitySnapshot::new(policy.capacities.clone()));
+                    let local = snapshot.capacities.clone();
+                    let (sender, receiver) = watch::channel(snapshot);
+                    (Some(sender), Some(receiver), Some(local))
+                })
+                .unwrap_or((None, None, None));
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
@@ -2424,6 +2480,8 @@ impl ApiWorkerScheduler {
                 live_memory_veto,
                 resource_escalation: resource_escalation.clone(),
                 resource_capacity_tx,
+                local_resource_capacities,
+                peer_resource_capacities: Vec::new(),
                 reservation_hold,
                 attempt_events: maybe_origin_event_tx.clone(),
                 lost_results: LostResults::default(),
@@ -2614,9 +2672,15 @@ impl ApiWorkerScheduler {
         self.inner.lock().await.fleet_generation
     }
 
-    /// The distinct properties this scheduler's workers registered with.
-    pub async fn fleet_shapes(&self) -> Vec<PlatformProperties> {
-        self.inner.lock().await.fleet_shapes()
+    /// One coherent advertisement of local worker shapes and local capacity facts.
+    /// Peer-merged fitting capacities must never be republished as local knowledge.
+    pub(crate) async fn fleet_advertisement(&self) -> PeerScheduler {
+        let inner = self.inner.lock().await;
+        PeerScheduler {
+            scheduler_id: inner.scheduler_id.clone(),
+            workers: inner.fleet_shapes(),
+            resource_capacities: inner.local_resource_capacities.clone(),
+        }
     }
 
     /// Records what the workers connected to peer schedulers can run, or

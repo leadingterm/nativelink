@@ -459,7 +459,7 @@ impl SimpleScheduler {
 
     /// What this scheduler would publish to peer schedulers.
     pub async fn fleet_shapes_for_test(&self) -> Vec<PlatformProperties> {
-        self.worker_scheduler.fleet_shapes().await
+        self.worker_scheduler.fleet_advertisement().await.workers
     }
 
     /// How long until the matching loop would next wake on behalf of an
@@ -1448,7 +1448,7 @@ impl SimpleScheduler {
             resource_sketch,
             has_peers,
             record_ttl,
-            scheduler_id.clone(),
+            scheduler_id,
         );
 
         let worker_scheduler_clone = worker_scheduler.clone();
@@ -1572,13 +1572,10 @@ impl SimpleScheduler {
                     else {
                         return;
                     };
-                    let local = PeerScheduler {
-                        scheduler_id: scheduler_id.clone(),
-                        workers: worker_scheduler.fleet_shapes().await,
-                        resource_capacities: worker_scheduler
-                            .resource_capacity_updates()
-                            .map(|updates| updates.borrow().capacities.clone()),
-                    };
+                    // Publish only local physical facts, never the global
+                    // watch: echoing peer minima would prevent recovery when
+                    // the smallest worker leaves the fleet.
+                    let local = worker_scheduler.fleet_advertisement().await;
                     match state_manager
                         .exchange_fleet_capabilities(local, record_ttl)
                         .await
@@ -1918,5 +1915,200 @@ mod unsatisfiable_fail_cap_tests {
         let over = MAX_UNSATISFIABLE_FAILS_PER_PASS * UNSATISFIABLE_FAIL_BACKLOG_DIVISOR
             + UNSATISFIABLE_FAIL_BACKLOG_DIVISOR;
         assert!(unsatisfiable_fail_cap(over) > MAX_UNSATISFIABLE_FAILS_PER_PASS);
+    }
+}
+
+#[cfg(test)]
+mod peer_capacity_feedback_tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use mock_instant::thread_local::MockClock;
+    use nativelink_config::schedulers::{
+        EscalationDimensionSpec, PropertyType, ResourceCapacity, ResourceEscalationSpec, SimpleSpec,
+    };
+    use nativelink_error::Error;
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::action_messages::WorkerId;
+    use nativelink_util::instant_wrapper::MockInstantWrapped;
+    use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
+    use tokio::sync::{Notify, mpsc};
+
+    use super::SimpleScheduler;
+    use crate::default_scheduler_factory::memory_awaited_action_db_factory;
+    use crate::worker::Worker;
+    use crate::worker_scheduler::WorkerScheduler;
+
+    #[nativelink_test]
+    async fn local_advertisements_break_peer_capacity_feedback() -> Result<(), Error> {
+        const GIB_KB: u64 = 1024 * 1024;
+        const ESTIMATE_KB: u64 = 63 * GIB_KB;
+        const OBSERVED_KB: u64 = 62_229 * 1024; // 60.77 GiB usable physical memory.
+        const ACTION_CEILING_KB: u64 = 4 * GIB_KB;
+        const NOW_TIME: u64 = 10_000;
+
+        MockClock::set_time(Duration::from_secs(NOW_TIME));
+        let spec = SimpleSpec {
+            supported_platform_properties: Some(HashMap::from([
+                ("memory_kb".to_string(), PropertyType::Minimum),
+                ("cpu_count".to_string(), PropertyType::Minimum),
+                ("fleet".to_string(), PropertyType::Exact),
+            ])),
+            resource_escalation: Some(ResourceEscalationSpec {
+                memory: EscalationDimensionSpec {
+                    property: "memory_kb".to_string(),
+                    percent: 250,
+                    max_steps: 3,
+                },
+                disk: None,
+                headroom_percent: 25,
+                cpu_property: "cpu_count".to_string(),
+                capacity_ignored_properties: Vec::new(),
+                capacities: vec![ResourceCapacity {
+                    minimum: BTreeMap::from([
+                        ("memory_kb".to_string(), ESTIMATE_KB),
+                        ("cpu_count".to_string(), 16),
+                    ]),
+                    exact: BTreeMap::from([("fleet".to_string(), "compile".to_string())]),
+                    action_ceilings: BTreeMap::from([("memory_kb".to_string(), ACTION_CEILING_KB)]),
+                }],
+            }),
+            ..SimpleSpec::default()
+        };
+        let make_scheduler = || {
+            let notify = Arc::new(Notify::new());
+            SimpleScheduler::new_with_callback(
+                &spec,
+                memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
+                || async {},
+                notify,
+                MockInstantWrapped::default,
+                None,
+            )
+        };
+        let (a, a_worker) = make_scheduler();
+        let (b, b_worker) = make_scheduler();
+        let a_capacity = a_worker
+            .resource_capacity_updates()
+            .expect("A supports the capacity watch");
+        let b_capacity = b_worker
+            .resource_capacity_updates()
+            .expect("B supports the capacity watch");
+        let (tx, _rx) = mpsc::channel(64);
+        let worker_id = WorkerId("local-small-worker".to_string());
+        a.add_worker(Worker::new(
+            worker_id.clone(),
+            PlatformProperties::new(HashMap::from([
+                (
+                    "memory_kb".to_string(),
+                    PlatformPropertyValue::Minimum(OBSERVED_KB),
+                ),
+                ("cpu_count".to_string(), PlatformPropertyValue::Minimum(16)),
+                (
+                    "fleet".to_string(),
+                    PlatformPropertyValue::Exact("compile".to_string()),
+                ),
+            ])),
+            tx,
+            NOW_TIME,
+            4,
+        ))
+        .await?;
+
+        let a_local = a.worker_scheduler.fleet_advertisement().await;
+        assert_eq!(a_local.workers.len(), 1);
+        let a_rows = a_local
+            .resource_capacities
+            .as_ref()
+            .expect("A advertises physical capacity");
+        assert_eq!(a_rows[0].minimum["memory_kb"], OBSERVED_KB);
+        assert_eq!(a_rows[0].action_ceilings["memory_kb"], ACTION_CEILING_KB);
+        b.set_peer_schedulers_for_test(vec![a_local]).await;
+        assert_eq!(
+            b_capacity.borrow().capacities[0].minimum["memory_kb"],
+            OBSERVED_KB
+        );
+
+        // B knows A's smaller pool globally, but has no local observation:
+        // its outgoing row must remain the configured physical estimate.
+        let b_local = b.worker_scheduler.fleet_advertisement().await;
+        assert!(b_local.workers.is_empty());
+        let b_rows = b_local
+            .resource_capacities
+            .as_ref()
+            .expect("B advertises its configured estimate");
+        assert_eq!(b_rows[0].minimum["memory_kb"], ESTIMATE_KB);
+        assert_eq!(b_rows[0].action_ceilings["memory_kb"], ACTION_CEILING_KB);
+        a.set_peer_schedulers_for_test(vec![b_local]).await;
+        assert_eq!(
+            a_capacity.borrow().capacities[0].minimum["memory_kb"],
+            OBSERVED_KB
+        );
+
+        let lower_peer = a.worker_scheduler.fleet_advertisement().await;
+        let observed = b_capacity.borrow().clone();
+        b.set_peer_schedulers_for_test(vec![lower_peer.clone()])
+            .await;
+        assert!(Arc::ptr_eq(&observed, &b_capacity.borrow()));
+        assert_eq!(observed.revision, b_capacity.borrow().revision);
+        b.set_peers_unknown_for_test().await;
+        let unknown = b_capacity.borrow().clone();
+        assert_eq!(unknown.capacities[0].minimum["memory_kb"], ESTIMATE_KB);
+        assert_ne!(observed.revision, unknown.revision);
+        b.set_peer_schedulers_for_test(vec![lower_peer.clone()])
+            .await;
+        assert_eq!(
+            b_capacity.borrow().capacities[0].minimum["memory_kb"],
+            OBSERVED_KB
+        );
+        b.set_peer_schedulers_for_test(Vec::new()).await;
+        assert_eq!(
+            b_capacity.borrow().capacities[0].minimum["memory_kb"],
+            ESTIMATE_KB
+        );
+        b.set_peer_schedulers_for_test(vec![lower_peer]).await;
+        assert_eq!(
+            b_capacity.borrow().capacities[0].minimum["memory_kb"],
+            OBSERVED_KB
+        );
+
+        a.remove_worker(&worker_id).await?;
+        // Feed the real local advertisements repeatedly, just as the periodic
+        // exchange does. Neither scheduler may preserve or echo the old pool.
+        for _ in 0..3 {
+            let a_local = a.worker_scheduler.fleet_advertisement().await;
+            let b_local = b.worker_scheduler.fleet_advertisement().await;
+            assert!(a_local.workers.is_empty());
+            for local in [&a_local, &b_local] {
+                let rows = local
+                    .resource_capacities
+                    .as_ref()
+                    .expect("local estimate remains advertised");
+                assert_eq!(rows[0].minimum["memory_kb"], ESTIMATE_KB);
+                assert_eq!(rows[0].action_ceilings["memory_kb"], ACTION_CEILING_KB);
+            }
+            a.set_peer_schedulers_for_test(vec![b_local]).await;
+            b.set_peer_schedulers_for_test(vec![a_local]).await;
+            assert_eq!(
+                a_capacity.borrow().capacities[0].minimum["memory_kb"],
+                ESTIMATE_KB
+            );
+            assert_eq!(
+                b_capacity.borrow().capacities[0].minimum["memory_kb"],
+                ESTIMATE_KB
+            );
+        }
+        let a_stable = a_capacity.borrow().clone();
+        let b_stable = b_capacity.borrow().clone();
+        let a_local = a.worker_scheduler.fleet_advertisement().await;
+        let b_local = b.worker_scheduler.fleet_advertisement().await;
+        a.set_peer_schedulers_for_test(vec![b_local]).await;
+        b.set_peer_schedulers_for_test(vec![a_local]).await;
+        assert!(Arc::ptr_eq(&a_stable, &a_capacity.borrow()));
+        assert!(Arc::ptr_eq(&b_stable, &b_capacity.borrow()));
+        assert_eq!(a_stable.revision, a_capacity.borrow().revision);
+        assert_eq!(b_stable.revision, b_capacity.borrow().revision);
+        Ok(())
     }
 }
