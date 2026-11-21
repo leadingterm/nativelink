@@ -187,10 +187,7 @@ impl Hist {
 
     /// The same over the samples of `self` and `other` together.
     pub fn p95_upper_with(&self, other: &Self) -> u64 {
-        self.percentile_upper_with(
-            other,
-            CpuReservationPercentile::new(95).expect("95 is a valid CPU reservation percentile"),
-        )
+        self.percentile_upper_with(other, CpuReservationPercentile::P95)
     }
 
     /// Upper bound of the selected percentile bucket across both histograms.

@@ -539,6 +539,9 @@ const fn default_historical_resource_headroom_percent() -> u64 {
 pub struct CpuReservationPercentile(u8);
 
 impl CpuReservationPercentile {
+    /// The 95th percentile.
+    pub const P95: Self = Self(95);
+
     /// Constructs a percentile, rejecting values outside 1 through 100.
     pub const fn new(value: u8) -> Option<Self> {
         if value >= 1 && value <= 100 {
@@ -555,7 +558,7 @@ impl CpuReservationPercentile {
 }
 
 const fn default_historical_resource_cpu_reservation_percentile() -> CpuReservationPercentile {
-    CpuReservationPercentile::new(95).expect("95 is a valid CPU reservation percentile")
+    CpuReservationPercentile::P95
 }
 
 fn deserialize_cpu_reservation_percentile<'de, D>(
