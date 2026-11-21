@@ -88,6 +88,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::buck2_file_capture::Buck2FileCapture;
 use crate::input_mounts::InputMounts;
+use crate::persistent_worker::pool::CommandRegistration;
 use crate::persistent_worker::{
     Input as PersistentWorkerInput, PersistentWorkerPool, PoolConfig, WireFormat, WorkRequest,
     WorkerKey,
@@ -189,14 +190,14 @@ pub fn classify_outcome(
 }
 
 #[cfg(target_os = "linux")]
-type SpawnedChild = crate::namespace_utils::MaybeNamespacedChild;
+pub(crate) type SpawnedChild = crate::namespace_utils::MaybeNamespacedChild;
 #[cfg(not(target_os = "linux"))]
-type SpawnedChild = process::Child;
+pub(crate) type SpawnedChild = process::Child;
 
 /// SIGKILL to every process group holding the action's processes, then
 /// through the child wrapper, which takes the action's own group with it;
 /// logged if it fails.
-async fn hard_kill(child: &mut SpawnedChild, watch: &ActionMemoryWatch, why: &str) {
+pub(crate) async fn hard_kill(child: &mut SpawnedChild, watch: &ActionMemoryWatch, why: &str) {
     #[cfg(target_family = "unix")]
     if let Some(pgid) = child.id() {
         signal_action(pgid, watch, libc::SIGKILL);
@@ -569,7 +570,7 @@ fn signal_process_group(pgid: u32, signal: i32) -> bool {
 /// test that `set -m` moved to a group of its own, which would survive the
 /// kill and keep its memory. Returns whether any process got it.
 #[cfg(target_family = "unix")]
-fn signal_action(action_pgid: u32, watch: &ActionMemoryWatch, signal: i32) -> bool {
+pub(crate) fn signal_action(action_pgid: u32, watch: &ActionMemoryWatch, signal: i32) -> bool {
     #[cfg(target_os = "linux")]
     let groups = {
         let mut seeds = watch.process_groups.lock().clone();
@@ -2689,6 +2690,7 @@ async fn do_cleanup(
     running_actions_manager: &Arc<RunningActionsManagerImpl>,
     operation_id: &OperationId,
     action_directory: &str,
+    expired: &AtomicBool,
 ) -> Result<(), Error> {
     // Mark this operation as being cleaned up. The other holders of the
     // mark are the orphan sweep and a retry's stale-directory removal, both
@@ -2728,7 +2730,7 @@ async fn do_cleanup(
     let remove_dir_result = loop {
         match fs::remove_dir_all(action_directory).await {
             Ok(()) => break Ok(()),
-            Err(err) if Instant::now() < remove_deadline => {
+            Err(err) if !expired.load(Ordering::Acquire) && Instant::now() < remove_deadline => {
                 debug!(%operation_id, ?err, "Removing the working directory again");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -3001,6 +3003,9 @@ pub struct RunningActionImpl {
     /// `experimental_active_input_leases`; `None` leaves eviction untouched.
     input_lease: Option<Arc<ActionInputLease>>,
     timeout: Duration,
+    /// Absolute controller deadline for this dispatch, shared by every phase.
+    attempt_deadline: Option<SystemTime>,
+    command_registration: Arc<Mutex<CommandRegistration>>,
     running_actions_manager: Arc<RunningActionsManagerImpl>,
     /// Set on a kill; every phase that can wait watches it, so a kill ends
     /// a fetch or an upload as surely as it ends the command.
@@ -3041,6 +3046,7 @@ impl RunningActionImpl {
         action_directory: String,
         action_info: ActionInfo,
         timeout: Duration,
+        attempt_deadline: Option<SystemTime>,
         running_actions_manager: Arc<RunningActionsManagerImpl>,
     ) -> Self {
         let work_directory = format!("{}/{}", action_directory, "work");
@@ -3061,6 +3067,11 @@ impl RunningActionImpl {
             action_info,
             input_lease,
             timeout,
+            attempt_deadline,
+            command_registration: Arc::new(Mutex::new(CommandRegistration::new(
+                attempt_deadline,
+                running_actions_manager.callbacks.now_fn,
+            ))),
             running_actions_manager,
             state: Mutex::new(RunningActionImplState {
                 command_proto: None,
@@ -3078,8 +3089,8 @@ impl RunningActionImpl {
             // The constructor can fail the operation-id uniqueness check
             // immediately after this object is created.
             has_manager_entry: AtomicBool::new(false),
-            // Only needs to be cleaned up after a prepare_action call, set there.
-            did_cleanup: AtomicBool::new(true),
+            // The action directory already exists before registration.
+            did_cleanup: AtomicBool::new(false),
             memory_watch: Arc::new(ActionMemoryWatch::default()),
         }
     }
@@ -3619,6 +3630,7 @@ impl RunningActionImpl {
     }
 
     async fn inner_execute(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+        self.command_registration.lock().check_deadline()?;
         let (command_proto, mut kill_channel_rx) = {
             let mut state = self.state.lock();
             state.execution_metadata.execution_start_timestamp =
@@ -3712,10 +3724,13 @@ impl RunningActionImpl {
                         .acquire_timeout()
                         .min(self.timeout);
                     let acquired = {
-                        let acquire_fut = self
-                            .running_actions_manager
-                            .persistent_worker_pool
-                            .acquire(key.clone(), &program, &worker_cwd);
+                        let acquire_fut =
+                            self.running_actions_manager.persistent_worker_pool.acquire(
+                                key.clone(),
+                                &program,
+                                &worker_cwd,
+                                self.command_registration.clone(),
+                            );
                         tokio::pin!(acquire_fut);
                         tokio::select! {
                             result = &mut acquire_fut => Some(result),
@@ -3880,6 +3895,7 @@ impl RunningActionImpl {
                             return Ok(self);
                         }
                         Err(err) => {
+                            self.command_registration.lock().check_deadline()?;
                             self.metrics().persistent_worker_fallbacks.inc();
                             info!(
                                 ?err,
@@ -3890,6 +3906,7 @@ impl RunningActionImpl {
                     }
                 }
                 Err(err) => {
+                    self.command_registration.lock().check_deadline()?;
                     self.metrics().persistent_worker_fallbacks.inc();
                     info!(
                         ?err,
@@ -3951,8 +3968,10 @@ impl RunningActionImpl {
             if let Err(error) = root_builder.create(side_root).await
                 && error.kind() != std::io::ErrorKind::AlreadyExists
             {
-                return Err(Error::from(error)
-                    .append(format!("Creating side channel root {}", side_root.display())));
+                return Err(Error::from(error).append(format!(
+                    "Creating side channel root {}",
+                    side_root.display()
+                )));
             }
             let metadata = tokio::fs::symlink_metadata(side_root)
                 .await
@@ -4044,9 +4063,18 @@ impl RunningActionImpl {
         #[cfg(target_family = "unix")]
         command_builder.process_group(0);
 
-        let mut child_process = command_builder
-            .spawn()
-            .err_tip(|| format!("Could not execute command {args:?}"))?;
+        let mut child_process = {
+            let mut registration = self.command_registration.lock();
+            registration.register_command(|| {
+                command_builder
+                    .spawn()
+                    .err_tip(|| format!("Could not execute command {args:?}"))
+            })?
+        };
+        // Kept until wait has reaped the child and the group is hard-signalled.
+        // The expiry owner never aborts this task while registration is active.
+        let registration = self.command_registration.clone();
+        let command_stopped = guard((), move |()| registration.lock().stop());
         // Ours until the wait below collects it; the reaper leaves it alone.
         let _owned_child = crate::reaper::OwnedChild::new(child_process.id());
         #[cfg(target_os = "linux")]
@@ -4279,8 +4307,28 @@ impl RunningActionImpl {
 
         let timer = self.metrics().child_process.begin_timer();
         let mut sleep_fut = (self.running_actions_manager.callbacks.sleep_fn)(self.timeout).fuse();
+        let mut attempt_deadline_fut: Fuse<BoxFuture<'static, ()>> = match self.attempt_deadline {
+            Some(deadline) => {
+                let remaining = deadline
+                    .duration_since((self.running_actions_manager.callbacks.now_fn)())
+                    .unwrap_or_default();
+                (self.running_actions_manager.callbacks.sleep_fn)(remaining).fuse()
+            }
+            None => Fuse::terminated(),
+        };
         loop {
             tokio::select! {
+                () = &mut attempt_deadline_fut => {
+                    self.command_registration.lock().expire();
+                    self.kill_token.send_replace(true);
+                    self.memory_watch.finished_or_killing.store(true, Ordering::Release);
+                    kill_reason = Some(KillReason::Timeout);
+                    self.state.lock().error = Some(make_err!(
+                        Code::DeadlineExceeded, "Dispatch deadline exceeded for operation {}", self.operation_id
+                    ));
+                    grace_fut = Fuse::terminated();
+                    hard_kill(&mut child_process_guard, &self.memory_watch, "dispatch deadline").await;
+                },
                 () = &mut sleep_fut, if kill_reason.is_none() => {
                     self.running_actions_manager.metrics.task_timeouts.inc();
                     kill_reason = Some(KillReason::Timeout);
@@ -4478,6 +4526,7 @@ impl RunningActionImpl {
                         .is_some_and(|pgid| signal_action(pgid, &self.memory_watch, libc::SIGKILL));
                     #[cfg(not(target_family = "unix"))]
                     let had_stragglers = false;
+                    drop(command_stopped);
                     // An action that exited on its own with nothing left in
                     // its group closes its pipes itself, and its output is
                     // the result, so that read runs to the end: a reader
@@ -4648,18 +4697,19 @@ impl RunningActionImpl {
                     }
                     return Ok(self);
                 },
-                _ = &mut kill_channel_rx, if kill_reason.is_none() => {
-                    kill_reason = Some(KillReason::External);
-                    grace_fut = stop_action(&mut child_process_guard, &self.memory_watch, kill_grace, "scheduler kill").await;
-                    {
-                        let mut state = self.state.lock();
-                        state.error = Error::merge_option(state.error.take(), Some(Error::new(
+                _ = &mut kill_channel_rx => {
+                    if self.command_registration.lock().expired.load(Ordering::Acquire) {
+                        kill_reason = Some(KillReason::Timeout);
+                        grace_fut = Fuse::terminated();
+                        hard_kill(&mut child_process_guard, &self.memory_watch, "dispatch deadline").await;
+                    } else if kill_reason.is_none() {
+                        kill_reason = Some(KillReason::External);
+                        grace_fut = stop_action(&mut child_process_guard, &self.memory_watch, kill_grace, "scheduler kill").await;
+                        self.state.lock().error = Some(make_err!(
                             Code::Aborted,
-                            format!(
-                                "Command '{}' was killed by scheduler",
-                                args.join(OsStr::new(" ")).to_string_lossy()
-                            )
-                        )));
+                            "Command '{}' was killed by scheduler",
+                            args.join(OsStr::new(" ")).to_string_lossy()
+                        ));
                     }
                 },
             }
@@ -5092,9 +5142,15 @@ impl Drop for RunningActionImpl {
         let action_directory = self.action_directory.clone();
         let input_lease = self.input_lease.clone();
         let input_mounts = self.state.get_mut().input_mounts.take();
+        let expired = self.command_registration.lock().expired.clone();
         background_spawn!("running_action_impl_drop", async move {
-            let cleanup_result =
-                do_cleanup(&running_actions_manager, &operation_id, &action_directory).await;
+            let cleanup_result = do_cleanup(
+                &running_actions_manager,
+                &operation_id,
+                &action_directory,
+                &expired,
+            )
+            .await;
             drop(input_mounts);
             if let Some(input_lease) = input_lease {
                 input_lease.release().await;
@@ -5117,6 +5173,8 @@ impl RunningAction for RunningActionImpl {
     }
 
     async fn prepare_action(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+        self.command_registration.lock().check_deadline()?;
+        let attempt_expired = self.command_registration.lock().expired.clone();
         let download_timeout = self.running_actions_manager.max_download_timeout;
         let operation_id = self.operation_id.clone();
         let manager = self.running_actions_manager.clone();
@@ -5165,7 +5223,7 @@ impl RunningAction for RunningActionImpl {
                 _ = kill_rx.wait_for(|killed| *killed) => {
                     warn!(%operation_id, "prepare_action: killed while fetching inputs");
                     Err(make_err!(
-                        Code::Aborted,
+                        if attempt_expired.load(Ordering::Acquire) { Code::DeadlineExceeded } else { Code::Aborted },
                         "Operation {operation_id} was killed while fetching its inputs"
                     ))
                 }
@@ -5217,6 +5275,8 @@ impl RunningAction for RunningActionImpl {
         );
         let metrics = self.metrics().clone();
         let kill_token = self.kill_token.clone();
+        self.command_registration.lock().check_deadline()?;
+        let attempt_expired = self.command_registration.lock().expired.clone();
         let upload_fut = metrics
             .upload_results
             .wrap(Self::inner_upload_results(self));
@@ -5249,7 +5309,7 @@ impl RunningAction for RunningActionImpl {
                 Ok(()) = kill_rx.changed() => {
                     warn!(%operation_id, "upload_results: killed while uploading");
                     Err(make_err!(
-                        Code::Aborted,
+                        if attempt_expired.load(Ordering::Acquire) { Code::DeadlineExceeded } else { Code::Aborted },
                         "Operation {operation_id} was killed while uploading its results"
                     ))
                 }
@@ -5277,10 +5337,12 @@ impl RunningAction for RunningActionImpl {
             .clone()
             .cleanup
             .wrap(async move {
+                let expired = self.command_registration.lock().expired.clone();
                 let result = do_cleanup(
                     &self.running_actions_manager,
                     &self.operation_id,
                     &self.action_directory,
+                    &expired,
                 )
                 .await;
                 self.has_manager_entry.store(false, Ordering::Release);
@@ -5341,6 +5403,19 @@ pub trait RunningActionsManager: Sync + Send + Sized + Unpin + 'static {
         &self,
         operation_id: &OperationId,
     ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Mark expiry under command registration, hard-stop any registered command,
+    /// and return cleanup ownership. No command can register after this returns.
+    fn expire_attempt(
+        &self,
+        operation_id: &OperationId,
+    ) -> impl Future<Output = Option<Arc<Self::RunningAction>>> + Send;
+
+    /// Uses the same clock as command registration and execution.
+    fn wait_for_attempt_deadline(&self, deadline: SystemTime) -> impl Future<Output = ()> + Send;
+
+    /// The action clock, also used for admission of delayed deliveries.
+    fn now(&self) -> SystemTime;
 
     fn metrics(&self) -> &Arc<Metrics>;
 }
@@ -5870,6 +5945,32 @@ pub struct RunningActionsManagerArgs<'a> {
     pub use_namespaces: UseNamespaces,
 }
 
+/// Owns partial directory setup until a registered action takes over.
+struct PendingActionDirectory {
+    path: String,
+    manager: Arc<RunningActionsManagerImpl>,
+    operation_id: OperationId,
+    armed: bool,
+}
+
+impl Drop for PendingActionDirectory {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let manager = self.manager.clone();
+        let operation_id = self.operation_id.clone();
+        let path = self.path.clone();
+        background_spawn!("cancelled_action_directory", async move {
+            if let Err(err) =
+                do_cleanup(&manager, &operation_id, &path, &AtomicBool::new(true)).await
+            {
+                warn!(?err, %operation_id, "Cleaning up cancelled action directory creation");
+            }
+        });
+    }
+}
+
 /// The mark that an operation's directory is being cleaned; dropping it
 /// clears the mark and wakes whoever waits for it.
 #[derive(Debug)]
@@ -6232,25 +6333,48 @@ impl RunningActionsManagerImpl {
     }
 
     fn make_action_directory<'a>(
-        &'a self,
+        self: &'a Arc<Self>,
         operation_id: &'a OperationId,
-    ) -> impl Future<Output = Result<String, Error>> + 'a {
+    ) -> impl Future<Output = Result<PendingActionDirectory, Error>> + 'a {
         self.metrics.make_action_directory.wrap(async move {
-            let action_directory = format!("{}/{}", self.root_action_directory, operation_id);
-            fs::create_dir(&action_directory)
-                .await
-                .err_tip(|| format!("Error creating action directory {action_directory}"))?;
-            // Keep action paths in the same physical spelling as the process working directory.
-            dunce::canonicalize(&action_directory)
-                .err_tip(|| format!("Error canonicalizing action directory {action_directory}"))?
-                .into_os_string()
-                .into_string()
-                .map_err(|path| {
-                    make_err!(
-                        Code::Internal,
-                        "Canonical action directory is not UTF-8: {path:?}"
-                    )
-                })
+            let mut directory = PendingActionDirectory {
+                path: format!("{}/{}", self.root_action_directory, operation_id),
+                manager: self.clone(),
+                operation_id: operation_id.clone(),
+                armed: false,
+            };
+            let (tx, rx) = oneshot::channel();
+            // Tokio filesystem work can finish after its waiter is cancelled.
+            // Keep ownership until the create completes, then remove any partial
+            // directory if registration no longer has a receiver.
+            background_spawn!("create_action_directory", async move {
+                let result = async {
+                    fs::create_dir(&directory.path).await.err_tip(|| {
+                        format!("Error creating action directory {}", directory.path)
+                    })?;
+                    directory.armed = true;
+                    directory.path = dunce::canonicalize(&directory.path)
+                        .err_tip(|| {
+                            format!("Error canonicalizing action directory {}", directory.path)
+                        })?
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|path| {
+                            make_err!(
+                                Code::Internal,
+                                "Canonical action directory is not UTF-8: {path:?}"
+                            )
+                        })?;
+                    Ok(directory)
+                }
+                .await;
+                // The guard also survives a successful send whose receiver is
+                // dropped before consuming it.
+                drop(tx.send(result));
+            });
+            rx.await
+                .map_err(|e| make_err!(Code::Internal, "{e}"))
+                .err_tip(|| "Could not join action directory creation")?
         })
     }
 
@@ -6844,6 +6968,14 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                     .queued_timestamp
                     .and_then(|time| time.try_into().ok())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
+                let attempt_deadline = start_execute
+                    .attempt_deadline
+                    .clone()
+                    .map(|time| time.try_into().map_err(|_| make_input_err!("Invalid attempt deadline")))
+                    .transpose()?;
+                if attempt_deadline.is_some_and(|deadline| (self.callbacks.now_fn)() >= deadline) {
+                    return Err(make_err!(Code::DeadlineExceeded, "Dispatch deadline exceeded before registration"));
+                }
                 let operation_id = start_execute
                     .operation_id.as_str().into();
                 let action_info = self.create_action_info(start_execute, queued_timestamp).await?;
@@ -6853,7 +6985,7 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                 );
                 // Wait for any previous cleanup to complete before creating directory
                 self.wait_for_cleanup_if_needed(&operation_id).await?;
-                let action_directory = self.make_action_directory(&operation_id).await?;
+                let mut action_directory = self.make_action_directory(&operation_id).await?;
                 let execution_metadata = ExecutionMetadata {
                     worker: worker_id,
                     queued_timestamp: action_info.insert_timestamp,
@@ -6887,11 +7019,13 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                 let running_action = Arc::new(RunningActionImpl::new(
                     execution_metadata,
                     operation_id.clone(),
-                    action_directory,
+                    action_directory.path.clone(),
                     action_info,
                     timeout,
+                    attempt_deadline,
                     self.clone(),
                 ));
+                action_directory.armed = false;
                 {
                     let mut running_actions = self.running_actions.lock();
                     // Check if action already exists and is still alive
@@ -6948,6 +7082,40 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                 hasher,
             ))
             .await
+    }
+
+    fn now(&self) -> SystemTime {
+        (self.callbacks.now_fn)()
+    }
+
+    async fn wait_for_attempt_deadline(&self, deadline: SystemTime) {
+        let remaining = deadline
+            .duration_since((self.callbacks.now_fn)())
+            .unwrap_or_default();
+        (self.callbacks.sleep_fn)(remaining).await;
+    }
+
+    async fn expire_attempt(&self, operation_id: &OperationId) -> Option<Arc<RunningActionImpl>> {
+        let action = self
+            .running_actions
+            .lock()
+            .get(operation_id)
+            .and_then(Weak::upgrade)?;
+        let stopped = action.command_registration.lock().expire_and_subscribe();
+        action.state.lock().error = Some(make_err!(
+            Code::DeadlineExceeded,
+            "Dispatch deadline exceeded for operation {operation_id}"
+        ));
+        action.kill_token.send_replace(true);
+        if let Some(tx) = action.state.lock().kill_channel_tx.take() {
+            let _ = tx.send(());
+        }
+        // The command select owns hard-kill and reaping. Keep its task alive
+        // until acknowledgement, then the caller may abort a stalled upload.
+        if let Some(mut stopped) = stopped {
+            drop(stopped.wait_for(|stopped| *stopped).await);
+        }
+        Some(action)
     }
 
     async fn kill_operation(&self, operation_id: &OperationId) -> Result<(), Error> {

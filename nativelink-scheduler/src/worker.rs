@@ -55,7 +55,14 @@ pub struct ActionInfoWithProps {
 pub enum WorkerUpdate {
     /// Requests that the worker begin executing this action, dispatched at
     /// this scheduler time.
-    RunAction(Box<(OperationId, ActionInfoWithProps, WorkerTimestamp)>),
+    RunAction(
+        Box<(
+            OperationId,
+            ActionInfoWithProps,
+            WorkerTimestamp,
+            Option<SystemTime>,
+        )>,
+    ),
 
     /// Request that the worker is no longer in the pool and may discard any jobs.
     Disconnect,
@@ -68,6 +75,10 @@ pub enum WorkerUpdate {
 pub struct PendingActionInfoData {
     #[metric]
     pub action_info: ActionInfoWithProps,
+    /// Absolute deadline stamped by the controller for this dispatch.
+    pub attempt_deadline: Option<SystemTime>,
+    /// A terminal update failed; retain ownership until publication or expiry.
+    pub terminal_publication_failed: bool,
     /// When the worker was told to kill this operation, recorded as the
     /// worker's last-seen timestamp at send time; keepalives keep that
     /// within the worker timeout of now, so a deadline computed from it
@@ -156,6 +167,8 @@ pub struct Worker {
     /// Whether the worker is draining.
     #[metric(help = "If the worker is draining.")]
     pub is_draining: bool,
+    /// Retained solely for unpublished terminal state after disconnection.
+    pub(crate) disconnected: bool,
 
     /// Maximum inflight tasks for this worker (or 0 for unlimited)
     #[metric(help = "Maximum inflight tasks for this worker (or 0 for unlimited)")]
@@ -247,6 +260,7 @@ impl Worker {
             admits_when_idle: false,
             idle_declined_kb: None,
             is_draining: false,
+            disconnected: false,
             max_inflight_tasks,
             last_load: None,
             metrics: Arc::new(Metrics {
@@ -300,8 +314,8 @@ impl Worker {
     pub async fn notify_update(&mut self, worker_update: WorkerUpdate) -> Result<(), Error> {
         match worker_update {
             WorkerUpdate::RunAction(action) => {
-                let (operation_id, action_info, dispatched_at) = *action;
-                self.run_action(operation_id, action_info, dispatched_at)
+                let (operation_id, action_info, dispatched_at, attempt_deadline) = *action;
+                self.run_action(operation_id, action_info, dispatched_at, attempt_deadline)
                     .await
             }
             WorkerUpdate::Disconnect => {
@@ -391,12 +405,9 @@ impl Worker {
         }
     }
 
-    /// Takes a keepalive's report of what the worker is running and returns
-    /// the acknowledged operations it has left out of
-    /// [`LOST_AFTER_MISSED_REPORTS`] reports in a row. An operation the
-    /// worker was told to kill is on its way off and not counted; one it has
-    /// not acknowledged may still be in transit, which the acknowledgement
-    /// sweep covers.
+    /// Returns acknowledged operations omitted from consecutive reports.
+    /// Deadline-enabled attempts remain owned until their common deadline;
+    /// a missing report alone must not requeue them early.
     pub fn unreported_operations(&mut self, reported: &HashSet<OperationId>) -> Vec<OperationId> {
         let mut lost = Vec::new();
         for (operation_id, pending) in &mut self.running_action_infos {
@@ -404,7 +415,11 @@ impl Worker {
                 pending.missed_reports = 0;
                 continue;
             }
-            if !pending.accepted || pending.kill_requested_at.is_some() {
+            if !pending.accepted
+                || pending.kill_requested_at.is_some()
+                || pending.attempt_deadline.is_some()
+                || pending.terminal_publication_failed
+            {
                 continue;
             }
             pending.missed_reports += 1;
@@ -415,12 +430,17 @@ impl Worker {
         lost
     }
 
-    /// Operations dispatched at or before `cutoff` that the worker never
-    /// acknowledged.
+    /// Deadline-free operations dispatched at or before `cutoff` that the
+    /// worker never acknowledged.
     pub fn unacknowledged(&self, cutoff: WorkerTimestamp) -> Vec<OperationId> {
         self.running_action_infos
             .iter()
-            .filter(|(_, pending)| !pending.accepted && pending.dispatched_at <= cutoff)
+            .filter(|(_, pending)| {
+                !pending.accepted
+                    && pending.attempt_deadline.is_none()
+                    && !pending.terminal_publication_failed
+                    && pending.dispatched_at <= cutoff
+            })
             .map(|(operation_id, _)| operation_id.clone())
             .collect()
     }
@@ -430,6 +450,7 @@ impl Worker {
         operation_id: OperationId,
         action_info: ActionInfoWithProps,
         dispatched_at: WorkerTimestamp,
+        attempt_deadline: Option<SystemTime>,
     ) -> Result<(), Error> {
         let tx = &mut self.tx;
         let worker_platform_properties = &mut self.platform_properties;
@@ -447,6 +468,7 @@ impl Worker {
                     platform: Some((&action_info.platform_properties).into()),
                     worker_id,
                     request_metadata: action_info.origin_metadata.bazel_metadata.clone(),
+                    attempt_deadline: attempt_deadline.map(Into::into),
                 };
                 // Send first: a channel that will not take the message
                 // leaves the ledger untouched, and the caller requeues.
@@ -459,6 +481,8 @@ impl Worker {
                     operation_id,
                     PendingActionInfoData {
                         action_info,
+                        attempt_deadline,
+                        terminal_publication_failed: false,
                         kill_requested_at: None,
                         missed_reports: 0,
                         dispatched_at,

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_lock::Mutex;
 use nativelink_error::{Error, make_input_err};
@@ -188,6 +189,26 @@ impl RunningActionsManager for MockRunningActionsManager {
             .send(operation_id.clone())
             .expect("Could not send request to mpsc");
         Ok(())
+    }
+
+    async fn expire_attempt(&self, operation_id: &OperationId) -> Option<Arc<MockRunningAction>> {
+        self.tx_kill_operation
+            .send(operation_id.clone())
+            .expect("Could not send expiry");
+        None
+    }
+
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    async fn wait_for_attempt_deadline(&self, deadline: SystemTime) {
+        tokio::time::sleep(
+            deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or_default(),
+        )
+        .await;
     }
 
     async fn kill_all(&self) {
