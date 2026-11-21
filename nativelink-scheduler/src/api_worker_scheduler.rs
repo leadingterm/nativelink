@@ -3221,6 +3221,13 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // and the worker registry. A worker is alive if either source says it's alive.
         let timeout = Duration::from_secs(self.worker_timeout_s);
         let now = UNIX_EPOCH + Duration::from_secs(now_timestamp);
+        // The ordinary worker sweep also retires whole-attempt deadlines,
+        // including dispatches a worker has not yet acknowledged.
+        let deadline_now = {
+            let inner = self.inner.lock().await;
+            (inner.now_fn)()
+        };
+        let mut result = self.expire_attempts(deadline_now).await;
         let timeout_threshold = now_timestamp.saturating_sub(self.worker_timeout_s);
 
         let workers_to_check: Vec<(WorkerId, bool, bool)> = {
@@ -3279,11 +3286,10 @@ impl WorkerScheduler for ApiWorkerScheduler {
         }
 
         if worker_ids_to_remove.is_empty() {
-            return Ok(());
+            return result;
         }
 
         let mut inner = self.inner.lock().await;
-        let mut result = Ok(());
 
         for (worker_id, kill_overdue) in &worker_ids_to_remove {
             let err = if *kill_overdue {
