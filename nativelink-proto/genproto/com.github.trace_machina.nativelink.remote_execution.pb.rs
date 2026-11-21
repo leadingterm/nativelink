@@ -24,6 +24,26 @@ pub struct WorkerLoad {
     #[prost(uint64, tag = "1")]
     pub free_memory_kb: u64,
 }
+/// / Cache counters and current capacity for this worker's local cache.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CacheStats {
+    #[prost(uint64, tag = "1")]
+    pub local_read_requests: u64,
+    #[prost(uint64, tag = "2")]
+    pub local_read_bytes: u64,
+    #[prost(uint64, tag = "3")]
+    pub slow_read_requests: u64,
+    #[prost(uint64, tag = "4")]
+    pub slow_read_bytes: u64,
+    #[prost(uint64, tag = "5")]
+    pub evictions: u64,
+    #[prost(uint64, tag = "6")]
+    pub evicted_bytes: u64,
+    #[prost(uint64, tag = "7")]
+    pub size_bytes: u64,
+    #[prost(uint64, tag = "8")]
+    pub budget_bytes: u64,
+}
 /// / Request object for keep alive requests.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KeepAliveRequest {
@@ -36,6 +56,9 @@ pub struct KeepAliveRequest {
     /// / that do not report.
     #[prost(message, optional, tag = "2")]
     pub running_operations: ::core::option::Option<RunningOperations>,
+    /// / Cache stats, absent when the worker cannot report them.
+    #[prost(message, optional, tag = "3")]
+    pub cache_stats: ::core::option::Option<CacheStats>,
 }
 /// / The operations a worker is running, by operation id.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

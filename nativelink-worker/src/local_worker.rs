@@ -449,6 +449,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
     ) -> Result<(), Error> {
         // According to tonic's documentation this call should be cheap and is the same stream.
         let mut grpc_client = self.grpc_client.clone();
+        let running_actions_manager = Arc::clone(&self.running_actions_manager);
         let timeout = self
             .config
             .worker_api_endpoint
@@ -482,6 +483,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 let operation_ids = running_operations.lock().iter().cloned().collect();
                 let request = KeepAliveRequest {
                     load,
+                    cache_stats: running_actions_manager.cache_stats(),
                     running_operations: Some(RunningOperations { operation_ids }),
                 };
                 if let Err(e) = grpc_client.keep_alive(request).await {

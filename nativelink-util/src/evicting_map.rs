@@ -20,6 +20,7 @@ use core::hash::Hash;
 use core::marker::PhantomData;
 use core::ops::RangeBounds;
 use core::pin::Pin;
+use core::sync::atomic::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
@@ -360,8 +361,14 @@ pub struct EvictingMap<
 // debugging helper used mostly to get a snapshot of what eviction threshold might be causing issues
 #[derive(Debug, Copy, Clone)]
 pub struct EvictionSnapshot {
-    max_bytes: u64,
-    current_bytes: u64,
+    /// Configured byte limit; zero means unlimited.
+    pub max_bytes: u64,
+    /// Bytes currently charged to the map.
+    pub current_bytes: u64,
+    /// Number of items removed without replacement.
+    pub evicted_items: u64,
+    /// Bytes removed without replacement.
+    pub evicted_bytes: u64,
     max_items: u64,
     current_items: usize,
     max_seconds: i32,
@@ -557,6 +564,8 @@ where
         EvictionSnapshot {
             max_bytes: self.max_bytes,
             current_bytes: state.sum_store_size,
+            evicted_items: state.evicted_items.counter.load(Ordering::Relaxed),
+            evicted_bytes: state.evicted_bytes.get(),
             max_items: self.max_count,
             current_items: state.lru.len(),
             max_seconds: self.max_seconds,

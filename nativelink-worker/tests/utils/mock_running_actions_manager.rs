@@ -17,7 +17,7 @@ use std::sync::Arc;
 use async_lock::Mutex;
 use nativelink_error::{Error, make_input_err};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ActionResourceUsage, StartExecute,
+    ActionResourceUsage, CacheStats, StartExecute,
 };
 use nativelink_util::action_messages::{ActionResult, OperationId};
 use nativelink_util::common::DigestInfo;
@@ -48,6 +48,7 @@ pub(crate) struct MockRunningActionsManager {
     rx_kill_operation: Mutex<mpsc::UnboundedReceiver<OperationId>>,
     tx_kill_operation: mpsc::UnboundedSender<OperationId>,
     metrics: Arc<Metrics>,
+    pub cache_snapshot: std::sync::Mutex<Option<CacheStats>>,
 }
 
 impl Default for MockRunningActionsManager {
@@ -72,6 +73,7 @@ impl MockRunningActionsManager {
             rx_kill_operation: Mutex::new(rx_kill_operation),
             tx_kill_operation,
             metrics: Arc::new(Metrics::default()),
+            cache_snapshot: std::sync::Mutex::new(None),
         }
     }
 }
@@ -145,6 +147,10 @@ impl MockRunningActionsManager {
 
 impl RunningActionsManager for MockRunningActionsManager {
     type RunningAction = MockRunningAction;
+
+    fn cache_stats(&self) -> Option<CacheStats> {
+        self.cache_snapshot.lock().unwrap().clone()
+    }
 
     async fn create_and_add_action(
         self: &Arc<Self>,

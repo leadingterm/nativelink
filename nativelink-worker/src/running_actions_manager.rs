@@ -53,7 +53,8 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
     Tree as ProtoTree, UpdateActionResultRequest,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ActionResourceUsage, HistoricalExecuteResponse, Reservation, ResourceOutcome, StartExecute,
+    ActionResourceUsage, CacheStats, HistoricalExecuteResponse, Reservation, ResourceOutcome,
+    StartExecute,
 };
 use nativelink_store::ac_utils::{
     ESTIMATED_DIGEST_SIZE, compute_buf_digest, get_and_decode_digest, serialize_and_upload_message,
@@ -1784,7 +1785,7 @@ async fn resolve_plain_files(
     let mut tasks = Vec::with_capacity(files.len());
     for file in files {
         tasks.push(async move {
-            let file_entry = if let Ok(entry) = filesystem_store
+            let file_entry = if let Ok(entry) = cas_store
                 .get_file_entry_for_digest(&file.digest)
                 .await
             {
@@ -1845,7 +1846,7 @@ async fn resolve_exec_files(
     downloads: &Semaphore,
 ) -> Result<Vec<PendingLink>, Error> {
     let digests: Vec<DigestInfo> = files.iter().map(|file| file.digest).collect();
-    let sources = filesystem_store
+    let sources = cas_store
         .get_executable_hardlink_sources(&digests)
         .await;
 
@@ -5322,6 +5323,11 @@ impl RunningAction for RunningActionImpl {
 pub trait RunningActionsManager: Sync + Send + Sized + Unpin + 'static {
     type RunningAction: RunningAction;
 
+    /// Returns a current cache snapshot, or `None` when unavailable.
+    fn cache_stats(&self) -> Option<CacheStats> {
+        None
+    }
+
     fn create_and_add_action(
         self: &Arc<Self>,
         worker_id: String,
@@ -6824,6 +6830,19 @@ async fn disk_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy:
 
 impl RunningActionsManager for RunningActionsManagerImpl {
     type RunningAction = RunningActionImpl;
+
+    fn cache_stats(&self) -> Option<CacheStats> {
+        self.cas_store.cache_stats().map(|stats| CacheStats {
+            local_read_requests: stats.local_read_requests,
+            local_read_bytes: stats.local_read_bytes,
+            slow_read_requests: stats.slow_read_requests,
+            slow_read_bytes: stats.slow_read_bytes,
+            evictions: stats.evictions,
+            evicted_bytes: stats.evicted_bytes,
+            size_bytes: stats.size_bytes,
+            budget_bytes: stats.budget_bytes,
+        })
+    }
 
     async fn create_and_add_action(
         self: &Arc<Self>,

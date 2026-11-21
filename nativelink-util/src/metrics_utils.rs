@@ -261,6 +261,11 @@ impl Counter {
     }
 
     #[inline]
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    #[inline]
     pub fn sub(&self, value: u64) {
         self.0.fetch_sub(value, Ordering::Acquire);
     }

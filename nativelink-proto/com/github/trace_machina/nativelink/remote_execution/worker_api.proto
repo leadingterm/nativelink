@@ -52,6 +52,20 @@ message WorkerLoad {
 
     reserved 2; // NextId.
 }
+/// Cache counters and current capacity for this worker's local cache.
+message CacheStats {
+    uint64 local_read_requests = 1;
+    uint64 local_read_bytes = 2;
+    uint64 slow_read_requests = 3;
+    uint64 slow_read_bytes = 4;
+    uint64 evictions = 5;
+    uint64 evicted_bytes = 6;
+    uint64 size_bytes = 7;
+    uint64 budget_bytes = 8;
+
+    reserved 9; // NextId.
+}
+
 
 /// Request object for keep alive requests.
 message KeepAliveRequest {
@@ -64,7 +78,10 @@ message KeepAliveRequest {
     /// that do not report.
     RunningOperations running_operations = 2;
 
-    reserved 3; // NextId.
+    /// Cache stats, absent when the worker cannot report them.
+    CacheStats cache_stats = 3;
+
+    reserved 4; // NextId.
 }
 
 /// The operations a worker is running, by operation id.

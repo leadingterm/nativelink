@@ -167,6 +167,41 @@ async fn insert_purges_at_max_bytes() -> Result<(), Error> {
 }
 
 #[nativelink_test]
+async fn snapshot_counts_evictions_but_not_replacements() -> Result<(), Error> {
+    let map = EvictingMap::<DigestInfo, DigestInfo, BytesWrapper, MockInstantWrapped>::new(
+        &EvictionPolicy {
+            max_count: 0,
+            max_seconds: 0,
+            max_bytes: 17,
+            evict_bytes: 0,
+        },
+        MockInstantWrapped::default(),
+    );
+    let first = DigestInfo::try_new(HASH1, 0)?;
+    let second = DigestInfo::try_new(HASH2, 0)?;
+    let third = DigestInfo::try_new(HASH3, 0)?;
+    let data = Bytes::from_static(b"12345678");
+
+    let snapshot = map.get_snapshot();
+    assert_eq!((snapshot.max_bytes, snapshot.current_bytes), (17, 0));
+    assert_eq!((snapshot.evicted_items, snapshot.evicted_bytes), (0, 0));
+
+    map.insert(first, data.clone().into()).await;
+    map.insert(second, data.clone().into()).await;
+    map.insert(first, data.clone().into()).await;
+    let snapshot = map.get_snapshot();
+    assert_eq!((snapshot.max_bytes, snapshot.current_bytes), (17, 16));
+    assert_eq!((snapshot.evicted_items, snapshot.evicted_bytes), (0, 0));
+
+    map.insert(third, data.into()).await;
+    let snapshot = map.get_snapshot();
+    assert_eq!((snapshot.max_bytes, snapshot.current_bytes), (17, 16));
+    assert_eq!((snapshot.evicted_items, snapshot.evicted_bytes), (1, 8));
+    assert_eq!(map.size_for_key(&second).await, None);
+    Ok(())
+}
+
+#[nativelink_test]
 async fn size_queries_report_content_len_while_eviction_charges_len() -> Result<(), Error> {
     #[derive(Clone, Debug)]
     struct BlockEntry {
