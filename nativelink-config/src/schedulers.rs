@@ -532,6 +532,22 @@ const fn default_historical_resource_headroom_percent() -> u64 {
     20
 }
 
+const fn default_historical_resource_cpu_reservation_percentile() -> u8 {
+    95
+}
+
+fn deserialize_cpu_reservation_percentile<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let percentile = convert_numeric_with_shellexpand(deserializer)?;
+    if (1..=100).contains(&percentile) {
+        Ok(percentile)
+    } else {
+        Err(serde::de::Error::custom("CPU reservation percentile must be between 1 and 100"))
+    }
+}
+
 const fn default_historical_resource_window_days() -> u64 {
     7
 }
@@ -751,14 +767,22 @@ pub struct HistoricalResourceSpec {
     )]
     pub refresh_interval_s: u64,
 
-    /// Headroom over the measured 95th percentile, as a share of it: 20
-    /// reserves 20% more than was measured.
+    /// Headroom over the selected CPU percentile and memory and disk p95,
+    /// as a share of each measurement: 20 reserves 20% more.
     /// Default: 20
     #[serde(
         default = "default_historical_resource_headroom_percent",
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub headroom_percent: u64,
+
+    /// Percentile of attempt-average CPU used for learned reservations.
+    /// Must be an integer from 1 through 100. Default: 95.
+    #[serde(
+        default = "default_historical_resource_cpu_reservation_percentile",
+        deserialize_with = "deserialize_cpu_reservation_percentile"
+    )]
+    pub cpu_reservation_percentile: u8,
 
     /// A key not measured for this many days is forgotten. Within the
     /// window, two half-window histograms retain each sample for between

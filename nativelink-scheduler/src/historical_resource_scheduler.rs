@@ -441,6 +441,7 @@ impl HistoricalResourceScheduler {
         ResourceSketch::new(
             Policy {
                 headroom_percent: spec.headroom_percent,
+                cpu_reservation_percentile: spec.cpu_reservation_percentile,
                 classes: spec.classes.clone(),
                 reserve_cpu: reserved.cpu,
                 reserve_memory: reserved.memory,

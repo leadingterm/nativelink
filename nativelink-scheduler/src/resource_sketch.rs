@@ -187,6 +187,12 @@ impl Hist {
 
     /// The same over the samples of `self` and `other` together.
     pub fn p95_upper_with(&self, other: &Self) -> u64 {
+        self.percentile_upper_with(other, 95)
+    }
+
+    /// Upper bound of the selected percentile bucket across both histograms.
+    /// The percentile must be in 1..=100.
+    pub fn percentile_upper_with(&self, other: &Self, percentile: u8) -> u64 {
         let total: u128 = self
             .0
             .iter()
@@ -196,7 +202,7 @@ impl Hist {
         if total == 0 {
             return 0;
         }
-        let target = (total * 95).div_ceil(100);
+        let target = (total * u128::from(percentile)).div_ceil(100);
         let mut seen = 0u128;
         for (i, (&a, &b)) in self.0.iter().zip(other.0.iter()).enumerate() {
             seen += u128::from(a) + u128::from(b);
@@ -284,6 +290,7 @@ impl Shaped {
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub headroom_percent: u64,
+    pub cpu_reservation_percentile: u8,
     pub classes: Vec<SizeClassSpec>,
     /// Which dimensions the fleet reserves: a number on one it does not
     /// would be a minimum no worker advertises.
@@ -927,10 +934,8 @@ impl Entry {
     }
 }
 
-/// The p95 bucket's upper bound, capped by the exact maximum: an entry with
-/// one sample reserves what that sample used, one with a thousand less than
-/// twice the true p95 and never less than it.
-const fn p95_capped(upper: u64, max: u64) -> u64 {
+/// The percentile bucket's upper bound, capped by the exact maximum.
+const fn percentile_capped(upper: u64, max: u64) -> u64 {
     if max == 0 {
         return 0;
     }
@@ -975,19 +980,23 @@ fn smallest_dominating_class(
 fn shape(policy: &Policy, entry: &Entry) -> Shaped {
     let headroom = policy.headroom_percent;
     let mut memory_kb = with_headroom(
-        p95_capped(entry.memory_p95_upper(), entry.max_memory_kb()),
+        percentile_capped(entry.memory_p95_upper(), entry.max_memory_kb()),
         headroom,
     );
     memory_kb = memory_kb.max(with_headroom(entry.killed_peak_memory_kb, headroom));
-    // A CPU p95 of zero is an action that used no measurable CPU or a
-    // worker that reported none; neither keeps the action off a small
-    // class, so no CPU need is stated and the class goes by memory.
+    // A zero or missing CPU measurement must not impose a CPU minimum.
     let mut cpu = with_headroom(
-        p95_capped(entry.cpu_p95_upper(), entry.max_cpu_millicores()),
+        percentile_capped(
+            entry.current.cpu.percentile_upper_with(
+                &entry.previous.cpu,
+                policy.cpu_reservation_percentile,
+            ),
+            entry.max_cpu_millicores(),
+        ),
         headroom,
     );
     let mut disk_kb = with_headroom(
-        p95_capped(entry.disk_p95_upper(), entry.max_disk_kb()),
+        percentile_capped(entry.disk_p95_upper(), entry.max_disk_kb()),
         headroom,
     );
     disk_kb = disk_kb.max(with_headroom(entry.killed_peak_disk_kb, headroom));

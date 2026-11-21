@@ -79,6 +79,7 @@ fn base_spec(hints_file: String, cold_start: Option<ColdStartSpec>) -> Historica
         learn_from_workers: true,
         // No headroom, so a seeded number comes back as stated.
         headroom_percent: 0,
+        cpu_reservation_percentile: 95,
         window_days: 7,
         memory_budget_bytes: 16 << 20,
         snapshot_store: None,
@@ -823,12 +824,42 @@ fn existing_configuration_does_not_enable_learning() {
     }))
     .unwrap();
     assert!(!spec.learn_from_workers);
+    assert_eq!(spec.cpu_reservation_percentile, 95);
     assert_eq!(spec.refresh_interval_s, 30);
     let empty = HistoricalResourceScheduler::sketch_from_spec(&spec);
     assert!(
         empty.charged_bytes() < 1 << 20,
         "static mode must not preallocate the learned cache"
     );
+}
+
+#[test]
+fn cpu_reservation_percentile_is_validated_and_forwarded() {
+    for percentile in [1, 50, 95, 100] {
+        let spec: HistoricalResourceSpec = serde_json::from_value(serde_json::json!({
+            "cpu_reservation_percentile": percentile,
+            "scheduler": {"simple": {}}
+        }))
+        .unwrap();
+        assert_eq!(spec.cpu_reservation_percentile, percentile);
+        assert_eq!(
+            HistoricalResourceScheduler::sketch_from_spec(&spec).policy().cpu_reservation_percentile,
+            percentile
+        );
+    }
+    for value in [
+        serde_json::json!(0),
+        serde_json::json!(101),
+        serde_json::json!(-1),
+        serde_json::json!(256),
+        serde_json::json!(1.5),
+    ] {
+        let result = serde_json::from_value::<HistoricalResourceSpec>(serde_json::json!({
+            "cpu_reservation_percentile": value,
+            "scheduler": {"simple": {}}
+        }));
+        assert!(result.is_err());
+    }
 }
 
 #[nativelink_test]

@@ -33,6 +33,7 @@ fn class(name: &str, cpu_count: u64, memory_kb: u64, disk_kb: u64) -> SizeClassS
 const fn policy(headroom_percent: u64, classes: Vec<SizeClassSpec>) -> Policy {
     Policy {
         headroom_percent,
+        cpu_reservation_percentile: 95,
         classes,
         reserve_cpu: true,
         reserve_memory: true,
@@ -116,6 +117,89 @@ fn p95_is_the_upper_bound_of_the_95th_samples_bucket() {
     assert_eq!(hist.p95_upper(), 2000);
     hist.add(100_000);
     assert_eq!(hist.p95_upper(), 128_000, "the 96th of 101 is large");
+}
+
+#[test]
+fn cpu_percentile_uses_both_windows_and_preserves_other_dimensions() {
+    let mut median_policy = policy(0, vec![]);
+    median_policy.cpu_reservation_percentile = 50;
+    let median = sketch(median_policy, small_budget());
+    let p95 = sketch(policy(0, vec![]), small_budget());
+    let mut max_policy = policy(0, vec![]);
+    max_policy.cpu_reservation_percentile = 100;
+    let maximum = sketch(max_policy, small_budget());
+    let key = target("//bursty", "X");
+    let half_window = 7 * 86_400 / 2;
+    for i in 0..20 {
+        let observation = Observation {
+            cpu_millicores: Some(if i < 18 { 1000 } else { 12_000 }),
+            peak_memory_kb: if i < 18 { 1000 } else { 12_000 },
+            peak_disk_kb: if i < 18 { 1000 } else { 12_000 },
+            killed_peak_memory_kb: (i == 19).then_some(15_000),
+            killed_peak_disk_kb: (i == 19).then_some(17_000),
+            killed: i == 19,
+            now_s: if i < 10 { half_window - 1 } else { half_window },
+        };
+        median.observe(key.clone(), &observation);
+        p95.observe(key.clone(), &observation);
+        maximum.observe(key.clone(), &observation);
+    }
+    let entry = median.lookup(&key, half_window).unwrap();
+    assert!(entry.previous.cpu.total() > 0);
+    assert!(entry.current.cpu.total() > 0);
+    let shaped = median.shape(&entry);
+    assert_eq!(shaped.cpu_count, 2000);
+    assert_eq!(shaped.memory_kb, 15_000);
+    assert_eq!(shaped.disk_kb, 17_000);
+    assert_eq!(p95.shape(&entry).cpu_count, 12_000);
+    assert_eq!(maximum.shape(&entry).cpu_count, 12_000);
+    assert_eq!(p95.shape(&entry).memory_kb, shaped.memory_kb);
+    assert_eq!(maximum.shape(&entry).disk_kb, shaped.disk_kb);
+}
+
+#[test]
+fn cpu_percentile_caps_steady_samples_and_handles_zero_and_missing() {
+    let mut configured = policy(20, vec![]);
+    configured.cpu_reservation_percentile = 50;
+    let sketch = sketch(configured, small_budget());
+    for (name, cpu, expected) in [
+        ("//steady", Some(1500), 1800),
+        ("//zero", Some(0), 0),
+        ("//missing", None, 0),
+    ] {
+        let key = target(name, "X");
+        sketch.observe(key.clone(), &Observation {
+            cpu_millicores: cpu,
+            peak_memory_kb: 1000,
+            now_s: NOW,
+            ..Observation::default()
+        });
+        assert_eq!(sketch.shape(&sketch.lookup(&key, NOW).unwrap()).cpu_count, expected);
+    }
+}
+
+#[test]
+fn snapshot_reinterprets_cpu_percentile_without_changing_snapshot() {
+    let mut median_policy = policy(0, vec![]);
+    median_policy.cpu_reservation_percentile = 50;
+    let median = sketch(median_policy, small_budget());
+    let key = target("//snapshot", "X");
+    for i in 0..20 {
+        median.observe(key.clone(), &Observation {
+            cpu_millicores: Some(if i < 18 { 1000 } else { 12_000 }),
+            now_s: NOW,
+            ..Observation::default()
+        });
+    }
+    let bytes = median.encode_snapshot(NOW);
+    let restored = sketch(policy(0, vec![]), small_budget());
+    restored.load(Snapshot::decode(&bytes, usize::MAX).unwrap(), NOW).unwrap();
+    let original = median.lookup(&key, NOW).unwrap();
+    let loaded = restored.lookup(&key, NOW).unwrap();
+    assert_eq!(original, loaded);
+    assert_eq!(median.shape(&original).cpu_count, 2000);
+    assert_eq!(restored.shape(&loaded).cpu_count, 12_000);
+    assert_eq!(restored.encode_snapshot(NOW), bytes);
 }
 
 /// One sample reserves exactly what it used, plus headroom; the bucket's
