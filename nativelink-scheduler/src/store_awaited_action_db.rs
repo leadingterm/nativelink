@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
+use nativelink_config::schedulers::ResourceCapacity;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::action_messages::{
@@ -583,6 +584,8 @@ impl SchedulerStoreDataProvider for UpdateClientKeepalive<'_> {
 struct FleetCapabilities {
     scheduler_id: String,
     workers: Vec<PlatformProperties>,
+    #[serde(default)]
+    resource_capacities: Option<Arc<[ResourceCapacity]>>,
 }
 
 struct UpdateFleetCapabilities(FleetCapabilities);
@@ -1251,15 +1254,16 @@ where
 
     async fn exchange_fleet_capabilities(
         &self,
-        scheduler_id: &str,
-        local: Vec<PlatformProperties>,
+        local: PeerScheduler,
         ttl: Duration,
     ) -> Result<Vec<PeerScheduler>, Error> {
+        let scheduler_id = local.scheduler_id.clone();
         self.store
             .update_data(
                 UpdateFleetCapabilities(FleetCapabilities {
-                    scheduler_id: scheduler_id.to_string(),
-                    workers: local,
+                    scheduler_id: local.scheduler_id,
+                    workers: local.workers,
+                    resource_capacities: local.resource_capacities,
                 }),
                 Some(ttl),
             )
@@ -1279,6 +1283,7 @@ where
                 peers.push(PeerScheduler {
                     scheduler_id: record.scheduler_id,
                     workers: record.workers,
+                    resource_capacities: record.resource_capacities,
                 });
                 Ok(peers)
             })

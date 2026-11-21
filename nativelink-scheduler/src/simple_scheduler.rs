@@ -37,7 +37,7 @@ use nativelink_util::metrics::{
 };
 use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, MatchingEngineStateManager,
-    OperationFilter, OperationStageFlags, OrderDirection, UpdateOperationType,
+    OperationFilter, OperationStageFlags, OrderDirection, QueuedMemoryRefit, UpdateOperationType,
 };
 use nativelink_util::origin_event::{OriginMetadata, get_node_id};
 use nativelink_util::platform_properties::PlatformProperties;
@@ -58,6 +58,7 @@ use crate::api_worker_scheduler::{ApiWorkerScheduler, QueuedAction};
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION, PeerScheduler};
 use crate::known_platform_property_provider::KnownPlatformPropertyProvider;
 use crate::match_outcome::{MatchOutcome, PropertyShape, UnsatisfiableReason};
+use crate::memory_capacity::apply_memory_fit;
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::resource_sketch::ResourceSketch;
 use crate::simple_scheduler_state_manager::{
@@ -66,7 +67,7 @@ use crate::simple_scheduler_state_manager::{
 use crate::unsatisfiable_tracker::UnsatisfiableTracker;
 use crate::worker::{ActionInfoWithProps, Worker, WorkerTimestamp};
 use crate::worker_registry::WorkerRegistry;
-use crate::worker_scheduler::{WorkerScheduler, WorkerSummary};
+use crate::worker_scheduler::{ResourceCapacitySnapshot, WorkerScheduler, WorkerSummary};
 
 /// Default timeout for workers in seconds: four default keepalive intervals
 /// (2.5s each). The old value of two meant one late keepalive under load
@@ -361,8 +362,18 @@ impl SimpleScheduler {
     async fn inner_add_action(
         &self,
         client_operation_id: OperationId,
-        action_info: Arc<ActionInfo>,
+        mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
+        // Fit before the state manager compiles properties or persists the
+        // operation. The steady-state submission still performs one write.
+        if let Some((fit, policy)) = self.worker_scheduler.memory_fit(&action_info).await? {
+            apply_memory_fit(
+                Arc::make_mut(&mut action_info),
+                &policy.memory.property,
+                &policy.cpu_property,
+                fit,
+            );
+        }
         let action_state_result = self
             .client_state_manager
             .add_action(client_operation_id.clone(), action_info)
@@ -412,6 +423,7 @@ impl SimpleScheduler {
         self.set_peer_schedulers_for_test(vec![PeerScheduler {
             scheduler_id: "peer".to_string(),
             workers: peer_fleet,
+            resource_capacities: None,
         }])
         .await;
     }
@@ -592,6 +604,72 @@ impl SimpleScheduler {
             action_info: ActionInfoWithProps,
         }
 
+        /// Refit only dirty opted-in actions. A CAS conflict returns current
+        /// intent (possibly an OOM escalation), never permission to replay an
+        /// old fit over it.
+        async fn refit_action(
+            action_state_result: &dyn ActionStateResult,
+            mut info: Arc<ActionInfo>,
+            workers: &ApiWorkerScheduler,
+            state_manager: &dyn MatchingEngineStateManager,
+        ) -> Result<Option<Arc<ActionInfo>>, Error> {
+            loop {
+                let fit = workers.memory_fit(&info).await;
+                let (fit, policy) = match fit {
+                    Ok(None) => return Ok(Some(info)),
+                    Ok(Some(fit)) => fit,
+                    Err(err) => {
+                        let (state, _) = action_state_result.as_state().await?;
+                        state_manager
+                            .fail_queued_operation(&state.client_operation_id, err)
+                            .await?;
+                        return Ok(None);
+                    }
+                };
+                let (state, _) = action_state_result.as_state().await?;
+                match state_manager
+                    .refit_queued_memory(
+                        &state.client_operation_id,
+                        &info,
+                        &policy.memory.property,
+                        &policy.cpu_property,
+                        fit,
+                    )
+                    .await?
+                {
+                    QueuedMemoryRefit::Updated(current) | QueuedMemoryRefit::Stale(current) => {
+                        info = current;
+                    }
+                    QueuedMemoryRefit::NotQueued => return Ok(None),
+                }
+            }
+        }
+
+        async fn refresh_loaded(
+            loaded: &mut Loaded,
+            scheduler: &SimpleScheduler,
+        ) -> Result<bool, Error> {
+            let Some(current) = refit_action(
+                loaded.action_state_result.as_ref(),
+                loaded.action_info.inner.clone(),
+                scheduler.worker_scheduler.as_ref(),
+                scheduler.matching_engine_state_manager.as_ref(),
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            if !Arc::ptr_eq(&current, &loaded.action_info.inner) {
+                loaded.action_info.platform_properties = typed_properties_for(
+                    &scheduler.typed_properties,
+                    scheduler.platform_property_manager.as_ref(),
+                    &current.platform_properties,
+                )?;
+                loaded.action_info.inner = current;
+            }
+            Ok(true)
+        }
+
         /// Reads what matching needs of a listed action. `None` when the
         /// record cannot be read: gone from the store (eviction), or
         /// unreadable. Counted so an operator can see the store losing
@@ -600,8 +678,7 @@ impl SimpleScheduler {
         /// ten times a second until the entry went away.
         async fn load_action(
             action_state_result: Box<dyn ActionStateResult>,
-            platform_property_manager: &PlatformPropertyManager,
-            typed_properties: &Mutex<HashMap<u64, PlatformProperties>>,
+            scheduler: &SimpleScheduler,
         ) -> Result<Option<Loaded>, Error> {
             let (action_info, maybe_origin_metadata) =
                 match action_state_result.as_action_info().await {
@@ -629,10 +706,20 @@ impl SimpleScheduler {
                         );
                     }
                 };
+            let Some(action_info) = refit_action(
+                action_state_result.as_ref(),
+                action_info,
+                scheduler.worker_scheduler.as_ref(),
+                scheduler.matching_engine_state_manager.as_ref(),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
 
             let platform_properties = typed_properties_for(
-                typed_properties,
-                platform_property_manager,
+                &scheduler.typed_properties,
+                scheduler.platform_property_manager.as_ref(),
                 &action_info.platform_properties,
             )
             .err_tip(|| "Failed to make platform properties in SimpleScheduler::do_try_match")?;
@@ -801,6 +888,7 @@ impl SimpleScheduler {
         #[expect(clippy::too_many_arguments)]
         async fn place_parked(
             parked: &mut Parked,
+            scheduler: &SimpleScheduler,
             placement: &mut Placement,
             contended: &mut HashSet<PropertyShape>,
             workers: &ApiWorkerScheduler,
@@ -813,7 +901,18 @@ impl SimpleScheduler {
             let mut result = Ok(());
             let mut blocked: HashSet<PropertyShape> = HashSet::new();
             let mut still_parked = VecDeque::with_capacity(parked.queue.len());
-            while let Some((shape, loaded)) = parked.queue.pop_front() {
+            while let Some((_, mut loaded)) = parked.queue.pop_front() {
+                match refresh_loaded(&mut loaded, scheduler).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(err) => {
+                        result = result.merge(Err(err));
+                        continue;
+                    }
+                }
+                // Neither cached shape decisions nor reservation holds may
+                // use the shape from before a capacity-driven refit.
+                let shape = PropertyShape::from(&loaded.action_info.platform_properties);
                 if blocked.contains(&shape) || contended.contains(&shape) {
                     still_parked.push_back((shape, loaded));
                     continue;
@@ -926,13 +1025,7 @@ impl SimpleScheduler {
         let mut queued_ages = AgeBuckets::default();
         'actions: while let Some(action_state_result) = stream.next().await {
             queued_seen += 1;
-            let loaded = match load_action(
-                action_state_result,
-                self.platform_property_manager.as_ref(),
-                &self.typed_properties,
-            )
-            .await
-            {
+            let mut loaded = match load_action(action_state_result, self).await {
                 Ok(Some(loaded)) => loaded,
                 Ok(None) => continue,
                 Err(err) => {
@@ -949,16 +1042,25 @@ impl SimpleScheduler {
                 oldest_queued.sort_unstable_by_key(|action| action.insert_timestamp);
                 oldest_queued.truncate(5);
             }
-            let shape = PropertyShape::from(&loaded.action_info.platform_properties);
-            if contended.contains(&shape) {
-                continue;
-            }
+            let mut shape;
 
             // Room that opened since the pass last placed anything belongs
             // to the oldest action still waiting, not to this one, which is
             // newer than everything parked. The generation is read under the
             // placement lock, so a change cannot slip between the two.
             let outcome = loop {
+                match refresh_loaded(&mut loaded, self).await {
+                    Ok(true) => {}
+                    Ok(false) => continue 'actions,
+                    Err(err) => {
+                        result = result.merge(Err(err));
+                        continue 'actions;
+                    }
+                }
+                shape = PropertyShape::from(&loaded.action_info.platform_properties);
+                if contended.contains(&shape) {
+                    continue 'actions;
+                }
                 let (outcome, generation) = workers
                     .find_worker_for_action_observed(
                         &loaded.action_info.platform_properties,
@@ -970,6 +1072,24 @@ impl SimpleScheduler {
                         }),
                     )
                     .await;
+                if matches!(
+                    &outcome,
+                    MatchOutcome::Unsatisfiable(_) | MatchOutcome::NoWorkersConnected
+                ) {
+                    // Observations can arrive while matching awaited its
+                    // placement lock. Do not start/finalize a shape deadline
+                    // from the verdict for a superseded memory reservation.
+                    let previous = loaded.action_info.inner.clone();
+                    match refresh_loaded(&mut loaded, self).await {
+                        Ok(true) if Arc::ptr_eq(&previous, &loaded.action_info.inner) => {}
+                        Ok(true) => continue,
+                        Ok(false) => continue 'actions,
+                        Err(err) => {
+                            result = result.merge(Err(err));
+                            continue 'actions;
+                        }
+                    }
+                }
                 if generation == capacity_seen || parked.is_empty() {
                     capacity_seen = generation;
                     break outcome;
@@ -978,6 +1098,7 @@ impl SimpleScheduler {
                 result = result.merge(
                     place_parked(
                         &mut parked,
+                        self,
                         &mut placement,
                         &mut contended,
                         workers,
@@ -1058,6 +1179,7 @@ impl SimpleScheduler {
             result = result.merge(
                 place_parked(
                     &mut parked,
+                    self,
                     &mut placement,
                     &mut contended,
                     workers,
@@ -1450,9 +1572,15 @@ impl SimpleScheduler {
                     else {
                         return;
                     };
-                    let local = worker_scheduler.fleet_shapes().await;
+                    let local = PeerScheduler {
+                        scheduler_id: scheduler_id.clone(),
+                        workers: worker_scheduler.fleet_shapes().await,
+                        resource_capacities: worker_scheduler
+                            .resource_capacity_updates()
+                            .map(|updates| updates.borrow().capacities.clone()),
+                    };
                     match state_manager
-                        .exchange_fleet_capabilities(&scheduler_id, local, record_ttl)
+                        .exchange_fleet_capabilities(local, record_ttl)
                         .await
                     {
                         Ok(peer_fleet) => {
@@ -1648,6 +1776,12 @@ impl KnownPlatformPropertyProvider for SimpleScheduler {
 impl WorkerScheduler for SimpleScheduler {
     fn get_platform_property_manager(&self) -> &PlatformPropertyManager {
         self.worker_scheduler.get_platform_property_manager()
+    }
+
+    fn resource_capacity_updates(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Arc<ResourceCapacitySnapshot>>> {
+        self.worker_scheduler.resource_capacity_updates()
     }
 
     async fn add_worker(&self, worker: Worker) -> Result<(), Error> {

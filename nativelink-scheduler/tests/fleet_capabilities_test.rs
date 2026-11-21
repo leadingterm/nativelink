@@ -54,6 +54,14 @@ fn shape(gpu_count: u64) -> PlatformProperties {
     )]))
 }
 
+fn peer(scheduler_id: &str, workers: Vec<PlatformProperties>) -> PeerScheduler {
+    PeerScheduler {
+        scheduler_id: scheduler_id.to_string(),
+        workers,
+        resource_capacities: None,
+    }
+}
+
 async fn make_db(
     fake_redis_backend: &FakeRedisBackend<RedisSubscriptionManager>,
     port: u16,
@@ -86,29 +94,31 @@ async fn schedulers_see_each_others_fleet_but_not_their_own() -> Result<(), Erro
 
     // Nobody else has published yet.
     let peers = db_a
-        .exchange_fleet_capabilities("a", vec![shape(0)], TTL)
+        .exchange_fleet_capabilities(peer("a", vec![shape(0)]), TTL)
         .await?;
     assert_eq!(peers, Vec::<PeerScheduler>::new());
 
     let peers = db_b
-        .exchange_fleet_capabilities("b", vec![shape(1), shape(2)], TTL)
+        .exchange_fleet_capabilities(peer("b", vec![shape(1), shape(2)]), TTL)
         .await?;
     assert_eq!(
         peers,
         vec![PeerScheduler {
             scheduler_id: "a".to_string(),
             workers: vec![shape(0)],
+            resource_capacities: None,
         }]
     );
 
     let peers = db_a
-        .exchange_fleet_capabilities("a", vec![shape(0)], TTL)
+        .exchange_fleet_capabilities(peer("a", vec![shape(0)]), TTL)
         .await?;
     assert_eq!(
         peers,
         vec![PeerScheduler {
             scheduler_id: "b".to_string(),
             workers: vec![shape(1), shape(2)],
+            resource_capacities: None,
         }]
     );
 
@@ -126,16 +136,20 @@ async fn republishing_replaces_the_previous_record() -> Result<(), Error> {
     let db_a = make_db(&fake_redis_backend, port).await?;
     let db_b = make_db(&fake_redis_backend, port).await?;
 
-    db_b.exchange_fleet_capabilities("b", vec![shape(1)], TTL)
+    db_b.exchange_fleet_capabilities(peer("b", vec![shape(1)]), TTL)
         .await?;
-    db_b.exchange_fleet_capabilities("b", vec![], TTL).await?;
+    db_b.exchange_fleet_capabilities(peer("b", vec![]), TTL)
+        .await?;
 
-    let peers = db_a.exchange_fleet_capabilities("a", vec![], TTL).await?;
+    let peers = db_a
+        .exchange_fleet_capabilities(peer("a", vec![]), TTL)
+        .await?;
     assert_eq!(
         peers,
         vec![PeerScheduler {
             scheduler_id: "b".to_string(),
             workers: vec![],
+            resource_capacities: None,
         }],
         "the peer is still there, with no workers"
     );

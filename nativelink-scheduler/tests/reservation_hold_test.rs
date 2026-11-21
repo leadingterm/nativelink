@@ -844,6 +844,7 @@ async fn replicas_take_turns_holding() -> Result<(), Error> {
         .set_peer_schedulers_for_test(vec![PeerScheduler {
             scheduler_id: "peer".to_string(),
             workers: vec![shape(LARGE_KB - 1)],
+            resource_capacities: None,
         }])
         .await;
     let (_, _, large) =
@@ -861,6 +862,7 @@ async fn replicas_take_turns_holding() -> Result<(), Error> {
         .set_peer_schedulers_for_test(vec![PeerScheduler {
             scheduler_id: "peer".to_string(),
             workers: vec![shape(WORKER_KB)],
+            resource_capacities: None,
         }])
         .await;
     // The existing hold stands; a fresh one goes by the owner. Expire it

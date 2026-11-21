@@ -292,11 +292,21 @@ impl Display for ActionUniqueKey {
     }
 }
 
-/// Information needed to execute an action. This struct is used over bazel's proto `Action`
-/// for simplicity and offers a `salt`, which is useful to ensure during hashing (for dicts)
-/// to ensure we never match against another `ActionInfo` (when a task should never be cached).
-/// This struct must be 100% compatible with `ExecuteRequest` struct in `remote_execution.proto`
-/// except for the salt field.
+/// Original reservation intent and the observed capacity revision used to fit it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MemoryReservation {
+    /// Explicit minimum memory in KiB, if supplied.
+    pub minimum_kb: Option<u64>,
+    /// Desired memory in KiB before fitting, if supplied.
+    pub desired_kb: Option<u64>,
+    /// CPU reservation before memory fitting, if supplied.
+    pub cpu_before_memory_fit: Option<u64>,
+    /// Capacity snapshot used for the current fit, if any.
+    pub fitted_revision: Option<Uuid>,
+}
+
+/// Information needed to execute an action, including scheduler-owned
+/// execution metadata in addition to the remote execution request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, MetricsComponent)]
 pub struct ActionInfo {
     /// Digest of the underlying `Command`.
@@ -311,6 +321,9 @@ pub struct ActionInfo {
     /// The properties rules that must be applied when finding a worker that can run this action.
     #[metric(group = "platform_properties")]
     pub platform_properties: HashMap<String, String>,
+    /// Controller-owned memory fitting intent; absent for ordinary actions.
+    #[serde(default)]
+    pub memory_reservation: Option<MemoryReservation>,
     /// The priority of the action. Higher value means it should execute faster.
     #[metric(help = "The priority of the action. Higher value means it should execute faster.")]
     pub priority: i32,
@@ -367,6 +380,7 @@ impl ActionInfo {
         }
 
         Ok(Self {
+            memory_reservation: None,
             command_digest: action
                 .command_digest
                 .err_tip(|| "Expected command_digest to exist on Action")?

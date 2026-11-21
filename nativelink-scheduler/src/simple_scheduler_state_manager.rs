@@ -37,7 +37,8 @@ use nativelink_util::metrics::{
 };
 use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, MatchingEngineStateManager,
-    OperationFilter, OperationStageFlags, OrderDirection, UpdateOperationType, WorkerStateManager,
+    OperationFilter, OperationStageFlags, OrderDirection, QueuedMemoryFit, QueuedMemoryRefit,
+    UpdateOperationType, WorkerStateManager,
 };
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::platform_properties::PlatformProperties;
@@ -809,13 +810,10 @@ where
     /// See `AwaitedActionDb::exchange_fleet_capabilities`.
     pub async fn exchange_fleet_capabilities(
         &self,
-        scheduler_id: &str,
-        local: Vec<PlatformProperties>,
+        local: PeerScheduler,
         ttl: Duration,
     ) -> Result<Vec<PeerScheduler>, Error> {
-        self.action_db
-            .exchange_fleet_capabilities(scheduler_id, local, ttl)
-            .await
+        self.action_db.exchange_fleet_capabilities(local, ttl).await
     }
 
     async fn inner_fail_queued_operation(
@@ -1455,6 +1453,12 @@ where
                                 .platform_properties
                                 .insert(cpu_property.clone(), cpu_value.to_string());
                         }
+                        if escalation.resource == "memory" {
+                            if let Some(reservation) = &mut action_info.memory_reservation {
+                                reservation.desired_kb = Some(escalation.value);
+                                reservation.fitted_revision = None;
+                            }
+                        }
                         awaited_action.set_action_info(Arc::new(action_info));
                         is_retry = true;
                         ActionStage::Queued
@@ -1842,6 +1846,48 @@ where
     I: InstantWrapper,
     NowFn: Fn() -> I + Clone + Send + Unpin + Sync + 'static,
 {
+    async fn refit_queued_memory(
+        &self,
+        operation_id: &OperationId,
+        expected: &ActionInfo,
+        memory_property: &str,
+        cpu_property: &str,
+        fit: QueuedMemoryFit,
+    ) -> Result<QueuedMemoryRefit, Error> {
+        let Some(subscriber) = self.action_db.get_by_operation_id(operation_id).await? else {
+            return Ok(QueuedMemoryRefit::NotQueued);
+        };
+        for attempt in 1..=MAX_UPDATE_RETRIES {
+            if attempt > 1 {
+                tokio::time::sleep(version_conflict_backoff(attempt)).await;
+            }
+            let mut current = match subscriber.borrow().await {
+                Ok(current) => current,
+                Err(err) if err.code == Code::NotFound => return Ok(QueuedMemoryRefit::NotQueued),
+                Err(err) => return Err(err),
+            };
+            if !matches!(current.state().stage, ActionStage::Queued) {
+                return Ok(QueuedMemoryRefit::NotQueued);
+            }
+            if current.action_info().as_ref() != expected {
+                return Ok(QueuedMemoryRefit::Stale(current.action_info().clone()));
+            }
+            // Mutate only the fit on the current version. In particular, do
+            // not reconstruct the record and lose retry counters or clocks.
+            current.refit_memory(memory_property, cpu_property, fit.clone());
+            let updated = current.action_info().clone();
+            match self.action_db.update_awaited_action(current).await {
+                Ok(()) => return Ok(QueuedMemoryRefit::Updated(updated)),
+                Err(err) if err.code == Code::Aborted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Err(make_err!(
+            Code::Aborted,
+            "Queued memory refit repeatedly conflicted for operation {operation_id}"
+        ))
+    }
+
     async fn filter_operations<'a>(
         &'a self,
         filter: OperationFilter,
@@ -1879,5 +1925,212 @@ where
         err: Error,
     ) -> Result<bool, Error> {
         self.inner_fail_queued_operation(operation_id, err).await
+    }
+}
+
+#[cfg(test)]
+mod queued_memory_refit_tests {
+    use mock_instant::thread_local::MockClock;
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::action_messages::{
+        ActionUniqueKey, ActionUniqueQualifier, MemoryReservation,
+    };
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::instant_wrapper::MockInstantWrapped;
+    use tokio::sync::Notify;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::default_scheduler_factory::memory_awaited_action_db_factory;
+
+    #[nativelink_test]
+    async fn queued_refit_preserves_record_and_rejects_escalated_or_executing_state()
+    -> Result<(), Error> {
+        MockClock::set_time(Duration::from_secs(10_000));
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000);
+        let notify = Arc::new(Notify::new());
+        let manager = SimpleSchedulerStateManager::new(
+            3,
+            Duration::from_secs(10),
+            Duration::from_secs(300),
+            Duration::from_secs(15),
+            memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
+            MockInstantWrapped::default,
+            None,
+        );
+        let digest = DigestInfo::zero_digest();
+        let info = Arc::new(ActionInfo {
+            memory_reservation: Some(MemoryReservation {
+                minimum_kb: Some(0),
+                desired_kb: Some(200),
+                cpu_before_memory_fit: None,
+                fitted_revision: None,
+            }),
+            command_digest: digest,
+            input_root_digest: digest,
+            timeout: Duration::from_secs(60),
+            platform_properties: HashMap::from([
+                ("memory_kb".to_string(), "200".to_string()),
+                ("unrelated".to_string(), "retained".to_string()),
+            ]),
+            priority: 7,
+            load_timestamp: started + Duration::from_secs(1),
+            insert_timestamp: started,
+            unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+                execution_scope: None,
+                instance_name: "refit".to_string(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest,
+            }),
+        });
+        let subscriber = manager
+            .action_db
+            .add_action(
+                OperationId::default(),
+                info.clone(),
+                Duration::from_secs(10),
+            )
+            .await?;
+        let mut record = subscriber.borrow().await?;
+        let operation_id = record.operation_id().clone();
+        record.attempts = 2;
+        record.worker_losses = 3;
+        record.store_losses = 4;
+        record.memory_escalations = 5;
+        record.disk_escalations = 6;
+        record.update_client_keep_alive(started + Duration::from_secs(20));
+        record.worker_keep_alive(started + Duration::from_secs(10));
+        manager.action_db.update_awaited_action(record).await?;
+        let before = subscriber.borrow().await?;
+        let fit = QueuedMemoryFit {
+            memory_kb: Some(150),
+            cpu: Some(8),
+            revision: Uuid::new_v4(),
+        };
+        let QueuedMemoryRefit::Updated(updated) = manager
+            .refit_queued_memory(&operation_id, &info, "memory_kb", "cpu_count", fit.clone())
+            .await?
+        else {
+            panic!("unchanged queued action must accept a fit");
+        };
+        let persisted = subscriber.borrow().await?;
+        assert_eq!(persisted.action_info(), &updated);
+        assert_eq!(updated.platform_properties["memory_kb"], "150");
+        assert_eq!(updated.platform_properties["cpu_count"], "8");
+        let mut expected_metadata = info.memory_reservation.clone().unwrap();
+        expected_metadata.fitted_revision = Some(fit.revision);
+        assert_eq!(
+            updated.memory_reservation.as_ref(),
+            Some(&expected_metadata)
+        );
+        // Compare every other persisted field, including all clocks, state,
+        // sort key, operation id, retry counters and escalation counters.
+        let mut before_fields = serde_json::to_value(&before).unwrap();
+        let mut after_fields = serde_json::to_value(&persisted).unwrap();
+        for fields in [&mut before_fields, &mut after_fields] {
+            let fields = fields.as_object_mut().unwrap();
+            fields.remove("version");
+            fields.remove("action_info");
+        }
+        assert_eq!(before_fields, after_fields);
+        assert_eq!(updated.priority, info.priority);
+        assert_eq!(updated.insert_timestamp, info.insert_timestamp);
+        assert_eq!(updated.load_timestamp, info.load_timestamp);
+
+        // An OOM update that won since the caller read must remain intact.
+        let mut escalated = persisted;
+        let mut escalated_info = (*updated).clone();
+        escalated_info
+            .platform_properties
+            .insert("memory_kb".to_string(), "250".to_string());
+        let reservation = escalated_info.memory_reservation.as_mut().unwrap();
+        reservation.desired_kb = Some(250);
+        reservation.fitted_revision = None;
+        escalated.set_action_info(Arc::new(escalated_info));
+        escalated.memory_escalations += 1;
+        manager.action_db.update_awaited_action(escalated).await?;
+        let escalated = subscriber.borrow().await?;
+        let QueuedMemoryRefit::Stale(current) = manager
+            .refit_queued_memory(
+                &operation_id,
+                &updated,
+                "memory_kb",
+                "cpu_count",
+                fit.clone(),
+            )
+            .await?
+        else {
+            panic!("an escalated action must reject the old fit");
+        };
+        assert_eq!(&current, escalated.action_info());
+        assert_eq!(
+            serde_json::to_value(subscriber.borrow().await?).unwrap(),
+            serde_json::to_value(&escalated).unwrap(),
+        );
+
+        // A metadata-only change is stale too, even if raw properties match.
+        let mut metadata_changed = escalated.clone();
+        let mut metadata_info = (*current).clone();
+        metadata_info
+            .memory_reservation
+            .as_mut()
+            .unwrap()
+            .minimum_kb = Some(100);
+        metadata_changed.set_action_info(Arc::new(metadata_info));
+        manager
+            .action_db
+            .update_awaited_action(metadata_changed)
+            .await?;
+        assert!(matches!(
+            manager
+                .refit_queued_memory(
+                    &operation_id,
+                    &current,
+                    "memory_kb",
+                    "cpu_count",
+                    fit.clone()
+                )
+                .await?,
+            QueuedMemoryRefit::Stale(_)
+        ));
+
+        let mut executing = subscriber.borrow().await?;
+        let executing_info = executing.action_info().clone();
+        let mut state = (**executing.state()).clone();
+        state.stage = ActionStage::Executing;
+        state.last_transition_timestamp = started + Duration::from_secs(30);
+        executing.worker_set_state(Arc::new(state), started + Duration::from_secs(30));
+        manager.action_db.update_awaited_action(executing).await?;
+        let executing = subscriber.borrow().await?;
+        assert_eq!(
+            manager
+                .refit_queued_memory(
+                    &operation_id,
+                    &executing_info,
+                    "memory_kb",
+                    "cpu_count",
+                    fit.clone()
+                )
+                .await?,
+            QueuedMemoryRefit::NotQueued,
+        );
+        assert_eq!(
+            serde_json::to_value(subscriber.borrow().await?).unwrap(),
+            serde_json::to_value(&executing).unwrap(),
+        );
+        assert_eq!(
+            manager
+                .refit_queued_memory(
+                    &OperationId::default(),
+                    &info,
+                    "memory_kb",
+                    "cpu_count",
+                    fit
+                )
+                .await?,
+            QueuedMemoryRefit::NotQueued,
+        );
+        Ok(())
     }
 }

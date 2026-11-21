@@ -21,6 +21,7 @@ use bitflags::bitflags;
 use futures::Stream;
 use nativelink_error::Error;
 use nativelink_metric::MetricsComponent;
+use uuid::Uuid;
 
 use crate::action_messages::{
     ActionInfo, ActionStage, ActionState, ActionUniqueKey, OperationId, WorkerId,
@@ -200,8 +201,41 @@ pub trait WorkerStateManager: Sync + Send + MetricsComponent {
     ) -> Result<bool, Error>;
 }
 
+/// Capacity fit to apply atomically to a queued action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedMemoryFit {
+    /// Fitted memory reservation, or absence of the property.
+    pub memory_kb: Option<u64>,
+    /// Fitted CPU reservation, or absence of the property.
+    pub cpu: Option<u64>,
+    /// Capacity snapshot used to compute this fit.
+    pub revision: Uuid,
+}
+
+/// Result of comparing and refitting a queued action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueuedMemoryRefit {
+    /// The fit was applied.
+    Updated(Arc<ActionInfo>),
+    /// The action changed; recompute from the returned current action.
+    Stale(Arc<ActionInfo>),
+    /// The operation no longer exists or is no longer queued.
+    NotQueued,
+}
+
 #[async_trait]
 pub trait MatchingEngineStateManager: Sync + Send + MetricsComponent {
+    /// Atomically apply a fit only while the operation is queued and its action
+    /// still matches `expected`. A stale result returns the current action.
+    async fn refit_queued_memory(
+        &self,
+        operation_id: &OperationId,
+        expected: &ActionInfo,
+        memory_property: &str,
+        cpu_property: &str,
+        fit: QueuedMemoryFit,
+    ) -> Result<QueuedMemoryRefit, Error>;
+
     /// Returns a stream of operations that match the filter.
     async fn filter_operations<'a>(
         &'a self,

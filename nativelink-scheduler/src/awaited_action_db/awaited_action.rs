@@ -243,6 +243,22 @@ impl AwaitedAction {
         self.action_info = action_info;
     }
 
+    /// Change only the queued memory fit, preserving identity, ordering and
+    /// every persisted retry counter and timestamp on this record.
+    pub(crate) fn refit_memory(
+        &mut self,
+        memory_property: &str,
+        cpu_property: &str,
+        fit: nativelink_util::operation_state_manager::QueuedMemoryFit,
+    ) {
+        crate::memory_capacity::apply_memory_fit(
+            Arc::make_mut(&mut self.action_info),
+            memory_property,
+            cpu_property,
+            fit,
+        );
+    }
+
     pub(crate) fn set_client_operation_id(&mut self, client_operation_id: OperationId) {
         Arc::make_mut(&mut self.state).client_operation_id = client_operation_id;
     }

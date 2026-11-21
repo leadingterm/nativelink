@@ -99,6 +99,24 @@ Two consequences worth internalising:
 `max_inflight_tasks` on the worker is the separate, blunter cap: it counts
 tasks rather than resources, and `0` means unlimited.
 
+When memory resource escalation is enabled, the scheduler starts with the
+configured capacity rows. Matching worker and peer observations can
+conservatively lower each row's physical **total** memory; neither currently
+free memory nor a per-action ceiling is treated as physical capacity. These
+observations are retained when a worker or peer disconnects.
+
+<SourceLink file="nativelink-scheduler/src/memory_capacity.rs" symbol="observe_capacities" />
+
+Embedders can attach `MemoryReservation` to an action to keep its original
+explicit memory floor separate from its learned desired reservation. The
+scheduler fits it before persistence and refits queued actions when capacity
+changes. An impossible original floor fails rather than being lowered. When a
+fit reserves the whole memory pool, the corresponding whole-pool CPU
+reservation is based on the physical pool, not a lower per-action ceiling.
+
+<SourceLink file="nativelink-util/src/action_messages.rs" symbol="MemoryReservation" />
+<SourceLink file="nativelink-scheduler/src/memory_capacity.rs" symbol="fit_memory" />
+
 ## What happens when it doesn't match [#what-happens-when-it-doesnt-match]
 
 The two failure modes are asymmetric, and knowing which one you're in tells

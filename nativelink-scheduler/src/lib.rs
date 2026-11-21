@@ -22,6 +22,7 @@ pub mod historical_resource_scheduler;
 pub mod known_platform_property_provider;
 pub mod match_outcome;
 pub mod memory_awaited_action_db;
+pub(crate) mod memory_capacity;
 pub mod mock_scheduler;
 pub mod platform_property_manager;
 pub mod property_modifier_scheduler;

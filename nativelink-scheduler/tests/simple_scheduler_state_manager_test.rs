@@ -102,6 +102,7 @@ fn make_system_time(add_time: u64) -> SystemTime {
 fn action_info(started: SystemTime) -> ActionInfo {
     let action_digest = DigestInfo::zero_digest();
     ActionInfo {
+        memory_reservation: None,
         command_digest: action_digest,
         input_root_digest: action_digest,
         timeout: Duration::ZERO,
