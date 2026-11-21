@@ -301,6 +301,7 @@ async fn reconnects_when_action_stuck_in_transit_on_disconnect() -> Result<(), E
                     queued_timestamp: None,
                     platform: Some(Platform::default()),
                     worker_id: expected_worker_id,
+                    attempt_deadline: None,
                 })),
             })
             .unwrap(),
@@ -401,6 +402,7 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
                         queued_timestamp: None,
                         platform: Some(Platform::default()),
                         worker_id: expected_worker_id.clone(),
+                        attempt_deadline: None,
                     })),
                 })
                 .unwrap(),
@@ -522,6 +524,7 @@ async fn start_action_lifecycle_test(single_use: bool) -> Result<(), Error> {
                         queued_timestamp: None,
                         platform: Some(Platform::default()),
                         worker_id: expected_worker_id.clone(),
+                        attempt_deadline: None,
                     })),
                 })
                 .unwrap(),
@@ -1003,6 +1006,7 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
                         queued_timestamp: None,
                         platform: Some(Platform::default()),
                         worker_id: expected_worker_id.clone(),
+                        attempt_deadline: None,
                     })),
                 })
                 .unwrap(),
@@ -1103,6 +1107,7 @@ async fn kill_action_request_kills_action() -> Result<(), Error> {
                         queued_timestamp: None,
                         platform: Some(Platform::default()),
                         worker_id: expected_worker_id.clone(),
+                        attempt_deadline: None,
                     })),
                 })
                 .unwrap(),
@@ -1209,6 +1214,7 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
                         queued_timestamp: None,
                         platform: Some(Platform::default()),
                         worker_id: expected_worker_id.clone(),
+                        attempt_deadline: None,
                     })),
                 })
                 .unwrap(),
@@ -1341,6 +1347,7 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
                         queued_timestamp: None,
                         platform: Some(Platform::default()),
                         worker_id: expected_worker_id.clone(),
+                        attempt_deadline: None,
                     })),
                 })
                 .unwrap(),
@@ -1609,6 +1616,7 @@ async fn a_hung_acknowledgement_does_not_block_the_loop() -> Result<(), Error> {
                     queued_timestamp: None,
                     platform: Some(Platform::default()),
                     worker_id: worker_id.clone(),
+                    attempt_deadline: None,
                 })),
             })
             .unwrap(),
@@ -1713,6 +1721,7 @@ async fn a_failed_acknowledgement_leaves_a_single_use_worker_unspent() -> Result
             queued_timestamp: None,
             platform: Some(Platform::default()),
             worker_id: worker_id.clone(),
+            attempt_deadline: None,
         })),
     };
 
@@ -1858,6 +1867,7 @@ async fn disconnect_with_action_in_transit(single_use: bool) -> Result<(), Error
                         queued_timestamp: None,
                         platform: Some(Platform::default()),
                         worker_id: expected_worker_id.clone(),
+                        attempt_deadline: None,
                     })),
                 })
                 .unwrap(),
@@ -1970,6 +1980,7 @@ async fn a_worker_at_capacity_declines_the_next_dispatch() -> Result<(), Error> 
             queued_timestamp: None,
             platform: Some(Platform::default()),
             worker_id: worker_id.clone(),
+            attempt_deadline: None,
         })),
     };
 
@@ -2071,6 +2082,7 @@ fn start_reserving(operation_id: &str, memory_kb: u64) -> UpdateForWorker {
                 }],
             }),
             worker_id: "foobar".to_string(),
+            attempt_deadline: None,
         })),
     }
 }

@@ -453,6 +453,9 @@ message StartExecute {
     /// Original execution metadata, including the build tool and invocation.
     /// Workers must not infer a Buck2 file session from an action digest alone.
     build.bazel.remote.execution.v2.RequestMetadata request_metadata = 8;
+
+    /// Absolute controller-origin deadline for the whole dispatch attempt.
+    google.protobuf.Timestamp attempt_deadline = 9;
 }
 
 /// This is a special message used to save actions into the CAS that can be used

@@ -16,7 +16,7 @@ use core::ops::Bound;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::string::ToString;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::SystemTime;
 
 use async_lock::Mutex;
@@ -48,6 +48,7 @@ use super::awaited_action_db::{
     AwaitedAction, AwaitedActionDb, AwaitedActionSubscriber, PeerScheduler,
     SortedAwaitedActionState,
 };
+use crate::api_worker_scheduler::ApiWorkerScheduler;
 use crate::worker_registry::{ORPHANED_ACTION_TIMEOUT, SharedWorkerRegistry, WorkerLiveness};
 
 /// An attempt the executing sweep ended, for the scheduler to report.
@@ -503,6 +504,8 @@ where
 
     /// Worker registry for checking worker liveness.
     worker_registry: Option<SharedWorkerRegistry>,
+    /// Local ownership for attempts governed by the common dispatch deadline.
+    deadline_scheduler: OnceLock<Weak<ApiWorkerScheduler>>,
 }
 
 impl<T, I, NowFn> SimpleSchedulerStateManager<T, I, NowFn>
@@ -535,7 +538,14 @@ where
             weak_self: weak_self.clone(),
             now_fn,
             worker_registry,
+            deadline_scheduler: OnceLock::new(),
         })
+    }
+
+    /// Prevent legacy execution timeouts from requeuing locally owned attempts
+    /// whose whole-attempt deadline is enforced by the worker scheduler.
+    pub(crate) fn set_deadline_scheduler(&self, scheduler: &Arc<ApiWorkerScheduler>) {
+        let _ = self.deadline_scheduler.set(Arc::downgrade(scheduler));
     }
 
     /// Retires queued actions whose client has stopped listening.
@@ -893,6 +903,19 @@ where
     pub async fn timeout_cause(&self, awaited_action: &AwaitedAction) -> Option<TimeoutCause> {
         if !matches!(awaited_action.state().stage, ActionStage::Executing) {
             return None;
+        }
+
+        if let (Some(scheduler), Some(worker_id)) = (
+            self.deadline_scheduler.get().and_then(Weak::upgrade),
+            awaited_action.worker_id(),
+        ) {
+            if scheduler
+                .running_on_worker(worker_id, awaited_action.operation_id())
+                .await
+                == Some(true)
+            {
+                return None;
+            }
         }
 
         let now = (self.now_fn)().now();
@@ -2284,6 +2307,120 @@ mod queued_memory_refit_tests {
                 .await?,
             QueuedMemoryRefit::NotQueued,
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deadline_timeout_tests {
+    use mock_instant::thread_local::MockClock;
+    use nativelink_config::schedulers::WorkerAllocationStrategy;
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::action_messages::{ActionUniqueKey, ActionUniqueQualifier};
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::instant_wrapper::MockInstantWrapped;
+    use tokio::sync::{Notify, mpsc};
+
+    use super::*;
+    use crate::default_scheduler_factory::memory_awaited_action_db_factory;
+    use crate::platform_property_manager::PlatformPropertyManager;
+    use crate::worker::{ActionInfoWithProps, Worker};
+    use crate::worker_registry::WorkerRegistry;
+    use crate::worker_scheduler::WorkerScheduler;
+
+    #[nativelink_test]
+    async fn owned_attempt_is_not_requeued_by_legacy_timeouts() -> Result<(), Error> {
+        MockClock::set_time(Duration::from_secs(10_000));
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let notify = Arc::new(Notify::new());
+        let registry = Arc::new(WorkerRegistry::new());
+        let manager = SimpleSchedulerStateManager::new(
+            3,
+            Duration::from_secs(10),
+            Duration::from_secs(300),
+            Duration::from_secs(15),
+            memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
+            MockInstantWrapped::default,
+            Some(registry.clone()),
+        );
+        let scheduler = ApiWorkerScheduler::new_with_clock(
+            manager.clone(),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            None,
+            None,
+            None,
+            notify,
+            10,
+            60,
+            0,
+            registry,
+            None,
+            None,
+            false,
+            Duration::from_secs(15),
+            "scheduler".to_string(),
+            Box::new(|| SystemTime::UNIX_EPOCH + MockClock::time()),
+        );
+        manager.set_deadline_scheduler(&scheduler);
+        let worker_id = WorkerId::from("worker".to_string());
+        let (tx, _rx) = mpsc::channel(8);
+        scheduler
+            .add_worker(Worker::new(
+                worker_id.clone(),
+                PlatformProperties::default(),
+                tx,
+                10_000,
+                0,
+            ))
+            .await?;
+        let digest = DigestInfo::zero_digest();
+        let action_info = Arc::new(ActionInfo {
+            pre_fit_reservation: None,
+            memory_reservation: None,
+            command_digest: digest,
+            input_root_digest: digest,
+            timeout: Duration::from_secs(1),
+            platform_properties: HashMap::new(),
+            priority: 0,
+            load_timestamp: started,
+            insert_timestamp: started,
+            unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+                execution_scope: None,
+                instance_name: "main".to_string(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest,
+            }),
+        });
+        let operation_id = OperationId::default();
+        let mut action = AwaitedAction::new(operation_id.clone(), action_info.clone(), started);
+        action.worker_set_state(
+            Arc::new(ActionState {
+                stage: ActionStage::Executing,
+                client_operation_id: operation_id.clone(),
+                action_digest: digest,
+                last_transition_timestamp: started,
+            }),
+            started,
+        );
+        action.set_worker_id(Some(worker_id.clone()), started);
+        scheduler
+            .worker_notify_run_action(
+                worker_id,
+                operation_id,
+                ActionInfoWithProps {
+                    inner: action_info,
+                    platform_properties: PlatformProperties::default(),
+                    origin_metadata: OriginMetadata::default(),
+                    scheduler_start_execute_event_id: None,
+                },
+                10_000,
+                Some(started + Duration::from_secs(120)),
+            )
+            .await?;
+        MockClock::advance(Duration::from_secs(30));
+        assert_eq!(manager.timeout_cause(&action).await, None);
         Ok(())
     }
 }

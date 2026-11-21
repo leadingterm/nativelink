@@ -114,6 +114,11 @@ impl<T> JoinHandleDropGuard<T> {
     pub const fn new(inner: JoinHandle<T>) -> Self {
         Self { inner }
     }
+
+    /// Request cancellation; await the guard afterwards to join the task.
+    pub fn abort(&self) {
+        self.inner.abort();
+    }
 }
 
 impl<T> Future for JoinHandleDropGuard<T> {

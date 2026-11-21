@@ -163,6 +163,7 @@ async fn basic_add_action_with_one_worker_test() -> Result<(), Error> {
         let expected_msg_for_worker = UpdateForWorker {
             update: Some(update_for_worker::Update::StartAction(StartExecute {
                 request_metadata: None,
+                attempt_deadline: None,
                 execute_request: Some(ExecuteRequest {
                     instance_name: INSTANCE_NAME.to_string(),
                     action_digest: Some(action_digest.into()),
@@ -206,6 +207,7 @@ async fn scheduler_start_execute_origin_event_includes_resource_hints() -> Resul
                 ("cpu_count".to_string(), PropertyType::Minimum),
                 ("memory_kb".to_string(), PropertyType::Minimum),
             ])),
+            attempt_timeout_s: 30,
             ..Default::default()
         },
         memory_awaited_action_db_factory(
@@ -272,6 +274,14 @@ async fn scheduler_start_execute_origin_event_includes_resource_hints() -> Resul
         }
     };
     assert_eq!(start_action.worker_id, "worker_id");
+    let wire_deadline = start_action.attempt_deadline.clone();
+    assert!(wire_deadline.is_some());
+    assert_eq!(
+        wire_deadline,
+        worker_scheduler.worker_snapshot().await[0]
+            .latest_attempt_deadline
+            .map(Into::into),
+    );
     let start_action_platform = start_action.platform.unwrap();
     assert_eq!(
         start_action_platform.properties,
@@ -311,6 +321,7 @@ async fn scheduler_start_execute_origin_event_includes_resource_hints() -> Resul
         event => panic!("Unexpected request event: {event:?}"),
     };
     assert_eq!(scheduler_start_execute.worker_id, "worker_id");
+    assert_eq!(scheduler_start_execute.attempt_deadline, wire_deadline);
     assert_eq!(
         scheduler_start_execute.platform.unwrap().properties,
         start_action_platform.properties
@@ -657,6 +668,7 @@ async fn find_executing_action() -> Result<(), Error> {
         let expected_msg_for_worker = UpdateForWorker {
             update: Some(update_for_worker::Update::StartAction(StartExecute {
                 request_metadata: None,
+                attempt_deadline: None,
                 execute_request: Some(ExecuteRequest {
                     instance_name: INSTANCE_NAME.to_string(),
                     action_digest: Some(action_digest.into()),
@@ -737,6 +749,7 @@ async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Err
 
     let mut expected_start_execute_for_worker1 = StartExecute {
         request_metadata: None,
+        attempt_deadline: None,
         execute_request: Some(ExecuteRequest {
             instance_name: INSTANCE_NAME.to_string(),
             action_digest: Some(action_digest1.into()),
@@ -751,6 +764,7 @@ async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Err
 
     let mut expected_start_execute_for_worker2 = StartExecute {
         request_metadata: None,
+        attempt_deadline: None,
         execute_request: Some(ExecuteRequest {
             instance_name: INSTANCE_NAME.to_string(),
             action_digest: Some(action_digest2.into()),
@@ -1039,6 +1053,7 @@ async fn worker_should_not_queue_if_properties_dont_match_test() -> Result<(), E
         let expected_msg_for_worker = UpdateForWorker {
             update: Some(update_for_worker::Update::StartAction(StartExecute {
                 request_metadata: None,
+                attempt_deadline: None,
                 execute_request: Some(ExecuteRequest {
                     instance_name: INSTANCE_NAME.to_string(),
                     action_digest: Some(action_digest.into()),
@@ -1139,6 +1154,7 @@ async fn cacheable_items_join_same_action_queued_test() -> Result<(), Error> {
         let expected_msg_for_worker = UpdateForWorker {
             update: Some(update_for_worker::Update::StartAction(StartExecute {
                 request_metadata: None,
+                attempt_deadline: None,
                 execute_request: Some(ExecuteRequest {
                     instance_name: INSTANCE_NAME.to_string(),
                     action_digest: Some(action_digest.into()),
@@ -1506,6 +1522,7 @@ async fn worker_timesout_reschedules_running_job_test() -> Result<(), Error> {
 
     let mut start_execute = StartExecute {
         request_metadata: None,
+        attempt_deadline: None,
         execute_request: Some(ExecuteRequest {
             instance_name: INSTANCE_NAME.to_string(),
             action_digest: Some(action_digest.into()),
@@ -1982,6 +1999,7 @@ async fn does_not_crash_if_operation_joined_then_relaunched() -> Result<(), Erro
         let expected_msg_for_worker = UpdateForWorker {
             update: Some(update_for_worker::Update::StartAction(StartExecute {
                 request_metadata: None,
+                attempt_deadline: None,
                 execute_request: Some(ExecuteRequest {
                     instance_name: INSTANCE_NAME.to_string(),
                     action_digest: Some(action_digest.into()),
