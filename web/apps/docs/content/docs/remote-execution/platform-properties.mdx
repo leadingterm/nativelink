@@ -99,13 +99,14 @@ Two consequences worth internalising:
 `max_inflight_tasks` on the worker is the separate, blunter cap: it counts
 tasks rather than resources, and `0` means unlimited.
 
-When memory resource escalation is enabled, the scheduler starts with the
-configured capacity rows. Matching worker and peer observations can
-conservatively lower each row's physical **total** memory; neither currently
-free memory nor a per-action ceiling is treated as physical capacity. These
-observations are retained when a worker or peer disconnects.
+When memory resource escalation is enabled, the scheduler computes capacity
+from current local workers' physical **total** memory and current peers' local
+capacity rows. When a row has no observation, it uses the configured estimate.
+Departed workers and peers no longer contribute; peers advertise only their
+local rows, not the combined view, so observations cannot feed back indefinitely.
+Neither currently free memory nor a per-action ceiling is physical capacity.
 
-<SourceLink file="nativelink-scheduler/src/memory_capacity.rs" symbol="observe_capacities" />
+<SourceLink file="nativelink-scheduler/src/api_worker_scheduler.rs" symbol="fleet_advertisement" />
 
 Embedders can attach `MemoryReservation` to an action to keep its original
 explicit memory floor separate from its learned desired reservation. The
