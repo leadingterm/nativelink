@@ -18,11 +18,14 @@ use std::time::SystemTime;
 use hex::FromHex;
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
-use nativelink_proto::build::bazel::remote::execution::v2::{Action, ExecuteRequest, digest_function};
+use nativelink_proto::build::bazel::remote::execution::v2::{
+    Action, ExecuteRequest, digest_function,
+};
 use nativelink_proto::google::rpc::PreconditionFailure;
 use nativelink_util::action_messages::{
-    ActionInfo, ActionReservation, ActionResult, ActionStage, ActionUniqueKey, ActionUniqueQualifier,
-    ExecutionMetadata, INTERNAL_ERROR_EXIT_CODE, TypeUrl, to_execute_response,
+    ActionInfo, ActionReservation, ActionResult, ActionStage, ActionUniqueKey,
+    ActionUniqueQualifier, ExecutionMetadata, INTERNAL_ERROR_EXIT_CODE, TypeUrl,
+    to_execute_response,
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -70,7 +73,10 @@ fn pre_fit_reservation_is_backward_compatible_and_round_trips() {
     assert_eq!(action.pre_fit_reservation, None);
     let absent = serde_json::to_value(&action).unwrap();
     assert!(absent.get("pre_fit_reservation").is_none());
-    assert_eq!(serde_json::from_value::<ActionInfo>(absent).unwrap(), action);
+    assert_eq!(
+        serde_json::from_value::<ActionInfo>(absent).unwrap(),
+        action
+    );
 
     let reservation = ActionReservation {
         cpu_millicores: 1500,
