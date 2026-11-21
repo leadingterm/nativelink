@@ -70,7 +70,7 @@ impl PsiWindow {
         }
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) const fn reset(&mut self) {
         self.baseline = None;
         self.since = None;
     }

@@ -725,7 +725,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             }
                         }
                         Update::StartAction(start_execute) => {
-                            let attempt_deadline: Option<SystemTime> = start_execute.attempt_deadline.clone()
+                            let attempt_deadline: Option<SystemTime> = start_execute.attempt_deadline
                                 .map(|deadline| deadline.try_into()
                                     .map_err(|_| make_input_err!("Invalid attempt deadline")))
                                 .transpose()?;
@@ -2195,76 +2195,80 @@ mod attempt_tests {
 
     #[nativelink_test(start_paused = true)]
     async fn expiry_waits_for_reservation_cleanup_before_terminal_publication() {
-        for cleanup_already_started in [false, true] {
-            let allow_cleanup = Arc::new(Notify::new());
-            let action = TestAction::with_cleanup_gate(Some(allow_cleanup.clone()));
-            let manager = TestManager::new(Some(action.clone()));
-            let resources = retained(Some(action.clone()));
-            let published = Arc::new(AtomicBool::new(false));
-            let future = {
-                let action = action.clone();
-                let resources = resources.clone();
-                async move {
-                    if cleanup_already_started {
-                        resources.cleanup_started.store(true, Ordering::Release);
-                        let cleanup = background_spawn!("test_action_cleanup", async move {
-                            let result = action.cleanup().await;
-                            resources.cleanup_finished.notify_one();
-                            result
-                        });
-                        cleanup.await.unwrap()?;
-                    } else {
-                        action.prepare_action().await?;
+        time::timeout(Duration::from_secs(30), async {
+            for cleanup_already_started in [false, true] {
+                let allow_cleanup = Arc::new(Notify::new());
+                let action = TestAction::with_cleanup_gate(Some(allow_cleanup.clone()));
+                let manager = TestManager::new(Some(action.clone()));
+                let resources = retained(Some(action.clone()));
+                let published = Arc::new(AtomicBool::new(false));
+                let future = {
+                    let action = action.clone();
+                    let resources = resources.clone();
+                    async move {
+                        if cleanup_already_started {
+                            resources.cleanup_started.store(true, Ordering::Release);
+                            let cleanup = background_spawn!("test_action_cleanup", async move {
+                                let result = action.cleanup().await;
+                                resources.cleanup_finished.notify_one();
+                                result
+                            });
+                            cleanup.await.unwrap()?;
+                        } else {
+                            action.prepare_action().await?;
+                        }
+                        core::future::pending::<Result<(), Error>>().await
                     }
-                    core::future::pending::<Result<(), Error>>().await
+                    .boxed()
+                };
+                let terminal = {
+                    let action = action.clone();
+                    let published = published.clone();
+                    async move {
+                        assert!(
+                            run_attempt(
+                                manager,
+                                action.operation_id.clone(),
+                                Some(UNIX_EPOCH + Duration::from_secs(10)),
+                                resources,
+                                DigestHasherFunc::Sha256,
+                                future,
+                            )
+                            .await
+                            .unwrap()
+                        );
+                        assert!(!action.reservation.load(Ordering::Acquire));
+                        let execute_result::Result::ExecuteResponse(response) = execution_failure(
+                            make_err!(Code::DeadlineExceeded, "Dispatch deadline exceeded"),
+                        ) else {
+                            panic!("expiry must publish a terminal result");
+                        };
+                        published.store(true, Ordering::Release);
+                        assert_eq!(response.status.unwrap().code, Code::DeadlineExceeded as i32);
+                    }
+                };
+                let mut terminal = background_spawn!("test_terminal_publication", terminal);
+                assert!(futures::poll!(&mut terminal).is_pending());
+                if cleanup_already_started {
+                    action.cleanup_entered.notified().await;
+                } else {
+                    action.preparing.notified().await;
                 }
-                .boxed()
-            };
-            let terminal = {
-                let action = action.clone();
-                let published = published.clone();
-                async move {
-                    assert!(
-                        run_attempt(
-                            manager,
-                            action.operation_id.clone(),
-                            Some(UNIX_EPOCH + Duration::from_secs(10)),
-                            resources,
-                            DigestHasherFunc::Sha256,
-                            future,
-                        )
-                        .await
-                        .unwrap()
-                    );
-                    assert!(!action.reservation.load(Ordering::Acquire));
-                    let execute_result::Result::ExecuteResponse(response) = execution_failure(
-                        make_err!(Code::DeadlineExceeded, "Dispatch deadline exceeded"),
-                    ) else {
-                        panic!("expiry must publish a terminal result");
-                    };
-                    published.store(true, Ordering::Release);
-                    assert_eq!(response.status.unwrap().code, Code::DeadlineExceeded as i32);
+                time::advance(Duration::from_secs(10)).await;
+                assert!(futures::poll!(&mut terminal).is_pending());
+                if !cleanup_already_started {
+                    action.cleanup_entered.notified().await;
                 }
-            };
-            tokio::pin!(terminal);
-            assert!(futures::poll!(&mut terminal).is_pending());
-            if cleanup_already_started {
-                action.cleanup_entered.notified().await;
-            } else {
-                action.preparing.notified().await;
+                assert!(action.reservation.load(Ordering::Acquire));
+                assert!(!published.load(Ordering::Acquire));
+                allow_cleanup.notify_one();
+                terminal.await.expect("terminal publication task panicked");
+                assert!(published.load(Ordering::Acquire));
+                assert!(!action.reservation.load(Ordering::Acquire));
             }
-            time::advance(Duration::from_secs(10)).await;
-            assert!(futures::poll!(&mut terminal).is_pending());
-            if !cleanup_already_started {
-                action.cleanup_entered.notified().await;
-            }
-            assert!(action.reservation.load(Ordering::Acquire));
-            assert!(!published.load(Ordering::Acquire));
-            allow_cleanup.notify_one();
-            terminal.await;
-            assert!(published.load(Ordering::Acquire));
-            assert!(!action.reservation.load(Ordering::Acquire));
-        }
+        })
+        .await
+        .expect("terminal publication did not finish within 30 seconds");
     }
 
     #[nativelink_test(start_paused = true)]

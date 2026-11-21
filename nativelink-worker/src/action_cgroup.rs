@@ -64,7 +64,7 @@ pub(crate) fn read_kib(path: &Path, name: &str) -> Option<u64> {
         .trim()
         .parse()
         .ok()?;
-    Some(bytes / 1024 + u64::from(bytes % 1024 != 0))
+    Some(bytes.div_ceil(1024))
 }
 
 #[cfg(test)]

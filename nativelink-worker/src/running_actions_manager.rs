@@ -2443,7 +2443,10 @@ async fn upload_symlink(
             .strip_prefix(full_work_directory_path.as_ref())
             .map_err(|e| make_err!(Code::Internal, "{e}"))
             .err_tip(|| {
-                format!("Could not strip work directory from target {full_target_path:?}")
+                format!(
+                    "Could not strip work directory from target {}",
+                    full_target_path.display()
+                )
             })?;
         let target_path = RelativePath::from_path(target_path)
             .map_err(|v| make_err!(Code::Internal, "Could not convert {} to RelativePath", v))?;
@@ -4179,7 +4182,7 @@ impl RunningActionImpl {
             let memory = enforcement.and_then(|e| e.memory.as_ref());
             let memory_limit_kb = memory
                 .filter(|m| m.soft)
-                .and(memory_reservation.map(|(_, limit)| limit));
+                .and_then(|_| memory_reservation.map(|(_, limit)| limit));
             let disk_limit_kb = disk_enforcement.and_then(|(_, limit_kb)| limit_kb);
             let pressure_kill_armed = self
                 .running_actions_manager
@@ -6985,7 +6988,6 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                     .unwrap_or(SystemTime::UNIX_EPOCH);
                 let attempt_deadline = start_execute
                     .attempt_deadline
-                    .clone()
                     .map(|time| time.try_into().map_err(|_| make_input_err!("Invalid attempt deadline")))
                     .transpose()?;
                 if attempt_deadline.is_some_and(|deadline| (self.callbacks.now_fn)() >= deadline) {
@@ -7122,7 +7124,8 @@ impl RunningActionsManager for RunningActionsManagerImpl {
             "Dispatch deadline exceeded for operation {operation_id}"
         ));
         action.kill_token.send_replace(true);
-        if let Some(tx) = action.state.lock().kill_channel_tx.take() {
+        let kill_channel_tx = action.state.lock().kill_channel_tx.take();
+        if let Some(tx) = kill_channel_tx {
             let _ = tx.send(());
         }
         // The command select owns hard-kill and reaping. Keep its task alive
