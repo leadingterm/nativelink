@@ -381,6 +381,7 @@ pub async fn server_does_not_timeout_if_execute_complete_test()
                 scheduler_start_execute_event_id: None,
             },
             BASE_NOW_S,
+            None,
         )
         .await
         .unwrap();
@@ -485,6 +486,7 @@ pub async fn stream_end_requeues_running_actions_as_disconnect_test()
                 scheduler_start_execute_event_id: None,
             },
             BASE_NOW_S,
+            None,
         )
         .await
         .unwrap();
@@ -720,6 +722,7 @@ pub async fn execution_response_success_test() -> Result<(), Box<dyn core::error
                 scheduler_start_execute_event_id: None,
             },
             BASE_NOW_S,
+            None,
         )
         .await
         .unwrap();
@@ -1019,6 +1022,7 @@ pub async fn workers_only_allow_max_tasks() -> Result<(), Box<dyn core::error::E
                 scheduler_start_execute_event_id: None,
             },
             BASE_NOW_S,
+            None,
         )
         .await
         .unwrap();
@@ -1095,6 +1099,7 @@ pub async fn acknowledgement_is_recorded_before_the_sweep_it_carries_test()
                 scheduler_start_execute_event_id: None,
             },
             BASE_NOW_S,
+            None,
         )
         .await
         .unwrap();
@@ -1168,6 +1173,7 @@ async fn dispatch(test_context: &TestContext, seed: u8) -> Result<OperationId, E
                 scheduler_start_execute_event_id: None,
             },
             BASE_NOW_S,
+            None,
         )
         .await?;
     Ok(operation_id)

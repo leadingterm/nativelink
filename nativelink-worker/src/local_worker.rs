@@ -48,12 +48,12 @@ use nativelink_util::store_trait::Store;
 use nativelink_util::{background_spawn, spawn, spawn_blocking, tls_utils};
 use opentelemetry::context::Context;
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::{process, time};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Streaming, async_trait};
 use tracing::{Level, debug, error, event, info, info_span, instrument, trace, warn};
 
+use crate::persistent_worker::pool::CommandRegistration;
 use crate::running_actions_manager::{
     ExecutionConfiguration, MISSING_INPUT_ERROR_TIP, Metrics as RunningActionManagerMetrics,
     ResourceEnforcement, RunningAction, RunningActionsManager, RunningActionsManagerArgs,
@@ -172,6 +172,84 @@ struct FinishedActionResult {
     resource_usage: Option<ActionResourceUsage>,
 }
 
+/// Cleanup ownership survives cancellation of every attempt phase.
+struct AttemptResources<A> {
+    action: Mutex<Option<Arc<A>>>,
+    cleanup_started: AtomicBool,
+    cleanup_finished: tokio::sync::Notify,
+    precondition: Option<Mutex<CommandRegistration>>,
+}
+
+impl<A> AttemptResources<A> {
+    fn new(action: Option<Arc<A>>, precondition: Option<Mutex<CommandRegistration>>) -> Self {
+        Self {
+            action: Mutex::new(action),
+            cleanup_started: AtomicBool::new(false),
+            cleanup_finished: tokio::sync::Notify::new(),
+            precondition,
+        }
+    }
+}
+
+/// Owns the spawned attempt until command reaping acknowledges expiry. The
+/// remaining future is joined before cleanup, so it can never spawn later.
+async fn run_attempt<U: RunningActionsManager>(
+    manager: Arc<U>,
+    operation_id: OperationId,
+    deadline: Option<SystemTime>,
+    resources: Arc<AttemptResources<U::RunningAction>>,
+    digest_hasher: DigestHasherFunc,
+    future: BoxFuture<'static, Result<(), Error>>,
+) -> Result<bool, Error> {
+    let mut task = info_span!("worker_attempt", %operation_id).in_scope(|| {
+        let _guard = Context::current_with_value(digest_hasher).attach();
+        spawn!("worker_attempt", future)
+    });
+    let expiry = async {
+        match deadline {
+            Some(deadline) => manager.wait_for_attempt_deadline(deadline).await,
+            None => core::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(expiry);
+    tokio::select! {
+        biased;
+        () = &mut expiry => {}
+        result = &mut task => return result.err_tip(|| "Failed to join action attempt")?.map(|()| false),
+    }
+    let precondition_stopped = resources
+        .precondition
+        .as_ref()
+        .and_then(|registration| registration.lock().expire_and_subscribe());
+    let registered = manager.expire_attempt(&operation_id).await;
+    if let Some(mut stopped) = precondition_stopped {
+        drop(stopped.wait_for(|stopped| *stopped).await);
+    }
+    task.abort();
+    // Joining, not just dropping, closes the pre-registration spawn race.
+    if let Err(err) = task.await
+        && !err.is_cancelled()
+    {
+        error!(?err, %operation_id, "Action attempt failed while expiring");
+    }
+    let retained = resources.action.lock().take().or(registered);
+    if let Some(action) = retained {
+        if !resources.cleanup_started.swap(true, Ordering::AcqRel) {
+            let cleanup_resources = resources.clone();
+            // Cleanup retains its owner if this waiter is cancelled. Terminal
+            // publication still waits for reservations to be released.
+            drop(background_spawn!("expired_attempt_cleanup", async move {
+                if let Err(err) = action.cleanup().await {
+                    warn!(?err, %operation_id, "Expired attempt cleanup failed");
+                }
+                cleanup_resources.cleanup_finished.notify_one();
+            }));
+        }
+        resources.cleanup_finished.notified().await;
+    }
+    Ok(true)
+}
+
 fn is_killed(usage: Option<&ActionResourceUsage>) -> bool {
     usage.is_some_and(|usage| {
         matches!(
@@ -278,10 +356,36 @@ pub async fn preconditions_met<H: BuildHasher + Sync>(
     extra_envs: &HashMap<String, String, H>,
     timeout: Duration,
 ) -> Result<(), Error> {
+    if precondition_script.is_none() {
+        return Ok(());
+    }
+    preconditions_with_registration(
+        precondition_script,
+        extra_envs,
+        timeout,
+        Some(&Mutex::new(CommandRegistration::new(None, SystemTime::now))),
+        None,
+        SystemTime::now,
+    )
+    .await
+}
+
+async fn preconditions_with_registration<H: BuildHasher + Sync>(
+    precondition_script: Option<String>,
+    extra_envs: &HashMap<String, String, H>,
+    timeout: Duration,
+    registration: Option<&Mutex<CommandRegistration>>,
+    deadline: Option<SystemTime>,
+    now: impl Fn() -> SystemTime + Send + Sync,
+) -> Result<(), Error> {
+    use tokio::io::AsyncReadExt as _;
+
     let Some(precondition_script) = &precondition_script else {
         // No script means we are always ok to proceed.
         return Ok(());
     };
+    let registration =
+        registration.err_tip(|| "Configured precondition requires command registration")?;
     // TODO: Might want to pass some information about the command to the
     //       script, but at this point it's not even been downloaded yet,
     //       so that's not currently possible.  Perhaps we'll move this in
@@ -300,28 +404,79 @@ pub async fn preconditions_met<H: BuildHasher + Sync>(
         }
     };
 
-    let precondition_process = process::Command::new(command)
+    let mut command_builder = process::Command::new(command);
+    command_builder
         .args(args)
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env_clear()
-        .envs(extra_envs)
-        .spawn()
-        .err_tip(|| format!("Could not execute precondition command {precondition_script:?}"))?;
-    let _owned = crate::reaper::OwnedChild::new(precondition_process.id());
-    // Bounded: a script that hangs held the action forever, and
-    // `kill_on_drop` ends the script when the timeout drops it.
-    let output = match time::timeout(timeout, precondition_process.wait_with_output()).await {
-        Ok(output) => output?,
-        Err(_) => {
-            return Err(make_err!(
-                Code::ResourceExhausted,
-                "Preconditions script {precondition_script:?} did not finish within {} ms",
-                timeout.as_millis()
-            ));
+        .envs(extra_envs);
+    #[cfg(unix)]
+    command_builder.process_group(0);
+    let (child, mut stdout_reader) = {
+        let mut registration = registration.lock();
+        if deadline.is_some_and(|deadline| now() >= deadline) {
+            registration.expire();
         }
+        registration.check_deadline()?;
+        let mut child = command_builder.spawn().err_tip(|| {
+            format!("Could not execute precondition command {precondition_script:?}")
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .expect("precondition stdout is piped by construction");
+        registration.register();
+        (child, stdout)
+    };
+    let _owned = crate::reaper::OwnedChild::new(child.id());
+    let pgid = child.id();
+    let watch = Arc::new(crate::running_actions_manager::ActionMemoryWatch::default());
+    let group_watch = watch.clone();
+    let kill_group = scopeguard::guard((), move |()| {
+        #[cfg(unix)]
+        if let Some(pgid) = pgid {
+            crate::running_actions_manager::signal_action(pgid, &group_watch, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        let _ = (pgid, group_watch);
+    });
+    #[cfg(target_os = "linux")]
+    let mut child = crate::namespace_utils::MaybeNamespacedChild::new(false, child);
+    #[cfg(not(target_os = "linux"))]
+    let mut child = child;
+    let mut expired = registration.lock().expired_signal.subscribe();
+    let mut stdout = Vec::new();
+    let result = tokio::select! {
+        biased;
+        _ = expired.wait_for(|expired| *expired) => Err(make_err!(
+            Code::DeadlineExceeded, "Dispatch deadline exceeded during preconditions"
+        )),
+        () = time::sleep(timeout) => Err(make_err!(
+            Code::ResourceExhausted,
+            "Preconditions script {precondition_script:?} did not finish within {} ms",
+            timeout.as_millis()
+        )),
+        result = async {
+            tokio::try_join!(child.wait(), stdout_reader.read_to_end(&mut stdout))
+        } => result.map(|(status, _)| status).map_err(Error::from),
+    };
+    if result.is_err() {
+        crate::running_actions_manager::hard_kill(&mut child, &watch, "preconditions ended").await;
+        if let Err(err) = child.wait().await {
+            warn!(?err, "Could not reap precondition child");
+        }
+    }
+    // Complete the group hard signal and reaping before acknowledging. The
+    // attempt supervisor may only abort this future after this point.
+    drop(kill_group);
+    registration.lock().stop();
+    let output = std::process::Output {
+        status: result?,
+        stdout,
+        stderr: Vec::new(),
     };
     let stdout = str::from_utf8(&output.stdout).unwrap_or("");
     trace!(status = %output.status, %stdout, "Preconditions script returned");
@@ -504,24 +659,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
     ) -> Result<(), Error> {
         // This big block of logic is designed to help simplify upstream components. Upstream
         // components can write standard futures that return a `Result<(), Error>` and this block
-        // will forward the error up to the client and disconnect from the scheduler.
-        // It is a common use case that an item sent through update_for_worker_stream will always
-        // have a response but the response will be triggered through a callback to the scheduler.
-        // This can be quite tricky to manage, so what we have done here is given access to a
-        // `futures` variable which because this is in a single thread as well as a channel that you
-        // send a future into that makes it into the `futures` variable.
-        // This means that if you want to perform an action based on the result of the future
-        // you use the `.map()` method and the new action will always come to live in this spawn,
-        // giving mutable access to stuff in this struct.
+        // Every dispatch owns one future through final publication; this loop
+        // keeps reading control messages while those attempts make progress.
         // NOTE: If you ever return from this function it will disconnect from the scheduler.
         let mut futures = FuturesUnordered::new();
         // What this worker is running, from the dispatch until the result is
         // published, reported on every keepalive.
         let running_operations = Arc::new(Mutex::new(HashSet::new()));
         futures.push(self.start_keep_alive(running_operations.clone()).boxed());
-
-        let (add_future_channel, add_future_rx) = mpsc::unbounded_channel();
-        let mut add_future_rx = UnboundedReceiverStream::new(add_future_rx).fuse();
 
         let mut update_for_worker_stream = update_for_worker_stream.fuse();
         // A notify which is triggered every time actions_in_flight is subtracted.
@@ -580,9 +725,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             }
                         }
                         Update::StartAction(start_execute) => {
+                            let attempt_deadline: Option<SystemTime> = start_execute.attempt_deadline.clone()
+                                .map(|deadline| deadline.try_into()
+                                    .map_err(|_| make_input_err!("Invalid attempt deadline")))
+                                .transpose()?;
+                            // An expired delivery is terminal even if admission would
+                            // otherwise decline it and cause another dispatch.
+                            let already_expired = attempt_deadline
+                                .is_some_and(|deadline| self.running_actions_manager.now() >= deadline);
                             // Don't accept any new requests if we're shutting down.
-                            if shutting_down || (self.config.single_use
-                                && self.accepted_action.load(Ordering::Acquire)) {
+                            if !already_expired && (shutting_down || (self.config.single_use
+                                && self.accepted_action.load(Ordering::Acquire))) {
                                 if self.dispatch_ack {
                                     futures.push(self.decline(start_execute.operation_id, Refusal::ShuttingDown));
                                 } else if let Some(instance_name) = start_execute.execute_request.map(|request| request.instance_name) {
@@ -617,7 +770,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             // has gone out, so the scheduler hears the
                             // acknowledgement before anything the run sends,
                             // and one that fails leaves the action unstarted.
-                            let acknowledgement = if self.dispatch_ack {
+                            let acknowledgement = if self.dispatch_ack && !already_expired {
                                 if let Some(refusal) = self.admission(
                                     &start_execute,
                                     actions_in_flight.load(Ordering::Acquire),
@@ -645,7 +798,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
                             let execute_request = start_execute.execute_request.as_ref();
                             let operation_id = start_execute.operation_id.clone();
-                            let operation_id_to_log = operation_id.clone();
+                            let attempt_operation_id: OperationId = operation_id.as_str().into();
+                            let resources = Arc::new(AttemptResources::new(
+                                None,
+                                self.config.experimental_precondition_script.as_ref().map(|_| {
+                                    Mutex::new(CommandRegistration::new(None, SystemTime::now))
+                                }),
+                            ));
                             let tracked_operation_id = operation_id.clone();
                             let maybe_instance_name = execute_request.map(|v| v.instance_name.clone());
                             let action_digest = execute_request.and_then(|v| v.action_digest.clone());
@@ -687,9 +846,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     operation_id: operation_id.clone(),
                                 };
                                 let single_use = self.config.single_use;
+                                let resources = resources.clone();
                                 self.metrics.clone().wrap(move |metrics| async move {
-                                    metrics.preconditions.wrap(preconditions_met(precondition_script_cfg, &extra_envs, precondition_timeout))
-                                    .and_then(|()| running_actions_manager.create_and_add_action(worker_id, start_execute))
+                                    metrics.preconditions.wrap(preconditions_with_registration(
+                                        precondition_script_cfg, &extra_envs, precondition_timeout,
+                                        resources.precondition.as_ref(), attempt_deadline,
+                                        || running_actions_manager.now(),
+                                    )).await?;
+                                    running_actions_manager.create_and_add_action(worker_id, start_execute)
                                     .map(move |r| {
                                         // Now that we either failed or registered our action, we can
                                         // consider the action to no longer be in transit.
@@ -697,6 +861,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         r
                                     })
                                     .and_then(|action| {
+                                        *resources.action.lock() = Some(action.clone());
                                         debug!(
                                             operation_id = %action.get_operation_id(),
                                             "Received request to run action"
@@ -744,7 +909,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     }
                                                     ok => ok,
                                                 };
-                                                if let Err(e) = action.cleanup().await {
+                                                resources.cleanup_started.store(true, Ordering::Release);
+                                                // Cancellation drops only the waiter; expiry
+                                                // joins the same cleanup through its completion ack.
+                                                let cleanup_resources = resources.clone();
+                                                let cleanup = background_spawn!("action_cleanup", async move {
+                                                    let result = action.cleanup().await;
+                                                    cleanup_resources.cleanup_finished.notify_one();
+                                                    result
+                                                });
+                                                if let Err(e) = cleanup.await.err_tip(|| "Could not join action cleanup").and_then(|result| result) {
                                                     if result.as_ref().is_ok_and(|finished| is_killed(finished.resource_usage.as_ref())) {
                                                         warn!(?e, "Action cleanup failed after a classified kill");
                                                     } else {
@@ -758,17 +932,30 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             };
 
                             let make_publish_future = {
-                                let mut grpc_client = self.grpc_client.clone();
+                                let grpc_client = self.grpc_client.clone();
 
                                 let running_actions_manager = self.running_actions_manager.clone();
                                 let worker_id = self.worker_id.clone();
-                                move |res: Result<FinishedActionResult, Error>| async move {
+                                move |res: Result<FinishedActionResult, Error>| {
+                                    let mut grpc_client = grpc_client.clone();
+                                    let maybe_instance_name = maybe_instance_name.clone();
+                                    let action_digest = action_digest.clone();
+                                    let running_actions_manager = running_actions_manager.clone();
+                                    let operation_id = operation_id.clone();
+                                    let worker_id = worker_id.clone();
+                                    async move {
                                     let instance_name = maybe_instance_name
                                         .err_tip(|| "`instance_name` could not be resolved; this is likely an internal error in local_worker.")?;
+                                    let res = if attempt_deadline.is_some_and(|deadline| running_actions_manager.now() >= deadline) {
+                                        Err(make_err!(Code::DeadlineExceeded, "Dispatch deadline exceeded before publication"))
+                                    } else {
+                                        res
+                                    };
                                     match res {
                                         Ok(FinishedActionResult { mut action_result, resource_usage }) => {
                                             // Save in the action cache before notifying the scheduler that we've completed.
-                                            if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) &&
+                                            if action_result.error.as_ref().is_none_or(|error| error.code != Code::DeadlineExceeded)
+                                                && let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) &&
                                                 let Err(err) = running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher).await {
                                                     error!(
                                                         ?err,
@@ -782,6 +969,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                 with_phases(&mut resource_usage, &action_result);
                                                 resource_usage
                                             });
+                                            if attempt_deadline.is_some_and(|deadline| running_actions_manager.now() >= deadline) {
+                                                action_result.error = Some(make_err!(
+                                                    Code::DeadlineExceeded, "Dispatch deadline exceeded during cache write"
+                                                ));
+                                            }
                                             let action_stage = ActionStage::Completed(action_result);
                                             grpc_client.execution_response(
                                                 ExecuteResult{
@@ -795,129 +987,60 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             .err_tip(|| "Error while calling execution_response")?;
                                         },
                                         Err(e) => {
-                                            // The manager tags a NotFound on anything the client
-                                            // referenced by digest; no store's wording involved.
-                                            let is_cas_blob_missing = e.code == Code::NotFound
-                                                && e.messages.iter().any(|m| m == MISSING_INPUT_ERROR_TIP);
-                                            if is_cas_blob_missing {
-                                                warn!(
-                                                    ?e,
-                                                    "Missing CAS inputs during prepare_action, returning FAILED_PRECONDITION"
-                                                );
-                                                // The context names the digest; the
-                                                // execute response turns it into the
-                                                // PreconditionFailure detail Bazel
-                                                // re-uploads and retries on.
-                                                let action_result = ActionResult {
-                                                    error: Some(
-                                                        make_err!(
-                                                            Code::FailedPrecondition,
-                                                            "{}",
-                                                            e.message_string()
-                                                        )
-                                                        .with_context(e.context.clone()),
-                                                    ),
-                                                    ..ActionResult::default()
-                                                };
-                                                let action_stage = ActionStage::Completed(action_result);
-                                                grpc_client.execution_response(ExecuteResult{
-                                                    instance_name,
-                                                    operation_id,
-                                                    result: Some(execute_result::Result::ExecuteResponse(action_stage.into())),
-                                                    resource_usage: None,
-                                                }).await.err_tip(|| "Error calling execution_response with missing inputs")?;
-                                            } else {
-                                                grpc_client.execution_response(ExecuteResult{
-                                                    instance_name,
-                                                    operation_id,
-                                                    result: Some(execute_result::Result::InternalError(e.into())),
-                                                    resource_usage: None,
-                                                }).await.err_tip(|| "Error calling execution_response with error")?;
-                                            }
+                                            grpc_client.execution_response(ExecuteResult {
+                                                instance_name,
+                                                operation_id,
+                                                result: Some(execution_failure(e)),
+                                                resource_usage: None,
+                                            }).await.err_tip(|| "Error calling execution_response with error")?;
                                         },
                                     }
                                     Ok(())
+                                    }
                                 }
                             };
 
-                            let add_future_channel = add_future_channel.clone();
-
-                            // Boxed so the launch closure captures one
-                            // erased type, not the whole action future, and
-                            // the compiler's Send check does not overflow.
-                            let start_action_fut: BoxFuture<'static, Result<FinishedActionResult, Error>> =
-                                start_action_fut.boxed();
-                            let launch = {
-                                let span = info_span!(
-                                    "worker_start_action_ctx",
-                                    operation_id = operation_id_to_log,
-                                    digest_function = %digest_hasher.to_string(),
-                                );
-                                move || {
-                                    span.in_scope(|| {
-                                        let _guard = Context::current_with_value(digest_hasher)
-                                            .attach();
-                                        spawn!("worker_start_action", start_action_fut)
-                                    })
-                                }
-                            };
-
+                            // A single deadline includes the ack, setup, execution, cleanup,
+                            // cache write, and final stream publication. It is never restarted
+                            // after an acknowledgement or a phase transition.
                             let actions_in_flight = actions_in_flight.clone();
                             let actions_notify = actions_notify.clone();
-                            let actions_in_flight_fail = actions_in_flight.clone();
-                            let actions_notify_fail = actions_notify.clone();
                             let running_operations_done = running_operations.clone();
-                            let running_operations_fail = running_operations.clone();
                             let tracked_done = tracked_operation_id.clone();
-                            let tracked_fail = tracked_operation_id.clone();
-                            // Counted from the dispatch, so the next one is
-                            // admitted against this slot while the
-                            // acknowledgement is still on its way.
                             actions_in_flight.fetch_add(1, Ordering::Release);
                             running_operations.lock().insert(tracked_operation_id);
-
-                            futures.push(
-                                async move {
-                                    if let Some(acknowledgement) = acknowledgement {
-                                        acknowledgement.await?;
-                                    }
-                                    if let Some(accepted_action) = spent_mark {
-                                        accepted_action.store(true, Ordering::Release);
-                                    }
-                                    launch().await.err_tip(|| "Failed to launch spawn")
+                            let manager = self.running_actions_manager.clone();
+                            let publish = make_publish_future.clone();
+                            let normal_attempt = async move {
+                                if let Some(acknowledgement) = acknowledgement {
+                                    acknowledgement.await?;
                                 }
-                                .map(move |res| {
-                                    let res = res?;
-                                    if let Err(err) = &res {
-                                        error!(?err, "Error executing action");
+                                if let Some(accepted_action) = spent_mark {
+                                    accepted_action.store(true, Ordering::Release);
+                                }
+                                let result = start_action_fut.await;
+                                publish(result).await
+                            }.boxed();
+                            futures.push(async move {
+                                let result = async {
+                                    if run_attempt(manager, attempt_operation_id, attempt_deadline,
+                                        resources, digest_hasher, normal_attempt).await?
+                                    {
+                                        // Expiry is terminal, never the InternalError retry path.
+                                        // This is the expiry notification, not more attempt work.
+                                        make_publish_future(Err(make_err!(
+                                            Code::DeadlineExceeded, "Dispatch deadline exceeded"
+                                        ))).await?;
                                     }
-                                    add_future_channel
-                                        .send(make_publish_future(res).then(move |res| {
-                                            running_operations_done.lock().remove(&tracked_done);
-                                            actions_in_flight.fetch_sub(1, Ordering::Release);
-                                            actions_notify.notify_one();
-                                            core::future::ready(res)
-                                        }).boxed())
-                                        .map_err(|err|
-                                            Error::from_std_err(Code::Internal, &err).append("LocalWorker could not send future")
-                                            )?;
                                     Ok(())
-                                })
-                                .or_else(move |err| {
-                                    // If the make_publish_future is not run we still need to notify.
-                                    running_operations_fail.lock().remove(&tracked_fail);
-                                    actions_in_flight_fail.fetch_sub(1, Ordering::Release);
-                                    actions_notify_fail.notify_one();
-                                    core::future::ready(Err(err))
-                                })
-                                .boxed()
-                            );
+                                }.await;
+                                running_operations_done.lock().remove(&tracked_done);
+                                actions_in_flight.fetch_sub(1, Ordering::Release);
+                                actions_notify.notify_one();
+                                result
+                            }.boxed());
                         }
                     }
-                },
-                res = add_future_rx.next() => {
-                    let fut = res.err_tip(|| "New future stream receives should never be closed")?;
-                    futures.push(fut);
                 },
                 res = futures.next() => res.err_tip(|| "Keep-alive should always pending. Likely unable to send data to scheduler")??,
                 complete_msg = shutdown_rx.recv().fuse() => {
@@ -1753,5 +1876,453 @@ fn persistent_worker_settings(
     crate::running_actions_manager::PersistentWorkersSettings {
         enabled: config.is_none_or(|c| c.enabled),
         pool: PoolConfig { namespaced, ..pool },
+    }
+}
+
+fn execution_failure(mut error: Error) -> execute_result::Result {
+    let missing_input = error.code == Code::NotFound
+        && error
+            .messages
+            .iter()
+            .any(|message| message == MISSING_INPUT_ERROR_TIP);
+    if missing_input {
+        error.code = Code::FailedPrecondition;
+    }
+    if missing_input || error.code == Code::DeadlineExceeded {
+        execute_result::Result::ExecuteResponse(
+            ActionStage::Completed(ActionResult {
+                error: Some(error),
+                ..ActionResult::default()
+            })
+            .into(),
+        )
+    } else {
+        execute_result::Result::InternalError(error.into())
+    }
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::common::DigestInfo;
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::persistent_worker::pool::CommandRegistration;
+
+    struct TestAction {
+        operation_id: OperationId,
+        directory: String,
+        registration: Mutex<CommandRegistration>,
+        reservation: AtomicBool,
+        preparing: Notify,
+        cleanup_entered: Notify,
+        cleanup_allowed: Option<Arc<Notify>>,
+        cleaned: Notify,
+    }
+
+    impl TestAction {
+        fn new() -> Arc<Self> {
+            Self::with_cleanup_gate(None)
+        }
+
+        fn with_cleanup_gate(cleanup_allowed: Option<Arc<Notify>>) -> Arc<Self> {
+            Arc::new(Self {
+                operation_id: "attempt".into(),
+                directory: String::new(),
+                registration: Mutex::new(CommandRegistration::new(None, SystemTime::now)),
+                reservation: AtomicBool::new(true),
+                preparing: Notify::new(),
+                cleanup_entered: Notify::new(),
+                cleanup_allowed,
+                cleaned: Notify::new(),
+            })
+        }
+    }
+
+    impl RunningAction for TestAction {
+        fn get_operation_id(&self) -> &OperationId {
+            &self.operation_id
+        }
+        async fn prepare_action(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+            self.preparing.notify_one();
+            core::future::pending().await
+        }
+        async fn execute(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+            Ok(self)
+        }
+        async fn upload_results(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+            Ok(self)
+        }
+        async fn get_finished_result(self: Arc<Self>) -> Result<ActionResult, Error> {
+            Ok(ActionResult::default())
+        }
+        async fn cleanup(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+            self.cleanup_entered.notify_one();
+            if let Some(allowed) = &self.cleanup_allowed {
+                allowed.notified().await;
+            }
+            assert!(
+                self.reservation.swap(false, Ordering::AcqRel),
+                "cleanup runs once"
+            );
+            self.cleaned.notify_one();
+            Ok(self)
+        }
+        fn resource_usage(&self) -> Option<ActionResourceUsage> {
+            None
+        }
+        fn get_work_directory(&self) -> &String {
+            &self.directory
+        }
+    }
+
+    struct TestManager {
+        epoch: time::Instant,
+        action: Mutex<Option<Arc<TestAction>>>,
+        expired: AtomicBool,
+        metrics: Arc<RunningActionManagerMetrics>,
+    }
+
+    impl TestManager {
+        fn new(action: Option<Arc<TestAction>>) -> Arc<Self> {
+            Arc::new(Self {
+                epoch: time::Instant::now(),
+                action: Mutex::new(action),
+                expired: AtomicBool::new(false),
+                metrics: Arc::new(RunningActionManagerMetrics::default()),
+            })
+        }
+    }
+
+    impl RunningActionsManager for TestManager {
+        type RunningAction = TestAction;
+        async fn create_and_add_action(
+            self: &Arc<Self>,
+            _worker_id: String,
+            _start: StartExecute,
+        ) -> Result<Arc<TestAction>, Error> {
+            Ok(self
+                .action
+                .lock()
+                .as_ref()
+                .expect("registered action")
+                .clone())
+        }
+        async fn cache_action_result(
+            &self,
+            _digest: DigestInfo,
+            _result: &mut ActionResult,
+            _hasher: DigestHasherFunc,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn kill_all(&self) {
+            panic!("unexpected disconnect");
+        }
+        async fn kill_operation(&self, _operation_id: &OperationId) -> Result<(), Error> {
+            panic!("expiry must not use graceful scheduler kill");
+        }
+        fn now(&self) -> SystemTime {
+            UNIX_EPOCH + self.epoch.elapsed()
+        }
+        async fn wait_for_attempt_deadline(&self, deadline: SystemTime) {
+            time::sleep_until(self.epoch + deadline.duration_since(UNIX_EPOCH).unwrap()).await;
+        }
+        async fn expire_attempt(&self, _operation_id: &OperationId) -> Option<Arc<TestAction>> {
+            self.expired.store(true, Ordering::Release);
+            let action = self.action.lock().clone()?;
+            let stopped = action.registration.lock().expire_and_subscribe();
+            if let Some(mut stopped) = stopped {
+                stopped.wait_for(|stopped| *stopped).await.unwrap();
+            }
+            Some(action)
+        }
+        fn metrics(&self) -> &Arc<RunningActionManagerMetrics> {
+            &self.metrics
+        }
+    }
+
+    fn retained(action: Option<Arc<TestAction>>) -> Arc<AttemptResources<TestAction>> {
+        Arc::new(AttemptResources::new(action, None))
+    }
+
+    #[nativelink_test(start_paused = true)]
+    async fn delivery_and_stalled_ack_use_dispatch_deadline() {
+        let manager = TestManager::new(None);
+        let deadline = UNIX_EPOCH + Duration::from_secs(10);
+        time::advance(Duration::from_secs(3)).await; // delivery consumed this budget
+        let ack_started = Arc::new(Notify::new());
+        let setup_started = Arc::new(AtomicBool::new(false));
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+        let future = {
+            let ack_started = ack_started.clone();
+            let setup_started = setup_started.clone();
+            async move {
+                ack_started.notify_one();
+                let _ = ack_rx.await;
+                setup_started.store(true, Ordering::Release);
+                Ok(())
+            }
+            .boxed()
+        };
+        let attempt = spawn!(
+            "delayed_ack",
+            run_attempt(
+                manager.clone(),
+                "attempt".into(),
+                Some(deadline),
+                retained(None),
+                DigestHasherFunc::Sha256,
+                future,
+            )
+        );
+        ack_started.notified().await;
+        time::advance(Duration::from_secs(7)).await;
+        assert!(attempt.await.unwrap().unwrap());
+        assert_eq!(
+            time::Instant::now() - manager.epoch,
+            Duration::from_secs(10)
+        );
+        assert!(manager.expired.load(Ordering::Acquire));
+        assert!(!setup_started.load(Ordering::Acquire));
+        assert!(
+            ack_tx.send(()).is_err(),
+            "the ack waiter was joined, not detached"
+        );
+    }
+
+    #[nativelink_test(start_paused = true)]
+    async fn stalled_prepare_is_joined_and_actual_cleanup_releases_reservation() {
+        let action = TestAction::new();
+        let manager = TestManager::new(Some(action.clone()));
+        let future = {
+            let action = action.clone();
+            async move { action.prepare_action().await.map(|_| ()) }.boxed()
+        };
+        let attempt = spawn!(
+            "stalled_prepare",
+            run_attempt(
+                manager.clone(),
+                action.operation_id.clone(),
+                Some(UNIX_EPOCH + Duration::from_secs(10)),
+                retained(Some(action.clone())),
+                DigestHasherFunc::Sha256,
+                future,
+            )
+        );
+        action.preparing.notified().await;
+        time::advance(Duration::from_secs(10)).await;
+        assert!(attempt.await.unwrap().unwrap());
+        action.cleaned.notified().await;
+        assert!(!action.reservation.load(Ordering::Acquire));
+        assert!(!action.registration.lock().active);
+        assert!(
+            action.registration.lock().check_deadline().is_err(),
+            "no late spawn"
+        );
+    }
+
+    #[nativelink_test(start_paused = true)]
+    async fn expiry_keeps_registered_command_alive_until_stopped_ack() {
+        for precondition in [false, true] {
+            let action = TestAction::new();
+            let resources = Arc::new(AttemptResources::new(
+                Some(action.clone()),
+                precondition.then(|| Mutex::new(CommandRegistration::new(None, SystemTime::now))),
+            ));
+            let registration = if precondition {
+                resources
+                    .precondition
+                    .as_ref()
+                    .expect("precondition test supplies registration")
+            } else {
+                &action.registration
+            };
+            registration.lock().register();
+            let mut expiry_signal = registration.lock().expired_signal.subscribe();
+            let manager = TestManager::new(Some(action.clone()));
+            let signalled = Arc::new(Notify::new());
+            let allow_stop = Arc::new(Notify::new());
+            let child_live = Arc::new(AtomicBool::new(true));
+            let future = {
+                let action = action.clone();
+                let resources = resources.clone();
+                let signalled = signalled.clone();
+                let allow_stop = allow_stop.clone();
+                let child_live = child_live.clone();
+                async move {
+                    expiry_signal.wait_for(|expired| *expired).await.unwrap();
+                    signalled.notify_one();
+                    allow_stop.notified().await;
+                    child_live.store(false, Ordering::Release);
+                    if precondition {
+                        resources
+                            .precondition
+                            .as_ref()
+                            .expect("precondition test supplies registration")
+                            .lock()
+                            .stop();
+                    } else {
+                        action.registration.lock().stop();
+                    }
+                    core::future::pending::<Result<(), Error>>().await
+                }
+                .boxed()
+            };
+            let mut attempt = Box::pin(run_attempt(
+                manager,
+                action.operation_id.clone(),
+                Some(UNIX_EPOCH + Duration::from_secs(10)),
+                resources,
+                DigestHasherFunc::Sha256,
+                future,
+            ));
+            assert!(futures::poll!(&mut attempt).is_pending());
+            time::advance(Duration::from_secs(10)).await;
+            assert!(futures::poll!(&mut attempt).is_pending());
+            signalled.notified().await;
+            assert!(child_live.load(Ordering::Acquire));
+            assert!(action.reservation.load(Ordering::Acquire));
+            assert!(futures::poll!(&mut attempt).is_pending());
+            allow_stop.notify_one();
+            assert!(attempt.await.unwrap());
+            action.cleaned.notified().await;
+            assert!(!child_live.load(Ordering::Acquire));
+            assert!(!action.reservation.load(Ordering::Acquire));
+        }
+    }
+
+    #[nativelink_test(start_paused = true)]
+    async fn expiry_waits_for_reservation_cleanup_before_terminal_publication() {
+        for cleanup_already_started in [false, true] {
+            let allow_cleanup = Arc::new(Notify::new());
+            let action = TestAction::with_cleanup_gate(Some(allow_cleanup.clone()));
+            let manager = TestManager::new(Some(action.clone()));
+            let resources = retained(Some(action.clone()));
+            let published = Arc::new(AtomicBool::new(false));
+            let future = {
+                let action = action.clone();
+                let resources = resources.clone();
+                async move {
+                    if cleanup_already_started {
+                        resources.cleanup_started.store(true, Ordering::Release);
+                        let cleanup = background_spawn!("test_action_cleanup", async move {
+                            let result = action.cleanup().await;
+                            resources.cleanup_finished.notify_one();
+                            result
+                        });
+                        cleanup.await.unwrap()?;
+                    } else {
+                        action.prepare_action().await?;
+                    }
+                    core::future::pending::<Result<(), Error>>().await
+                }
+                .boxed()
+            };
+            let terminal = {
+                let action = action.clone();
+                let published = published.clone();
+                async move {
+                    assert!(
+                        run_attempt(
+                            manager,
+                            action.operation_id.clone(),
+                            Some(UNIX_EPOCH + Duration::from_secs(10)),
+                            resources,
+                            DigestHasherFunc::Sha256,
+                            future,
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    assert!(!action.reservation.load(Ordering::Acquire));
+                    let execute_result::Result::ExecuteResponse(response) = execution_failure(
+                        make_err!(Code::DeadlineExceeded, "Dispatch deadline exceeded"),
+                    ) else {
+                        panic!("expiry must publish a terminal result");
+                    };
+                    published.store(true, Ordering::Release);
+                    assert_eq!(response.status.unwrap().code, Code::DeadlineExceeded as i32);
+                }
+            };
+            tokio::pin!(terminal);
+            assert!(futures::poll!(&mut terminal).is_pending());
+            if cleanup_already_started {
+                action.cleanup_entered.notified().await;
+            } else {
+                action.preparing.notified().await;
+            }
+            time::advance(Duration::from_secs(10)).await;
+            assert!(futures::poll!(&mut terminal).is_pending());
+            if !cleanup_already_started {
+                action.cleanup_entered.notified().await;
+            }
+            assert!(action.reservation.load(Ordering::Acquire));
+            assert!(!published.load(Ordering::Acquire));
+            allow_cleanup.notify_one();
+            terminal.await;
+            assert!(published.load(Ordering::Acquire));
+            assert!(!action.reservation.load(Ordering::Acquire));
+        }
+    }
+
+    #[nativelink_test(start_paused = true)]
+    async fn predeadline_completion_remains_success_and_releases_bookkeeping() {
+        let action = TestAction::new();
+        let manager = TestManager::new(Some(action.clone()));
+        let resources = retained(Some(action.clone()));
+        let published = Arc::new(AtomicBool::new(false));
+        let future = {
+            let action = action.clone();
+            let resources = resources.clone();
+            let published = published.clone();
+            async move {
+                time::sleep(Duration::from_secs(2)).await;
+                let result = action
+                    .clone()
+                    .execute()
+                    .await?
+                    .get_finished_result()
+                    .await?;
+                assert!(result.error.is_none());
+                resources.cleanup_started.store(true, Ordering::Release);
+                action.cleanup().await?;
+                resources.cleanup_finished.notify_one();
+                published.store(true, Ordering::Release);
+                Ok(())
+            }
+            .boxed()
+        };
+        assert!(
+            !run_attempt(
+                manager.clone(),
+                action.operation_id.clone(),
+                Some(UNIX_EPOCH + Duration::from_secs(10)),
+                resources,
+                DigestHasherFunc::Sha256,
+                future,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(published.load(Ordering::Acquire));
+        assert!(!manager.expired.load(Ordering::Acquire));
+        assert!(!action.reservation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn timeout_publication_is_completed_not_internal_error() {
+        let execute_result::Result::ExecuteResponse(response) = execution_failure(make_err!(
+            Code::DeadlineExceeded,
+            "Dispatch deadline exceeded"
+        )) else {
+            panic!("timeout would requeue through InternalError");
+        };
+        assert_eq!(response.status.unwrap().code, Code::DeadlineExceeded as i32);
+        assert!(matches!(
+            execution_failure(make_err!(Code::Unavailable, "crash before expiry")),
+            execute_result::Result::InternalError(_)
+        ));
     }
 }

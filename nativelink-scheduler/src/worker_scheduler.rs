@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use nativelink_config::schedulers::ResourceCapacity;
@@ -96,6 +97,8 @@ pub struct WorkerSummary {
     pub available_platform_properties: HashMap<String, String>,
     /// What the worker last reported having to spare, if it reports.
     pub free_memory_kb: Option<u64>,
+    /// Latest deadline among attempts still owned by this worker.
+    pub latest_attempt_deadline: Option<SystemTime>,
     /// Cache stats from the latest keepalive, if reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<WorkerCacheStats>,
@@ -194,6 +197,9 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     /// Removes timed out workers from the pool. This is called periodically by an
     /// external source.
     async fn remove_timedout_workers(&self, now_timestamp: WorkerTimestamp) -> Result<(), Error>;
+
+    /// Complete expired attempts with a terminal deadline error.
+    async fn expire_attempts(&self, now: SystemTime) -> Result<(), Error>;
 
     /// Sets if the worker is draining or not.
     async fn set_drain_worker(&self, worker_id: &WorkerId, is_draining: bool) -> Result<(), Error>;

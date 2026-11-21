@@ -24,13 +24,15 @@ use core::{fmt, mem};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_util::background_spawn;
 use nativelink_util::task::JoinHandleDropGuard;
 use parking_lot::Mutex;
-use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tokio::sync::{Notify, watch};
+use tracing::{info, warn};
 
 use super::live_worker::LiveWorker;
 use super::protocol::WireFormat;
@@ -129,12 +131,10 @@ pub struct PoolConfig {
     pub max_workers_per_key: usize,
     pub idle_timeout: Duration,
     pub max_requests_per_worker: u64,
-    /// SIGKILL grace when shutting a worker down.
+    /// Shutdown grace for healthy retirement; attempt expiry always bypasses it.
     pub shutdown_grace: Duration,
-    /// How long `acquire` waits for a worker to come back when the key is
-    /// at `max_workers_per_key` with none idle, before the action runs
-    /// one-shot instead. Bazel itself queues on `worker_max_instances`; a
-    /// one-shot run of a worker tool pays the tool's startup again.
+    /// How long `acquire` waits at the per-key cap before reporting an error.
+    /// Nonexpired actions may then use the established one-shot fallback.
     pub acquire_timeout: Duration,
     /// Start each worker process in its own user, PID, UTS, IPC and mount
     /// namespaces, with a fresh `/proc`, as one-shot actions are when the
@@ -157,6 +157,78 @@ impl Default for PoolConfig {
     }
 }
 
+/// Serializes expiry with child/lease registration. It never crosses an await.
+#[derive(Debug)]
+pub(crate) struct CommandRegistration {
+    pub(crate) expired: Arc<AtomicBool>,
+    pub(crate) active: bool,
+    pub(crate) stopped: watch::Sender<bool>,
+    pub(crate) expired_signal: watch::Sender<bool>,
+    deadline: Option<SystemTime>,
+    now: fn() -> SystemTime,
+}
+
+impl CommandRegistration {
+    pub(crate) fn new(deadline: Option<SystemTime>, now: fn() -> SystemTime) -> Self {
+        Self {
+            expired: Arc::new(AtomicBool::new(false)),
+            active: false,
+            stopped: watch::channel(true).0,
+            expired_signal: watch::channel(false).0,
+            deadline,
+            now,
+        }
+    }
+
+    pub(crate) fn check_deadline(&self) -> Result<(), Error> {
+        if self
+            .deadline
+            .is_some_and(|deadline| (self.now)() >= deadline)
+        {
+            self.expire();
+        }
+        if self.expired.load(Ordering::Acquire) {
+            return Err(make_err!(
+                Code::DeadlineExceeded,
+                "Dispatch deadline exceeded"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn expire(&self) {
+        self.expired.store(true, Ordering::Release);
+        self.expired_signal.send_replace(true);
+    }
+
+    pub(crate) fn expire_and_subscribe(&self) -> Option<watch::Receiver<bool>> {
+        self.expire();
+        self.active.then(|| self.stopped.subscribe())
+    }
+
+    pub(crate) fn register(&mut self) {
+        self.active = true;
+        self.stopped.send_replace(false);
+    }
+
+    /// The one-shot spawn gate, including a nonexpired persistent fallback.
+    /// The caller holds the registration lock through the synchronous spawn.
+    pub(crate) fn register_command<T>(
+        &mut self,
+        spawn: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.check_deadline()?;
+        let command = spawn()?;
+        self.register();
+        Ok(command)
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.active = false;
+        self.stopped.send_replace(true);
+    }
+}
+
 /// Reservation handle returned by `acquire`. Holding it removes the worker
 /// from the pool's idle set; `release` returns it (unless the request marked
 /// it as dead). Drop-without-release is treated as "worker is dead": it is
@@ -171,6 +243,7 @@ struct LeaseInner {
     worker: LiveWorker,
     pool: Arc<PoolInner>,
     key: WorkerKey,
+    attempt: Arc<Mutex<CommandRegistration>>,
 }
 
 #[derive(Debug)]
@@ -222,13 +295,49 @@ impl Lease {
     /// still healthy. Unhealthy workers are shut down asynchronously and not
     /// returned to the idle set.
     pub async fn release(mut self, healthy: bool) {
-        let Some(inner) = self.inner.take() else {
+        let Some(mut inner) = self.inner.take() else {
             return;
         };
-        inner
-            .pool
-            .return_worker(inner.key, inner.worker, healthy)
-            .await;
+        // Returning a healthy worker and expiry are serialized: expiry can
+        // never kill a worker after it has been handed to another action.
+        {
+            let mut attempt = inner.attempt.lock();
+            if healthy
+                && attempt.check_deadline().is_ok()
+                && inner.worker.request_count() < inner.pool.config.max_requests_per_worker
+            {
+                inner.worker.set_attempt_expired(None);
+                inner
+                    .pool
+                    .state
+                    .lock()
+                    .entry(inner.key.clone())
+                    .or_insert_with(KeyState::new)
+                    .idle
+                    .push(inner.worker);
+                attempt.stop();
+                inner.pool.returned.notify_waiters();
+                return;
+            }
+            if attempt.expired.load(Ordering::Acquire) {
+                inner.worker.hard_signal();
+            }
+        }
+        let count_slot = CountSlotGuard::new(inner.pool.clone(), inner.key.clone());
+        let grace = if inner.attempt.lock().expired.load(Ordering::Acquire) {
+            Duration::ZERO
+        } else {
+            inner.pool.config.shutdown_grace
+        };
+        // Cancellation of release must not cancel reaping or strand the ack.
+        drop(
+            background_spawn!("persistent_worker_release", async move {
+                inner.worker.shutdown(grace).await;
+                count_slot.decrement_now();
+                inner.attempt.lock().stop();
+            })
+            .await,
+        );
     }
 }
 
@@ -236,19 +345,24 @@ impl Drop for Lease {
     fn drop(&mut self) {
         // If the caller forgot to call `release`, treat the worker as
         // unhealthy and shut it down on a detached task.
-        if let Some(inner) = self.inner.take() {
-            let pool = inner.pool.clone();
-            let key = inner.key.clone();
-            let worker = inner.worker;
-            let grace = pool.config.shutdown_grace;
+        if let Some(mut inner) = self.inner.take() {
+            let expired = inner.attempt.lock().expired.load(Ordering::Acquire);
+            // Signal synchronously, before scheduling the reaper. Dropping an
+            // acquire future at expiry cannot buy the child a shutdown grace.
+            if expired {
+                inner.worker.hard_signal();
+            }
+            let count_slot = CountSlotGuard::new(inner.pool.clone(), inner.key.clone());
+            let grace = if expired {
+                Duration::ZERO
+            } else {
+                inner.pool.config.shutdown_grace
+            };
             background_spawn!("persistent_worker_lease_drop", async move {
-                let count_slot = CountSlotGuard::new(pool.clone(), key.clone());
-                warn!(
-                    ?key,
-                    "Lease dropped without release; treating worker as unhealthy"
-                );
-                worker.shutdown(grace).await;
+                warn!(key = ?inner.key, "Lease dropped without release; treating worker as unhealthy");
+                inner.worker.shutdown(grace).await;
                 count_slot.decrement_now();
+                inner.attempt.lock().stop();
             });
         }
     }
@@ -294,28 +408,6 @@ impl PoolInner {
         }
         self.returned.notify_waiters();
     }
-
-    async fn return_worker(self: Arc<Self>, key: WorkerKey, worker: LiveWorker, healthy: bool) {
-        let exceeded_cap = worker.request_count() >= self.config.max_requests_per_worker;
-        if !healthy || exceeded_cap {
-            let count_slot = CountSlotGuard::new(self.clone(), key.clone());
-            debug!(
-                ?key,
-                request_count = worker.request_count(),
-                healthy,
-                "Retiring persistent worker"
-            );
-            worker.shutdown(self.config.shutdown_grace).await;
-            count_slot.decrement_now();
-            return;
-        }
-        {
-            let mut state = self.state.lock();
-            let entry = state.entry(key).or_insert_with(KeyState::new);
-            entry.idle.push(worker);
-        }
-        self.returned.notify_waiters();
-    }
 }
 
 /// The pool itself.
@@ -348,24 +440,26 @@ impl PersistentWorkerPool {
 
     /// Acquire a worker for `key`. If an idle worker is available it is
     /// returned. Otherwise a new one is spawned, capped at
-    /// `max_workers_per_key`. If the cap is reached and no idle worker exists,
-    /// returns `Err(Code::ResourceExhausted)` — the caller should fall back to
-    /// the one-shot subprocess path or wait and retry.
+    /// `max_workers_per_key`. At the cap, waits for a return up to the acquire
+    /// timeout. Expiry and spawn/lease registration use the action's lock.
     ///
     /// `working_dir` is a stable worker process directory. Per-request action
     /// directories are passed through `WorkRequest::sandbox_dir`, because the
     /// action directory is deleted after each action completes.
-    pub async fn acquire(
+    pub(crate) async fn acquire(
         &self,
         key: WorkerKey,
         executable_path: &Path,
         working_dir: &Path,
+        attempt: Arc<Mutex<CommandRegistration>>,
     ) -> Result<Lease, Error> {
         let deadline = tokio::time::Instant::now() + self.inner.config.acquire_timeout;
         loop {
             // Take an idle worker, or reserve a slot to spawn one, without
             // blocking on the spawn itself.
             let notified = {
+                let mut registration = attempt.lock();
+                registration.check_deadline()?;
                 let mut state = self.inner.state.lock();
                 let entry = state.entry(key.clone()).or_insert_with(KeyState::new);
                 while let Some(mut worker) = entry.idle.pop() {
@@ -374,11 +468,17 @@ impl PersistentWorkerPool {
                         entry.total_count = entry.total_count.saturating_sub(1);
                         continue;
                     }
+                    worker.set_attempt_expired(Some((
+                        registration.expired.clone(),
+                        registration.expired_signal.subscribe(),
+                    )));
+                    registration.register();
                     return Ok(Lease {
                         inner: Some(LeaseInner {
                             worker,
                             pool: self.inner.clone(),
                             key,
+                            attempt: attempt.clone(),
                         }),
                     });
                 }
@@ -408,6 +508,8 @@ impl PersistentWorkerPool {
 
         // Lock released; spawn outside the critical section.
         let count_slot = CountSlotGuard::new(self.inner.clone(), key.clone());
+        let mut registration = attempt.lock();
+        registration.check_deadline()?;
         let spawn_result = LiveWorker::spawn(
             executable_path,
             &key.startup_args,
@@ -415,6 +517,10 @@ impl PersistentWorkerPool {
             working_dir,
             &key.env,
             self.inner.config.namespaced,
+            (
+                registration.expired.clone(),
+                registration.expired_signal.subscribe(),
+            ),
         );
         let worker = match spawn_result {
             Ok(w) => w,
@@ -423,12 +529,15 @@ impl PersistentWorkerPool {
             }
         };
         count_slot.disarm();
+        registration.register();
+        drop(registration);
         info!(?key, "Spawned new persistent worker");
         Ok(Lease {
             inner: Some(LeaseInner {
                 worker,
                 pool: self.inner.clone(),
                 key,
+                attempt,
             }),
         })
     }
@@ -489,10 +598,46 @@ mod tests {
     #[cfg(unix)]
     use std::io::Write as _;
 
-    #[cfg(unix)]
     use nativelink_macro::nativelink_test;
 
     use super::*;
+
+    #[cfg(unix)]
+    fn attempt() -> Arc<Mutex<CommandRegistration>> {
+        Arc::new(Mutex::new(CommandRegistration::new(None, SystemTime::now)))
+    }
+
+    #[nativelink_test(start_paused = true)]
+    async fn expired_acquire_never_spawns_or_reserves() {
+        let pool = PersistentWorkerPool::default();
+        let attempt = Arc::new(Mutex::new(CommandRegistration::new(
+            Some(SystemTime::UNIX_EPOCH),
+            SystemTime::now,
+        )));
+        let key = WorkerKey::from_argv(&["must-not-spawn".into()], WireFormat::Json).unwrap();
+        let error = pool
+            .acquire(
+                key,
+                Path::new("must-not-spawn"),
+                Path::new("."),
+                attempt.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::DeadlineExceeded);
+        assert!(attempt.lock().expired.load(Ordering::Acquire));
+        assert!(!attempt.lock().active);
+        assert_eq!(pool.live_workers(), 0);
+        // Exercise the production one-shot fallback gate after acquisition
+        // fails: expiry must reject it before the spawn callback is invoked.
+        let mut spawned = false;
+        let fallback = attempt.lock().register_command(|| {
+            spawned = true;
+            Ok(())
+        });
+        assert_eq!(fallback.unwrap_err().code, Code::DeadlineExceeded);
+        assert!(!spawned);
+    }
 
     #[cfg(unix)]
     fn shell_script(working_dir: &Path, body: &str) -> PathBuf {
@@ -632,7 +777,7 @@ mod tests {
         let _sweeper = pool.spawn_sweeper();
 
         let lease = pool
-            .acquire(key, Path::new("/bin/sh"), dir.path())
+            .acquire(key, Path::new("/bin/sh"), dir.path(), attempt())
             .await
             .unwrap();
         lease.release(true).await;
@@ -660,7 +805,7 @@ mod tests {
         });
 
         let lease = pool
-            .acquire(key.clone(), Path::new("/bin/sh"), dir.path())
+            .acquire(key.clone(), Path::new("/bin/sh"), dir.path(), attempt())
             .await
             .unwrap();
         let release_handle =
@@ -671,7 +816,7 @@ mod tests {
 
         let next_lease = tokio::time::timeout(
             Duration::from_secs(2),
-            pool.acquire(key, Path::new("/bin/sh"), dir.path()),
+            pool.acquire(key, Path::new("/bin/sh"), dir.path(), attempt()),
         )
         .await
         .unwrap()
@@ -693,7 +838,7 @@ mod tests {
         });
 
         let lease = pool
-            .acquire(key.clone(), Path::new("/bin/sh"), dir.path())
+            .acquire(key.clone(), Path::new("/bin/sh"), dir.path(), attempt())
             .await
             .unwrap();
         let waiter = {
@@ -701,7 +846,8 @@ mod tests {
             let key = key.clone();
             let dir = dir.path().to_path_buf();
             background_spawn!("persistent_worker_acquire_waiter", async move {
-                pool.acquire(key, Path::new("/bin/sh"), &dir).await
+                pool.acquire(key, Path::new("/bin/sh"), &dir, attempt())
+                    .await
             })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -732,11 +878,11 @@ mod tests {
         });
 
         let lease = pool
-            .acquire(key.clone(), Path::new("/bin/sh"), dir.path())
+            .acquire(key.clone(), Path::new("/bin/sh"), dir.path(), attempt())
             .await
             .unwrap();
         let err = pool
-            .acquire(key, Path::new("/bin/sh"), dir.path())
+            .acquire(key, Path::new("/bin/sh"), dir.path(), attempt())
             .await
             .unwrap_err();
         assert_eq!(err.code, Code::ResourceExhausted);

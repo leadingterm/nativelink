@@ -34,7 +34,7 @@ use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::{ActionInfoWithProps, Worker};
 use nativelink_scheduler::worker_registry::WorkerRegistry;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
-use nativelink_util::action_messages::{OperationId, WorkerId};
+use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId, WorkerId};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
 use nativelink_util::origin_event::OriginMetadata;
@@ -56,6 +56,8 @@ const WORKER_TIMEOUT_S: u64 = 10;
 struct RecordingStateManager {
     errors: Mutex<Vec<(OperationId, WorkerId, Code)>>,
     revoked: AtomicBool,
+    fail_terminal: AtomicBool,
+    completed: Mutex<Vec<Option<Code>>>,
 }
 
 impl RecordingStateManager {
@@ -72,6 +74,19 @@ impl WorkerStateManager for RecordingStateManager {
         worker_id: &WorkerId,
         update: UpdateOperationType,
     ) -> Result<(), Error> {
+        if let UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(result)) = &update
+        {
+            if self.fail_terminal.load(Ordering::Acquire) {
+                return Err(nativelink_error::make_err!(
+                    Code::Unavailable,
+                    "state write failed"
+                ));
+            }
+            self.completed
+                .lock()
+                .unwrap()
+                .push(result.error.as_ref().map(|err| err.code));
+        }
         if let UpdateOperationType::UpdateWithError(err) = update {
             self.errors
                 .lock()
@@ -102,8 +117,12 @@ struct Fixture {
 
 /// One connected worker holding one dispatched operation.
 async fn dispatched() -> Result<Fixture, Error> {
+    dispatched_with_deadline(None).await
+}
+
+async fn dispatched_with_deadline(deadline: Option<SystemTime>) -> Result<Fixture, Error> {
     let state_manager = Arc::new(RecordingStateManager::default());
-    let scheduler = ApiWorkerScheduler::new(
+    let scheduler = ApiWorkerScheduler::new_with_clock(
         state_manager.clone(),
         Arc::new(PlatformPropertyManager::new(HashMap::new())),
         WorkerAllocationStrategy::default(),
@@ -120,6 +139,7 @@ async fn dispatched() -> Result<Fixture, Error> {
         false,
         Duration::from_secs(15),
         "scheduler".to_string(),
+        Box::new(|| SystemTime::UNIX_EPOCH + Duration::from_secs(NOW)),
     );
     let worker_id = WorkerId::from(String::from("worker"));
     let (tx, mut rx) = mpsc::channel(8);
@@ -144,6 +164,7 @@ async fn dispatched() -> Result<Fixture, Error> {
                 scheduler_start_execute_event_id: None,
             },
             NOW,
+            deadline,
         )
         .await?;
     rx.recv()
@@ -156,6 +177,44 @@ async fn dispatched() -> Result<Fixture, Error> {
         operation_id,
         _rx: rx,
     })
+}
+
+#[nativelink_test]
+async fn failed_terminal_publication_keeps_ownership_until_deadline() -> Result<(), Error> {
+    let deadline = SystemTime::UNIX_EPOCH + Duration::from_secs(NOW + 30);
+    let f = dispatched_with_deadline(Some(deadline)).await?;
+    f.state_manager.fail_terminal.store(true, Ordering::Release);
+    assert!(
+        f.scheduler
+            .update_action(
+                &f.worker_id,
+                &f.operation_id,
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                    ActionResult::default()
+                )),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.scheduler.worker_snapshot().await[0].latest_attempt_deadline,
+        Some(deadline)
+    );
+    f.scheduler.worker_disconnected(&f.worker_id).await?;
+    assert_eq!(f.scheduler.worker_snapshot().await[0].running_actions, 1);
+    assert!(f.scheduler.expire_attempts(deadline).await.is_err());
+    assert_eq!(f.scheduler.worker_snapshot().await[0].running_actions, 1);
+    f.state_manager
+        .fail_terminal
+        .store(false, Ordering::Release);
+    f.scheduler.expire_attempts(deadline).await?;
+    assert_eq!(
+        *f.state_manager.completed.lock().unwrap(),
+        vec![Some(Code::DeadlineExceeded)]
+    );
+    assert!(f.state_manager.errors().is_empty());
+    assert!(f.scheduler.worker_snapshot().await.is_empty());
+    Ok(())
 }
 
 #[nativelink_test]

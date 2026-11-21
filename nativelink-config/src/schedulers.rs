@@ -159,6 +159,10 @@ pub struct SimpleSpec {
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     pub client_action_timeout_s: u64,
 
+    /// Whole dispatch-attempt budget, in seconds. Zero disables the deadline.
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    pub attempt_timeout_s: u64,
+
     /// Periodically count the actions in each stage and report them as the
     /// `execution.active.count` metric.
     ///

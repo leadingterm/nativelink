@@ -32,6 +32,8 @@
 use core::time::Duration;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bytes::BytesMut;
@@ -56,7 +58,7 @@ pub struct LiveWorker {
     child: Child,
     /// Registered with the reaper for as long as the child is ours to wait on.
     _owned: crate::reaper::OwnedChild,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     /// Wire format we negotiated at spawn (immutable for this worker's lifetime).
     wire_format: WireFormat,
@@ -68,6 +70,7 @@ pub struct LiveWorker {
     /// across requests for the same `WorkerKey` until per-request sandboxing
     /// arrives in v2.
     working_dir: PathBuf,
+    attempt_expired: Option<(Arc<AtomicBool>, tokio::sync::watch::Receiver<bool>)>,
 }
 
 impl LiveWorker {
@@ -84,6 +87,7 @@ impl LiveWorker {
         working_dir: &Path,
         env: &[(String, String)],
         namespaced: bool,
+        attempt_expired: (Arc<AtomicBool>, tokio::sync::watch::Receiver<bool>),
     ) -> Result<Self, Error> {
         let mut cmd = Command::new(executable);
         cmd.args(startup_args)
@@ -153,13 +157,39 @@ impl LiveWorker {
         Ok(Self {
             child,
             _owned: owned,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             wire_format,
             request_count: 0,
             last_used: Instant::now(),
             working_dir: working_dir.to_path_buf(),
+            attempt_expired: Some(attempt_expired),
         })
+    }
+
+    pub(crate) fn set_attempt_expired(
+        &mut self,
+        expired: Option<(Arc<AtomicBool>, tokio::sync::watch::Receiver<bool>)>,
+    ) {
+        self.attempt_expired = expired;
+    }
+
+    /// No async scheduling and no grace between expiry and the hard signal.
+    pub(crate) fn hard_signal(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.child.id().and_then(|pid| i32::try_from(pid).ok()) {
+            // SAFETY: this child was started as its own process-group leader.
+            // Its Child/OwnedChild remain owned here, so its PID cannot be reused.
+            if unsafe { libc::kill(-pgid, libc::SIGKILL) } == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    warn!(?err, pgid, "Could not hard-kill persistent worker group");
+                }
+            }
+        }
+        if let Err(err) = self.child.start_kill() {
+            warn!(?err, "Could not hard-kill persistent worker");
+        }
     }
 
     pub const fn wire_format(&self) -> WireFormat {
@@ -211,10 +241,14 @@ impl LiveWorker {
 
         let bytes = request.encode_framed(self.wire_format)?;
         self.stdin
+            .as_mut()
+            .ok_or_else(|| make_err!(Code::Internal, "Worker stdin is closed"))?
             .write_all(&bytes)
             .await
             .err_tip(|| "Writing WorkRequest to persistent worker stdin")?;
         self.stdin
+            .as_mut()
+            .ok_or_else(|| make_err!(Code::Internal, "Worker stdin is closed"))?
             .flush()
             .await
             .err_tip(|| "Flushing persistent worker stdin")?;
@@ -227,7 +261,8 @@ impl LiveWorker {
                 ?timeout,
                 "Persistent worker did not respond before deadline; killing child"
             );
-            drop(self.child.kill().await);
+            self.hard_signal();
+            drop(self.child.wait().await);
             return Err(make_err!(
                 Code::DeadlineExceeded,
                 "Persistent worker did not respond within {timeout:?}"
@@ -256,18 +291,57 @@ impl LiveWorker {
     pub async fn shutdown(mut self, grace: Duration) {
         // Dropping stdin closes the pipe, which most well-behaved workers
         // interpret as "no more work, please exit".
-        drop(self.stdin);
-
-        match tokio::time::timeout(grace, self.child.wait()).await {
-            Ok(Ok(status)) => debug!(?status, "Persistent worker exited cleanly"),
-            Ok(Err(err)) => warn!(?err, "Error waiting for persistent worker exit"),
-            Err(_) => {
-                warn!(
-                    ?grace,
-                    "Persistent worker did not exit within grace; SIGKILLing"
-                );
-                drop(self.child.kill().await);
+        self.stdin.take();
+        if self
+            .attempt_expired
+            .as_ref()
+            .is_some_and(|(expired, _)| expired.load(Ordering::Acquire))
+        {
+            self.hard_signal();
+            if let Err(err) = self.child.wait().await {
+                warn!(?err, "Error waiting for expired persistent worker");
             }
+            return;
+        }
+
+        let expired = async {
+            match &mut self.attempt_expired {
+                Some((_, signal)) => {
+                    if signal.wait_for(|expired| *expired).await.is_err() {
+                        core::future::pending::<()>().await;
+                    }
+                }
+                None => core::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            () = expired => {
+                self.hard_signal();
+                if let Err(err) = self.child.wait().await {
+                    warn!(?err, "Error waiting for expired persistent worker");
+                }
+            }
+            result = tokio::time::timeout(grace, self.child.wait()) => match result {
+                Ok(Ok(status)) => debug!(?status, "Persistent worker exited cleanly"),
+                Ok(Err(err)) => warn!(?err, "Error waiting for persistent worker exit"),
+                Err(_) => {
+                    warn!(?grace, "Persistent worker did not exit within grace; SIGKILLing");
+                    self.hard_signal();
+                    drop(self.child.wait().await);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for LiveWorker {
+    fn drop(&mut self) {
+        if self
+            .attempt_expired
+            .as_ref()
+            .is_some_and(|(expired, _)| expired.load(Ordering::Acquire))
+        {
+            self.hard_signal();
         }
     }
 }
@@ -444,6 +518,10 @@ mod tests {
             dir.path(),
             &path_env(),
             false,
+            (
+                Arc::new(AtomicBool::new(false)),
+                tokio::sync::watch::channel(false).1,
+            ),
         )
         .unwrap();
         let start = Instant::now();
@@ -469,6 +547,10 @@ mod tests {
             dir.path(),
             &path_env(),
             false,
+            (
+                Arc::new(AtomicBool::new(false)),
+                tokio::sync::watch::channel(false).1,
+            ),
         )
         .unwrap();
 
@@ -500,6 +582,10 @@ mod tests {
             dir.path(),
             &path_env(),
             false,
+            (
+                Arc::new(AtomicBool::new(false)),
+                tokio::sync::watch::channel(false).1,
+            ),
         )
         .unwrap();
 
@@ -530,6 +616,10 @@ mod tests {
             dir.path(),
             &path_env(),
             false,
+            (
+                Arc::new(AtomicBool::new(false)),
+                tokio::sync::watch::channel(false).1,
+            ),
         )
         .unwrap();
         let req = WorkRequest {

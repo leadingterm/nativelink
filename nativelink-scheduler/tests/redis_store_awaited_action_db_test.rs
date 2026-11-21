@@ -364,6 +364,7 @@ async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
         let expected_msg_for_worker = UpdateForWorker {
             update: Some(update_for_worker::Update::StartAction(StartExecute {
                 request_metadata: None,
+                attempt_deadline: None,
                 execute_request: Some(ExecuteRequest {
                     instance_name: INSTANCE_NAME.to_string(),
                     action_digest: Some(DigestInfo::zero_digest().into()),

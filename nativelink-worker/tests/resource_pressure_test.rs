@@ -18,9 +18,10 @@ use nativelink_config::stores::{
 };
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
+use nativelink_proto::build::bazel::remote::execution::v2::digest_function::Value as ProtoDigestFunction;
+use nativelink_proto::build::bazel::remote::execution::v2::platform::Property;
 use nativelink_proto::build::bazel::remote::execution::v2::{
     Action, Command, Directory, ExecuteRequest, Platform,
-    digest_function::Value as ProtoDigestFunction, platform::Property,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::StartExecute;
 use nativelink_store::ac_utils::serialize_and_upload_message;
@@ -229,6 +230,7 @@ impl Fixture {
                         }],
                     }),
                     worker_id: "worker".into(),
+                    attempt_deadline: None,
                 },
             )
             .await?;

@@ -3,6 +3,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Features
+
+- Stamp optional absolute attempt deadlines at dispatch and enforce the same
+  budget across worker acknowledgement, preparation, execution, and publication.
+  Registered commands and persistent workers are killed and reaped, and action
+  reservations are released, before the worker publishes deadline completion.
+- Retain deadline-governed attempt ownership across missing acknowledgements,
+  missing operation reports, and worker disconnects until terminal publication
+  or expiry, while preserving observed-capacity memory fitting and updates.
+
 ## [1.8.3](https://github.com/TraceMachina/nativelink/compare/v1.8.2..v1.8.3) - 2026-10-28
 
 
