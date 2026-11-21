@@ -2247,13 +2247,13 @@ mod attempt_tests {
                         assert_eq!(response.status.unwrap().code, Code::DeadlineExceeded as i32);
                     }
                 };
-                let mut terminal = background_spawn!("test_terminal_publication", terminal);
-                assert!(futures::poll!(&mut terminal).is_pending());
+                let mut terminal = spawn!("test_terminal_publication", terminal);
                 if cleanup_already_started {
                     action.cleanup_entered.notified().await;
                 } else {
                     action.preparing.notified().await;
                 }
+                assert!(futures::poll!(&mut terminal).is_pending());
                 time::advance(Duration::from_secs(10)).await;
                 assert!(futures::poll!(&mut terminal).is_pending());
                 if !cleanup_already_started {
