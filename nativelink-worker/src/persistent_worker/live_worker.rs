@@ -262,7 +262,7 @@ impl LiveWorker {
                 "Persistent worker did not respond before deadline; killing child"
             );
             self.hard_signal();
-            let _ = self.child.wait().await;
+            drop(self.child.wait().await);
             return Err(make_err!(
                 Code::DeadlineExceeded,
                 "Persistent worker did not respond within {timeout:?}"
@@ -327,7 +327,7 @@ impl LiveWorker {
                 Err(_) => {
                     warn!(?grace, "Persistent worker did not exit within grace; SIGKILLing");
                     self.hard_signal();
-                    let _ = self.child.wait().await;
+                    drop(self.child.wait().await);
                 }
             }
         }

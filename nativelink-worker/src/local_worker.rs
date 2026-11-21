@@ -221,7 +221,7 @@ async fn run_attempt<U: RunningActionsManager>(
         .and_then(|registration| registration.lock().expire_and_subscribe());
     let registered = manager.expire_attempt(&operation_id).await;
     if let Some(mut stopped) = precondition_stopped {
-        let _ = stopped.wait_for(|stopped| *stopped).await;
+        drop(stopped.wait_for(|stopped| *stopped).await);
     }
     task.abort();
     // Joining, not just dropping, closes the pre-registration spawn race.
