@@ -525,12 +525,25 @@ impl FastSlowStore {
             ));
         }
 
+        let mut populated_here = false;
         self.get_loader(key.borrow())
             .get_or_try_init(|| {
+                populated_here = true;
                 Pin::new(self).populate_and_maybe_stream(key.borrow(), None, 0, None)
             })
             .await
-            .err_tip(|| "Failed to populate()")
+            .err_tip(|| "Failed to populate()")?;
+        if !populated_here {
+            let size = match Self::digest_size_bytes(&key) {
+                Some(size) => Some(size),
+                None => self.fast_store.has(key.borrow()).await
+                    .err_tip(|| "While querying populated fast store")?,
+            };
+            if let Some(size) = size {
+                self.record_local_read(size);
+            }
+        }
+        Ok(())
     }
 
     /// Returns the range of bytes that should be sent given a slice bounds

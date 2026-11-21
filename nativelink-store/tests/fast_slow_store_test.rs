@@ -1064,6 +1064,52 @@ impl StoreDriver for InstrumentedSlowStore {
 
 default_health_status_indicator!(InstrumentedSlowStore);
 
+#[nativelink_test]
+async fn concurrent_populates_count_one_remote_fill_and_one_local_read() -> Result<(), Error> {
+    let data = b"deduplicated populate";
+    let digest = DigestInfo::try_new(VALID_HASH, data.len())?;
+    let filesystem_spec = FilesystemSpec {
+        content_path: make_temp_path("populate_metrics_content"),
+        temp_path: make_temp_path("populate_metrics_temp"),
+        block_size: 1,
+        ..Default::default()
+    };
+    let fast = Store::new(FilesystemStore::<FileEntryImpl>::new(&filesystem_spec).await?);
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+    let slow = Arc::new(InstrumentedSlowStore {
+        digest,
+        data: data.to_vec(),
+        get_part_count: AtomicU64::new(0),
+        gate: Mutex::new(Some(gate_rx)),
+    });
+    let driver = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Filesystem(filesystem_spec),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            bypass_dedup_threshold_bytes: 0,
+        },
+        fast,
+        Store::new(slow.clone()),
+    );
+    let leader = driver.populate_fast_store(digest.into());
+    let follower = driver.populate_fast_store(digest.into());
+    tokio::pin!(leader, follower);
+    assert!(futures::poll!(&mut leader).is_pending());
+    assert_eq!(slow.get_part_count.load(Ordering::Acquire), 1);
+    assert!(futures::poll!(&mut follower).is_pending());
+    gate_tx.send(()).map_err(|()| make_err!(Code::Internal, "Slow gate closed"))?;
+    let (leader_result, follower_result) = futures::join!(leader, follower);
+    leader_result?;
+    follower_result?;
+    let stats = driver.cache_stats().unwrap();
+    assert_eq!(slow.get_part_count.load(Ordering::Acquire), 1);
+    assert_eq!((stats.slow_read_requests, stats.slow_read_bytes), (1, data.len() as u64));
+    assert_eq!((stats.local_read_requests, stats.local_read_bytes), (1, data.len() as u64));
+    Ok(())
+}
+
 fn make_fast_slow_with_instrumented_slow(
     digest: DigestInfo,
     data: Vec<u8>,
