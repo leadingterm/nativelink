@@ -48,7 +48,7 @@ impl<'a> From<&'a PlatformPropertyValue> for CapacityProperty<'a> {
 pub(crate) fn eligible_capacity<'a, I>(
     policy: &ResourceEscalationSpec,
     rows: &[ResourceCapacity],
-    properties: I,
+    properties: &I,
     property: &str,
     reservation: Option<&MemoryReservation>,
 ) -> Result<Option<(u64, u64, u64)>, Error>
@@ -153,7 +153,7 @@ pub(crate) fn fit_memory(
     let properties = info.platform_properties.iter().map(|(name, value)| {
         let value = match manager.get_known_properties().get(name) {
             Some(PropertyType::Minimum) => {
-                CapacityProperty::from_minimum(manager.make_prop_value(name, value)?)
+                CapacityProperty::from_minimum(&manager.make_prop_value(name, value)?)
             }
             Some(PropertyType::Exact) => CapacityProperty::Exact(value),
             _ => CapacityProperty::Other,
@@ -163,7 +163,7 @@ pub(crate) fn fit_memory(
     let Some((ceiling, physical, cpu)) = eligible_capacity(
         policy,
         &snapshot.capacities,
-        properties,
+        &properties,
         &policy.memory.property,
         Some(reservation),
     )?
@@ -194,9 +194,9 @@ pub(crate) fn fit_memory(
 }
 
 impl CapacityProperty<'_> {
-    fn from_minimum(value: PlatformPropertyValue) -> Self {
+    const fn from_minimum(value: &PlatformPropertyValue) -> Self {
         match value {
-            PlatformPropertyValue::Minimum(value) => Self::Minimum(value),
+            PlatformPropertyValue::Minimum(value) => Self::Minimum(*value),
             _ => Self::Other,
         }
     }
@@ -345,7 +345,7 @@ mod tests {
             pre_fit_reservation: None,
             command_digest: digest,
             input_root_digest: digest,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             platform_properties,
             memory_reservation: Some(MemoryReservation {
                 minimum_kb: minimum,

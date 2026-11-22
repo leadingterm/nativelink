@@ -36,7 +36,9 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     execute_declined, execute_result, update_for_worker,
 };
 use nativelink_proto::google::rpc::Status as ProtoStatus;
-use nativelink_scheduler::api_worker_scheduler::ApiWorkerScheduler;
+use nativelink_scheduler::api_worker_scheduler::{
+    ApiWorkerScheduler, ApiWorkerSchedulerConfig, ApiWorkerSchedulerDependencies,
+};
 use nativelink_scheduler::match_outcome::MatchOutcome;
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::{ActionInfoWithProps, channel_capacity};
@@ -190,22 +192,26 @@ async fn setup_api_server_with(
     let state_manager = Arc::new(MockWorkerStateManager::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
     let scheduler = ApiWorkerScheduler::new(
-        state_manager.clone(),
-        platform_property_manager,
-        WorkerAllocationStrategy::default(),
-        None,
-        None,
-        None,
-        tasks_or_worker_change_notify,
-        worker_timeout,
-        60, // unacknowledged_kill_timeout_s
-        dispatch_ack_timeout_s,
-        worker_registry,
-        None,
-        None,                    // resource_sketch
-        false,                   // has_peers
-        Duration::from_secs(15), // record_ttl (unused while has_peers = false)
-        "scheduler".to_string(),
+        ApiWorkerSchedulerConfig {
+            allocation_strategy: WorkerAllocationStrategy::default(),
+            live_memory_veto: None,
+            resource_escalation: None,
+            reservation_hold: None,
+            worker_timeout_s: worker_timeout,
+            unacknowledged_kill_timeout_s: 60,
+            dispatch_ack_timeout_s,
+            has_peers: false,
+            record_ttl: Duration::from_secs(15), // unused while has_peers = false
+            scheduler_id: "scheduler".to_string(),
+        },
+        ApiWorkerSchedulerDependencies {
+            worker_state_manager: state_manager.clone(),
+            platform_property_manager,
+            worker_change_notify: tasks_or_worker_change_notify,
+            worker_registry,
+            maybe_origin_event_tx: None,
+            resource_sketch: None,
+        },
     );
 
     let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();

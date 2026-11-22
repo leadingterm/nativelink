@@ -67,7 +67,7 @@ enum EscalationResource {
 }
 
 impl EscalationResource {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Memory => "memory",
             Self::Disk => "disk",
@@ -1576,7 +1576,7 @@ impl ApiWorkerSchedulerImpl {
         eligible_capacity(
             policy,
             &snapshot.capacities,
-            properties
+            &properties
                 .properties
                 .iter()
                 .map(|(name, value)| Ok((name.as_str(), CapacityProperty::from(value)))),
@@ -2404,8 +2404,7 @@ impl ApiWorkerSchedulerImpl {
             if !worker.running_action_infos.is_empty() {
                 // Keep the disconnected ledger visible to drain and deadline
                 // expiry, but never offer this worker more work.
-                worker.is_draining = true;
-                worker.disconnected = true;
+                worker.retain_for_terminal_publication();
                 self.workers.put(worker_id.clone(), worker);
             }
         }
@@ -2413,6 +2412,47 @@ impl ApiWorkerSchedulerImpl {
         // TODO(palfrey) This should be moved to inside the Workers struct.
         self.capacity_changed();
         result
+    }
+}
+
+/// Placement, liveness and peer-census policy for a worker scheduler.
+///
+/// Timeouts are the caller's resolved values; construction does not apply
+/// configuration defaults. `record_ttl` is the same nonzero peer-record TTL
+/// used by fleet exchange.
+#[derive(Debug)]
+pub struct ApiWorkerSchedulerConfig {
+    pub allocation_strategy: WorkerAllocationStrategy,
+    pub live_memory_veto: Option<String>,
+    pub resource_escalation: Option<ResourceEscalationSpec>,
+    pub reservation_hold: Option<ReservationHoldSpec>,
+    pub worker_timeout_s: u64,
+    pub unacknowledged_kill_timeout_s: u64,
+    pub dispatch_ack_timeout_s: u64,
+    pub has_peers: bool,
+    pub record_ttl: Duration,
+    pub scheduler_id: String,
+}
+
+/// Shared runtime services and optional resource-observation sinks.
+pub struct ApiWorkerSchedulerDependencies {
+    pub worker_state_manager: Arc<dyn WorkerStateManager>,
+    pub platform_property_manager: Arc<PlatformPropertyManager>,
+    pub worker_change_notify: Arc<Notify>,
+    pub worker_registry: SharedWorkerRegistry,
+    pub maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
+    pub resource_sketch: Option<Arc<ResourceSketch>>,
+}
+
+impl core::fmt::Debug for ApiWorkerSchedulerDependencies {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ApiWorkerSchedulerDependencies")
+            .field("platform_property_manager", &self.platform_property_manager)
+            .field("worker_change_notify", &self.worker_change_notify)
+            .field("worker_registry", &self.worker_registry)
+            .field("maybe_origin_event_tx", &self.maybe_origin_event_tx)
+            .field("resource_sketch", &self.resource_sketch)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2512,65 +2552,41 @@ impl ApiWorkerScheduler {
         );
     }
 
-    #[expect(clippy::too_many_arguments)]
+    /// Construct a worker scheduler using the system wall clock.
     pub fn new(
-        worker_state_manager: Arc<dyn WorkerStateManager>,
-        platform_property_manager: Arc<PlatformPropertyManager>,
-        allocation_strategy: WorkerAllocationStrategy,
-        live_memory_veto: Option<String>,
-        resource_escalation: Option<ResourceEscalationSpec>,
-        reservation_hold: Option<ReservationHoldSpec>,
-        worker_change_notify: Arc<Notify>,
-        worker_timeout_s: u64,
-        unacknowledged_kill_timeout_s: u64,
-        dispatch_ack_timeout_s: u64,
-        worker_registry: SharedWorkerRegistry,
-        maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
-        resource_sketch: Option<Arc<ResourceSketch>>,
-        has_peers: bool,
-        record_ttl: Duration,
-        scheduler_id: String,
+        config: ApiWorkerSchedulerConfig,
+        dependencies: ApiWorkerSchedulerDependencies,
     ) -> Arc<Self> {
-        Self::new_with_clock(
-            worker_state_manager,
-            platform_property_manager,
+        Self::new_with_clock(config, dependencies, Box::new(SystemTime::now))
+    }
+
+    /// Construct a worker scheduler with the dispatch and census clock supplied
+    /// by its owner, so deadline decisions share the owner's time source.
+    pub fn new_with_clock(
+        config: ApiWorkerSchedulerConfig,
+        dependencies: ApiWorkerSchedulerDependencies,
+        now_fn: Box<dyn Fn() -> SystemTime + Send + Sync>,
+    ) -> Arc<Self> {
+        let ApiWorkerSchedulerConfig {
             allocation_strategy,
             live_memory_veto,
             resource_escalation,
             reservation_hold,
-            worker_change_notify,
             worker_timeout_s,
             unacknowledged_kill_timeout_s,
             dispatch_ack_timeout_s,
-            worker_registry,
-            maybe_origin_event_tx,
-            resource_sketch,
             has_peers,
             record_ttl,
             scheduler_id,
-            Box::new(SystemTime::now),
-        )
-    }
-
-    pub fn new_with_clock(
-        worker_state_manager: Arc<dyn WorkerStateManager>,
-        platform_property_manager: Arc<PlatformPropertyManager>,
-        allocation_strategy: WorkerAllocationStrategy,
-        live_memory_veto: Option<String>,
-        resource_escalation: Option<ResourceEscalationSpec>,
-        reservation_hold: Option<ReservationHoldSpec>,
-        worker_change_notify: Arc<Notify>,
-        worker_timeout_s: u64,
-        unacknowledged_kill_timeout_s: u64,
-        dispatch_ack_timeout_s: u64,
-        worker_registry: SharedWorkerRegistry,
-        maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
-        resource_sketch: Option<Arc<ResourceSketch>>,
-        has_peers: bool,
-        record_ttl: Duration,
-        scheduler_id: String,
-        now_fn: Box<dyn Fn() -> SystemTime + Send + Sync>,
-    ) -> Arc<Self> {
+        } = config;
+        let ApiWorkerSchedulerDependencies {
+            worker_state_manager,
+            platform_property_manager,
+            worker_change_notify,
+            worker_registry,
+            maybe_origin_event_tx,
+            resource_sketch,
+        } = dependencies;
         debug_assert!(
             !record_ttl.is_zero(),
             "record_ttl must be non-zero; a zero TTL degenerates the census warm-up/staleness checks"
@@ -2591,14 +2607,13 @@ impl ApiWorkerScheduler {
         let (resource_capacity_tx, resource_capacity_rx, local_resource_capacities) =
             resource_escalation
                 .as_ref()
-                .map(|policy| {
+                .map_or((None, None, None), |policy| {
                     let snapshot =
                         Arc::new(ResourceCapacitySnapshot::new(policy.capacities.clone()));
                     let local = snapshot.capacities.clone();
                     let (sender, receiver) = watch::channel(snapshot);
                     (Some(sender), Some(receiver), Some(local))
-                })
-                .unwrap_or((None, None, None));
+                });
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
@@ -3478,11 +3493,9 @@ impl WorkerScheduler for ApiWorkerScheduler {
                     )
                     .await,
             );
-            if inner
-                .workers
-                .peek(&worker_id)
-                .is_some_and(|worker| worker.disconnected && worker.running_action_infos.is_empty())
-            {
+            if inner.workers.peek(&worker_id).is_some_and(|worker| {
+                worker.is_disconnected() && worker.running_action_infos.is_empty()
+            }) {
                 inner.remove_worker(&worker_id);
             }
         }
@@ -3627,7 +3640,7 @@ mod escalation_capacity_tests {
             eligible_capacity(
                 policy,
                 &policy.capacities,
-                properties
+                &properties
                     .properties
                     .iter()
                     .map(|(name, value)| Ok((name.as_str(), CapacityProperty::from(value)))),

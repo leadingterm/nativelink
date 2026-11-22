@@ -908,14 +908,12 @@ where
         if let (Some(scheduler), Some(worker_id)) = (
             self.deadline_scheduler.get().and_then(Weak::upgrade),
             awaited_action.worker_id(),
-        ) {
-            if scheduler
-                .running_on_worker(worker_id, awaited_action.operation_id())
-                .await
-                == Some(true)
-            {
-                return None;
-            }
+        ) && scheduler
+            .running_on_worker(worker_id, awaited_action.operation_id())
+            .await
+            == Some(true)
+        {
+            return None;
         }
 
         let now = (self.now_fn)().now();
@@ -1983,7 +1981,7 @@ mod queued_memory_refit_tests {
         use crate::worker_scheduler::ResourceCapacitySnapshot;
 
         MockClock::set_time(Duration::from_secs(10_000));
-        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000);
+        let started = SystemTime::UNIX_EPOCH + Duration::from_mins(150);
         let policy: ResourceEscalationSpec = serde_json::from_value(serde_json::json!({
             "memory": { "property": "memory_kb", "percent": 200, "max_steps": 10 },
             "disk": { "property": "disk_kb", "percent": 200, "max_steps": 10 },
@@ -2008,7 +2006,7 @@ mod queued_memory_refit_tests {
             let manager = SimpleSchedulerStateManager::new(
                 3,
                 Duration::from_secs(10),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
                 Duration::from_secs(15),
                 memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
                 MockInstantWrapped::default,
@@ -2025,7 +2023,7 @@ mod queued_memory_refit_tests {
                 }),
                 command_digest: digest,
                 input_root_digest: digest,
-                timeout: Duration::from_secs(60),
+                timeout: Duration::from_mins(1),
                 platform_properties: HashMap::from([
                     ("memory_kb".to_string(), "200".to_string()),
                     ("disk_kb".to_string(), "100".to_string()),
@@ -2135,12 +2133,12 @@ mod queued_memory_refit_tests {
     async fn queued_refit_preserves_record_and_rejects_escalated_or_executing_state()
     -> Result<(), Error> {
         MockClock::set_time(Duration::from_secs(10_000));
-        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000);
+        let started = SystemTime::UNIX_EPOCH + Duration::from_mins(150);
         let notify = Arc::new(Notify::new());
         let manager = SimpleSchedulerStateManager::new(
             3,
             Duration::from_secs(10),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             Duration::from_secs(15),
             memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
             MockInstantWrapped::default,
@@ -2157,7 +2155,7 @@ mod queued_memory_refit_tests {
             }),
             command_digest: digest,
             input_root_digest: digest,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             platform_properties: HashMap::from([
                 ("memory_kb".to_string(), "200".to_string()),
                 ("unrelated".to_string(), "retained".to_string()),
@@ -2324,6 +2322,7 @@ mod deadline_timeout_tests {
     use tokio::sync::{Notify, mpsc};
 
     use super::*;
+    use crate::api_worker_scheduler::{ApiWorkerSchedulerConfig, ApiWorkerSchedulerDependencies};
     use crate::default_scheduler_factory::memory_awaited_action_db_factory;
     use crate::platform_property_manager::PlatformPropertyManager;
     use crate::worker::{ActionInfoWithProps, Worker};
@@ -2339,29 +2338,33 @@ mod deadline_timeout_tests {
         let manager = SimpleSchedulerStateManager::new(
             3,
             Duration::from_secs(10),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             Duration::from_secs(15),
             memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
             MockInstantWrapped::default,
             Some(registry.clone()),
         );
         let scheduler = ApiWorkerScheduler::new_with_clock(
-            manager.clone(),
-            Arc::new(PlatformPropertyManager::new(HashMap::new())),
-            WorkerAllocationStrategy::default(),
-            None,
-            None,
-            None,
-            notify,
-            10,
-            60,
-            0,
-            registry,
-            None,
-            None,
-            false,
-            Duration::from_secs(15),
-            "scheduler".to_string(),
+            ApiWorkerSchedulerConfig {
+                allocation_strategy: WorkerAllocationStrategy::default(),
+                live_memory_veto: None,
+                resource_escalation: None,
+                reservation_hold: None,
+                worker_timeout_s: 10,
+                unacknowledged_kill_timeout_s: 60,
+                dispatch_ack_timeout_s: 0,
+                has_peers: false,
+                record_ttl: Duration::from_secs(15),
+                scheduler_id: "scheduler".to_string(),
+            },
+            ApiWorkerSchedulerDependencies {
+                worker_state_manager: manager.clone(),
+                platform_property_manager: Arc::new(PlatformPropertyManager::new(HashMap::new())),
+                worker_change_notify: notify,
+                worker_registry: registry,
+                maybe_origin_event_tx: None,
+                resource_sketch: None,
+            },
             Box::new(|| SystemTime::UNIX_EPOCH + MockClock::time()),
         );
         manager.set_deadline_scheduler(&scheduler);
@@ -2417,7 +2420,7 @@ mod deadline_timeout_tests {
                     scheduler_start_execute_event_id: None,
                 },
                 10_000,
-                Some(started + Duration::from_secs(120)),
+                Some(started + Duration::from_mins(2)),
             )
             .await?;
         MockClock::advance(Duration::from_secs(30));

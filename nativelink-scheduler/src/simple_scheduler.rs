@@ -54,7 +54,9 @@ use tokio::time::Duration;
 use tracing::{debug, error, info, info_span, warn};
 use uuid::Uuid;
 
-use crate::api_worker_scheduler::{ApiWorkerScheduler, QueuedAction};
+use crate::api_worker_scheduler::{
+    ApiWorkerScheduler, ApiWorkerSchedulerConfig, ApiWorkerSchedulerDependencies, QueuedAction,
+};
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION, PeerScheduler};
 use crate::known_platform_property_provider::KnownPlatformPropertyProvider;
 use crate::match_outcome::{MatchOutcome, PropertyShape, UnsatisfiableReason};
@@ -242,6 +244,13 @@ pub struct SimpleScheduler {
     /// Wall clock used to stamp dispatches independently of matching clocks.
     dispatch_now_fn: Box<dyn Fn() -> SystemTime + Send + Sync>,
     attempt_timeout: Option<Duration>,
+}
+
+/// Matching and fleet exchange share a clock; dispatch may use an independent one.
+struct SchedulerTiming<NowFn> {
+    now_fn: NowFn,
+    fleet_exchange_interval: Duration,
+    dispatch_now: Option<Arc<dyn Fn() -> SystemTime + Send + Sync>>,
 }
 
 impl core::fmt::Debug for SimpleScheduler {
@@ -754,14 +763,13 @@ impl SimpleScheduler {
         /// error but sends nothing.
         async fn dispatch_to_worker(
             action_state_result: &dyn ActionStateResult,
-            workers: &ApiWorkerScheduler,
-            matching_engine_state_manager: &dyn MatchingEngineStateManager,
-            maybe_origin_event_tx: Option<&mpsc::Sender<OriginEvent>>,
+            scheduler: &SimpleScheduler,
             worker_id: WorkerId,
             action_info: ActionInfoWithProps,
-            now_fn: &(dyn Fn() -> SystemTime + Send + Sync),
-            attempt_timeout: Option<Duration>,
         ) -> Result<Dispatch, Error> {
+            let workers = scheduler.worker_scheduler.as_ref();
+            let matching_engine_state_manager = scheduler.matching_engine_state_manager.as_ref();
+            let maybe_origin_event_tx = scheduler.maybe_origin_event_tx.as_ref();
             let origin_metadata = action_info.origin_metadata.clone();
             let event_origin_metadata = origin_metadata.clone();
             let attach_operation_fut = async move {
@@ -774,8 +782,9 @@ impl SimpleScheduler {
                     action_state.client_operation_id.clone()
                 };
 
-                let dispatch_time = now_fn();
-                let attempt_deadline = attempt_timeout
+                let dispatch_time = (scheduler.dispatch_now_fn)();
+                let attempt_deadline = scheduler
+                    .attempt_timeout
                     .map(|timeout| {
                         dispatch_time.checked_add(timeout).ok_or_else(|| {
                             make_err!(
@@ -904,20 +913,15 @@ impl SimpleScheduler {
         /// Offers the room that opened since the pass last looked to the
         /// parked actions in listing order. Every parked action that found
         /// a worker leaves the list, whatever its dispatch came to.
-        #[expect(clippy::too_many_arguments)]
         async fn place_parked(
             parked: &mut Parked,
             scheduler: &SimpleScheduler,
             placement: &mut Placement,
             contended: &mut HashSet<PropertyShape>,
-            workers: &ApiWorkerScheduler,
-            matching_engine_state_manager: &dyn MatchingEngineStateManager,
-            maybe_origin_event_tx: Option<&mpsc::Sender<OriginEvent>>,
             full_worker_logging: bool,
             now: SystemTime,
-            now_fn: &(dyn Fn() -> SystemTime + Send + Sync),
-            attempt_timeout: Option<Duration>,
         ) -> Result<(), Error> {
+            let workers = scheduler.worker_scheduler.as_ref();
             let mut result = Ok(());
             let mut blocked: HashSet<PropertyShape> = HashSet::new();
             let mut still_parked = VecDeque::with_capacity(parked.queue.len());
@@ -956,13 +960,9 @@ impl SimpleScheduler {
                 placement.attempted += 1;
                 match dispatch_to_worker(
                     loaded.action_state_result.as_ref(),
-                    workers,
-                    matching_engine_state_manager,
-                    maybe_origin_event_tx,
+                    scheduler,
                     worker_id,
                     loaded.action_info,
-                    now_fn,
-                    attempt_timeout,
                 )
                 .await
                 {
@@ -1029,7 +1029,6 @@ impl SimpleScheduler {
 
         let workers = self.worker_scheduler.as_ref();
         let matching_engine_state_manager = self.matching_engine_state_manager.as_ref();
-        let maybe_origin_event_tx = self.maybe_origin_event_tx.as_ref();
         let mut parked = Parked::default();
         let mut placement = Placement::default();
         // Once a peer wins an assignment, let it advance through that
@@ -1122,13 +1121,8 @@ impl SimpleScheduler {
                         self,
                         &mut placement,
                         &mut contended,
-                        workers,
-                        matching_engine_state_manager,
-                        maybe_origin_event_tx,
                         full_worker_logging,
                         unsatisfiable_pass.now,
-                        self.dispatch_now_fn.as_ref(),
-                        self.attempt_timeout,
                     )
                     .await,
                 );
@@ -1142,13 +1136,9 @@ impl SimpleScheduler {
                     result = result.merge(
                         dispatch_to_worker(
                             loaded.action_state_result.as_ref(),
-                            workers,
-                            matching_engine_state_manager,
-                            maybe_origin_event_tx,
+                            self,
                             worker_id,
                             loaded.action_info,
-                            self.dispatch_now_fn.as_ref(),
-                            self.attempt_timeout,
                         )
                         .await
                         .map(|dispatch| {
@@ -1205,13 +1195,8 @@ impl SimpleScheduler {
                     self,
                     &mut placement,
                     &mut contended,
-                    workers,
-                    matching_engine_state_manager,
-                    maybe_origin_event_tx,
                     full_worker_logging,
                     unsatisfiable_pass.now,
-                    self.dispatch_now_fn.as_ref(),
-                    self.attempt_timeout,
                 )
                 .await,
             );
@@ -1333,11 +1318,13 @@ impl SimpleScheduler {
                 tokio::time::sleep(Duration::from_millis(1))
             },
             task_change_notify,
-            SystemTime::now,
             maybe_origin_event_tx,
             resource_sketch,
-            FLEET_EXCHANGE_INTERVAL,
-            Some(now),
+            SchedulerTiming {
+                now_fn: SystemTime::now,
+                fleet_exchange_interval: FLEET_EXCHANGE_INTERVAL,
+                dispatch_now: Some(now),
+            },
         )
     }
 
@@ -1392,11 +1379,13 @@ impl SimpleScheduler {
             awaited_action_db,
             on_matching_engine_run,
             task_change_notify,
-            now_fn,
             maybe_origin_event_tx,
             resource_sketch,
-            fleet_exchange_interval,
-            None,
+            SchedulerTiming {
+                now_fn,
+                fleet_exchange_interval,
+                dispatch_now: None,
+            },
         )
     }
 
@@ -1411,12 +1400,15 @@ impl SimpleScheduler {
         mut awaited_action_db: A,
         on_matching_engine_run: F,
         task_change_notify: Arc<Notify>,
-        now_fn: NowFn,
         maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
         resource_sketch: Option<Arc<ResourceSketch>>,
-        fleet_exchange_interval: Duration,
-        dispatch_now: Option<Arc<dyn Fn() -> SystemTime + Send + Sync>>,
+        timing: SchedulerTiming<NowFn>,
     ) -> (Arc<Self>, Arc<dyn WorkerScheduler>) {
+        let SchedulerTiming {
+            now_fn,
+            fleet_exchange_interval,
+            dispatch_now,
+        } = timing;
         let platform_property_manager = Arc::new(PlatformPropertyManager::new(
             spec.supported_platform_properties
                 .clone()
@@ -1474,29 +1466,27 @@ impl SimpleScheduler {
             let now_fn = now_fn.clone();
             Box::new(move || now_fn().now())
         };
-        let dispatch_now_fn: Box<dyn Fn() -> SystemTime + Send + Sync> = match &dispatch_now {
-            Some(now) => {
+        let dispatch_now_fn: Box<dyn Fn() -> SystemTime + Send + Sync> =
+            if let Some(now) = &dispatch_now {
                 let now = now.clone();
                 Box::new(move || now())
-            }
-            None => {
+            } else {
                 let now_fn = now_fn.clone();
                 Box::new(move || now_fn().now())
-            }
-        };
+            };
         // A second SystemTime clock for the fleet-exchange task, cloned before
         // `now_fn` is moved into the state manager below.
         let exchange_now_fn: Box<dyn Fn() -> SystemTime + Send + Sync> = {
             let now_fn = now_fn.clone();
             Box::new(move || now_fn().now())
         };
-        let worker_now_fn: Box<dyn Fn() -> SystemTime + Send + Sync> = match dispatch_now {
-            Some(now) => Box::new(move || now()),
-            None => {
+        let worker_now_fn: Box<dyn Fn() -> SystemTime + Send + Sync> =
+            if let Some(now) = dispatch_now {
+                Box::new(move || now())
+            } else {
                 let now_fn = now_fn.clone();
                 Box::new(move || now_fn().now())
-            }
-        };
+            };
         // One peer-record TTL: the fleet-exchange record's lifetime and the
         // census warm-up / staleness bound the worker scheduler applies.
         let record_ttl = fleet_exchange_interval * FLEET_RECORD_TTL_INTERVALS;
@@ -1524,22 +1514,26 @@ impl SimpleScheduler {
         // takes its turn holding workers by.
         let scheduler_id = Uuid::new_v4().hyphenated().to_string();
         let worker_scheduler = ApiWorkerScheduler::new_with_clock(
-            state_manager.clone(),
-            platform_property_manager.clone(),
-            spec.allocation_strategy,
-            spec.live_memory_veto.clone(),
-            spec.resource_escalation.clone(),
-            spec.reservation_hold,
-            worker_change_notify.clone(),
-            worker_timeout_s,
-            unacknowledged_kill_timeout_s,
-            spec.dispatch_ack_timeout_s,
-            worker_registry,
-            maybe_origin_event_tx.clone(),
-            resource_sketch,
-            has_peers,
-            record_ttl,
-            scheduler_id,
+            ApiWorkerSchedulerConfig {
+                allocation_strategy: spec.allocation_strategy,
+                live_memory_veto: spec.live_memory_veto.clone(),
+                resource_escalation: spec.resource_escalation.clone(),
+                reservation_hold: spec.reservation_hold,
+                worker_timeout_s,
+                unacknowledged_kill_timeout_s,
+                dispatch_ack_timeout_s: spec.dispatch_ack_timeout_s,
+                has_peers,
+                record_ttl,
+                scheduler_id,
+            },
+            ApiWorkerSchedulerDependencies {
+                worker_state_manager: state_manager.clone(),
+                platform_property_manager: platform_property_manager.clone(),
+                worker_change_notify: worker_change_notify.clone(),
+                worker_registry,
+                maybe_origin_event_tx: maybe_origin_event_tx.clone(),
+                resource_sketch,
+            },
             worker_now_fn,
         );
         if spec.attempt_timeout_s != 0 {

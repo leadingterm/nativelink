@@ -57,6 +57,36 @@ where
     spawn_blocking(move || span.in_scope(f))
 }
 
+/// Runs a future on its own thread and runtime, preserving tracing context.
+///
+/// Timers keep progressing even when the caller's executor is blocked.
+/// Join the returned thread to observe both runtime creation and future results.
+///
+/// # Panics
+/// Panics if the operating system cannot create the thread.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "independent runtime creation belongs in this context-preserving task factory"
+)]
+pub fn spawn_on_new_runtime<F>(
+    name: &'static str,
+    future: F,
+) -> std::thread::JoinHandle<std::io::Result<F::Output>>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let future = future
+        .instrument(tracing::error_span!("independent_runtime", task = name))
+        .with_context(Context::current());
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(runtime.block_on(future))
+    })
+}
+
 #[macro_export]
 macro_rules! background_spawn {
     ($name:expr, $fut:expr) => {{

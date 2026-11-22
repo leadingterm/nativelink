@@ -1228,6 +1228,7 @@ pub enum EnvironmentSource {
     ///
     /// The format of the file contents should be json with the following
     /// schema:
+    /// ```jsonc
     /// {
     ///   // If set the command will be considered a failure.
     ///   // May be one of the following static strings:
@@ -1238,6 +1239,7 @@ pub enum EnvironmentSource {
     ///   // Exact kernel memory peak in KiB, when available.
     ///   "peak_memory_kb": 12345,
     /// }
+    /// ```
     ///
     /// All fields are optional, file does not need to be created and may be
     /// empty.
@@ -2298,7 +2300,7 @@ mod tests {
             ),
             (123, 7, 124, 125)
         );
-        assert_eq!(c.memory_pressure_reserve_bytes, 123456);
+        assert_eq!(c.memory_pressure_reserve_bytes, 123_456);
         assert_eq!(
             c.memory_pool_path.as_deref(),
             Some("/sys/fs/cgroup/actions")

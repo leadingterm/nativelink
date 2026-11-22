@@ -274,7 +274,7 @@ async fn scheduler_start_execute_origin_event_includes_resource_hints() -> Resul
         }
     };
     assert_eq!(start_action.worker_id, "worker_id");
-    let wire_deadline = start_action.attempt_deadline.clone();
+    let wire_deadline = start_action.attempt_deadline;
     assert!(wire_deadline.is_some());
     assert_eq!(
         wire_deadline,

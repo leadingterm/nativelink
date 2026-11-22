@@ -379,7 +379,7 @@ async fn actions_queued_before_first_worker_refit_without_losing_identity_or_int
 #[nativelink_test]
 async fn explicit_61_gib_floor_is_never_lowered_to_observed_memory() -> Result<(), Error> {
     const FLOOR_KB: u64 = 61 * GIB_KB;
-    assert!(OBSERVED_KB < FLOOR_KB && FLOOR_KB < ESTIMATE_KB);
+    const { assert!(OBSERVED_KB < FLOOR_KB && FLOOR_KB < ESTIMATE_KB) };
     let (scheduler, _) = make_scheduler(vec![capacity("compile", ESTIMATE_KB)]);
     let original = action(3, Some("compile"), Some(FLOOR_KB), NOMINAL_KB, Some(1));
     let mut listener = scheduler
@@ -408,12 +408,11 @@ async fn explicit_61_gib_floor_is_never_lowered_to_observed_memory() -> Result<(
         Some(FLOOR_KB)
     );
     assert!(fitted_property(&failed_info, "memory_kb").unwrap() >= FLOOR_KB);
-    let error = match scheduler
+    let Err(error) = scheduler
         .add_action(OperationId::from("explicit-after-worker"), original)
         .await
-    {
-        Ok(_) => panic!("known impossible explicit floor must fail before persistence"),
-        Err(error) => error,
+    else {
+        panic!("known impossible explicit floor must fail before persistence");
     };
     assert_eq!(error.code, Code::FailedPrecondition);
     assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));

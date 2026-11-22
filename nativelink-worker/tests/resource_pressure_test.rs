@@ -29,8 +29,10 @@ use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::FilesystemStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::action_messages::{ActionResult, OperationId};
+use nativelink_util::background_spawn;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::task::spawn_on_new_runtime;
 use nativelink_worker::running_actions_manager::{
     ExecutionConfiguration, MemoryLimit, PressureKill, ResourceEnforcement, RunningAction,
     RunningActionImpl, RunningActionsManager, RunningActionsManagerArgs, RunningActionsManagerImpl,
@@ -61,7 +63,7 @@ async fn run_action(action: Arc<RunningActionImpl>) -> Result<ActionResult, Erro
 }
 
 struct Fixture {
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
     pool: PathBuf,
     cas: Arc<FastSlowStore>,
     manager: Arc<RunningActionsManagerImpl>,
@@ -143,7 +145,7 @@ impl Fixture {
                 upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
                 ..Default::default()
             },
-            max_action_timeout: Duration::from_secs(120),
+            max_action_timeout: Duration::from_mins(2),
             max_upload_timeout: Duration::from_secs(30),
             max_download_timeout: Duration::from_secs(30),
             max_cleanup_wait: Duration::from_secs(30),
@@ -156,7 +158,7 @@ impl Fixture {
         })?);
         assert!(manager.reserve_memory_pressure_monitor());
         Ok(Self {
-            _temp: temp,
+            temp,
             pool,
             cas,
             manager,
@@ -170,7 +172,7 @@ impl Fixture {
         current: Option<u64>,
         metadata: Metadata,
     ) -> TestResult<LiveAction> {
-        let marker = self._temp.path().join(name);
+        let marker = self.temp.path().join(name);
         // As in running_actions_manager_test, a shell exposes its PID and the side-channel path before exec.
         let shell = which::which("sh")?;
         let sleep = which::which("sleep")?;
@@ -234,7 +236,7 @@ impl Fixture {
                 },
             )
             .await?;
-        let run = tokio::spawn(run_action(action.clone()));
+        let run = background_spawn!("pressure_test_action", run_action(action.clone()));
         wait_until(|| {
             std::fs::read_to_string(&marker)
                 .is_ok_and(|text| text.ends_with('\n') && text.lines().count() == 2)
@@ -245,7 +247,7 @@ impl Fixture {
         let pid: u32 = fields.next().ok_or("missing pid")?.parse()?;
         let report = fields.next().ok_or("missing report path")?;
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-        let start: u64 = stat
+        let start_ticks: u64 = stat
             .rsplit_once(')')
             .ok_or("bad stat")?
             .1
@@ -253,7 +255,7 @@ impl Fixture {
             .nth(19)
             .ok_or("missing start time")?
             .parse()?;
-        let scope = self.pool.join(format!("{pid}-{start}-73"));
+        let scope = self.pool.join(format!("{pid}-{start_ticks}-73"));
         std::fs::create_dir_all(&scope)?;
         std::fs::write(
             scope.join("memory.current"),
@@ -267,14 +269,17 @@ impl Fixture {
         let value = match metadata {
             Metadata::Valid => Some(scope.to_string_lossy().into_owned()),
             Metadata::Absent => None,
-            Metadata::DotDot => Some(format!("{}/../pool/{pid}-{start}-73", self.pool.display())),
+            Metadata::DotDot => Some(format!(
+                "{}/../pool/{pid}-{start_ticks}-73",
+                self.pool.display()
+            )),
             Metadata::WrongParent => Some(format!(
-                "{}/other/{pid}-{start}-73",
-                self._temp.path().display()
+                "{}/other/{pid}-{start_ticks}-73",
+                self.temp.path().display()
             )),
             Metadata::WrongIdentity => Some(
                 self.pool
-                    .join(format!("{}-{start}-73", pid + 1))
+                    .join(format!("{}-{start_ticks}-73", pid + 1))
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -343,23 +348,21 @@ type Poll = (Option<u64>, u64, tokio::sync::oneshot::Sender<()>);
 struct Monitor {
     samples: Option<mpsc::Sender<Poll>>,
     abort: tokio::task::AbortHandle,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 impl Monitor {
     fn start(manager: &Arc<RunningActionsManagerImpl>) -> Self {
         let (samples, receiver) = mpsc::channel::<Poll>();
         let (abort_tx, abort_rx) = mpsc::sync_channel(1);
         let manager = Arc::downgrade(manager);
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let clock = Arc::new(Mutex::new(None::<(u64, tokio::sync::oneshot::Sender<()>)>));
-                let reader_clock = clock.clone();
-                let base = Instant::now();
-                let task = tokio::spawn(memory_pressure_monitor_with(
+        // Keep the monitor's runtime independent of the action executor.
+        let thread = spawn_on_new_runtime("pressure_test_runtime", async move {
+            let clock = Arc::new(Mutex::new(None::<(u64, tokio::sync::oneshot::Sender<()>)>));
+            let reader_clock = clock.clone();
+            let base = Instant::now();
+            let task = background_spawn!(
+                "pressure_test_monitor",
+                memory_pressure_monitor_with(
                     manager,
                     POLICY,
                     move |_path: &Path| match receiver.recv() {
@@ -376,10 +379,10 @@ impl Monitor {
                         let _ = ack.send(());
                         base + Duration::from_millis(ms)
                     },
-                ));
-                abort_tx.send(task.abort_handle()).unwrap();
-                drop(task.await);
-            });
+                )
+            );
+            abort_tx.send(task.abort_handle()).unwrap();
+            drop(task.await);
         });
         Self {
             samples: Some(samples),
@@ -410,7 +413,7 @@ impl Drop for Monitor {
     fn drop(&mut self) {
         self.abort.abort();
         drop(self.samples.take());
-        self.thread.take().unwrap().join().unwrap();
+        self.thread.take().unwrap().join().unwrap().unwrap();
     }
 }
 
@@ -429,8 +432,8 @@ async fn pressure_selects_excess_then_resets_window() -> TestResult {
         monitor.step(Some(i * 4_000), i * 50).await;
     }
     monitor.step(Some(16_000), 250).await; // transient dip clears four high intervals
-    assert_eq!(std::fs::read(&excess.scope.join("cgroup.kill"))?, b"");
-    assert_eq!(std::fs::read(&large.scope.join("cgroup.kill"))?, b"");
+    assert_eq!(std::fs::read(excess.scope.join("cgroup.kill"))?, b"");
+    assert_eq!(std::fs::read(large.scope.join("cgroup.kill"))?, b"");
     monitor.pressure(300, 16_000).await;
     wait_until(|| std::fs::read(excess.scope.join("cgroup.kill")).is_ok_and(|v| v == b"1")).await;
     assert_eq!(std::fs::read(large.scope.join("cgroup.kill"))?, b"");

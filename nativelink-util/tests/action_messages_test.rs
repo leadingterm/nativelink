@@ -93,7 +93,7 @@ fn pre_fit_reservation_is_backward_compatible_and_round_trips() {
 
     let updated = ActionInfo {
         platform_properties: HashMap::from([("cpu".to_string(), "1".to_string())]),
-        ..action.clone()
+        ..action
     };
     assert_eq!(updated.pre_fit_reservation, Some(reservation));
 }

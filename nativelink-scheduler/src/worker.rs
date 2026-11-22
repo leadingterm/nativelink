@@ -111,6 +111,14 @@ pub struct PendingActionInfoData {
 /// action and whose result never arrived.
 pub const LOST_AFTER_MISSED_REPORTS: u32 = 2;
 
+/// Whether this entry still represents a worker connection or only the
+/// operations whose terminal state could not yet be published.
+#[derive(Debug)]
+enum WorkerConnectionState {
+    Connected,
+    RetainedForTerminalPublication,
+}
+
 /// Represents a connection to a worker and used as the medium to
 /// interact with the worker from the client/scheduler.
 #[derive(Debug, MetricsComponent)]
@@ -167,8 +175,10 @@ pub struct Worker {
     /// Whether the worker is draining.
     #[metric(help = "If the worker is draining.")]
     pub is_draining: bool,
-    /// Retained solely for unpublished terminal state after disconnection.
-    pub(crate) disconnected: bool,
+    /// A disconnected entry owns only unpublished terminal state. Its drain
+    /// flag remains independent so administrative drain transitions retain
+    /// their existing semantics.
+    connection_state: WorkerConnectionState,
 
     /// Maximum inflight tasks for this worker (or 0 for unlimited)
     #[metric(help = "Maximum inflight tasks for this worker (or 0 for unlimited)")]
@@ -263,7 +273,7 @@ impl Worker {
             admits_when_idle: false,
             idle_declined_kb: None,
             is_draining: false,
-            disconnected: false,
+            connection_state: WorkerConnectionState::Connected,
             max_inflight_tasks,
             last_load: None,
             cache: None,
@@ -280,6 +290,22 @@ impl Worker {
                 keep_alives_dropped: CounterWithTime::default(),
             }),
         }
+    }
+
+    /// Retain the operation ledger after the connection has gone away, without
+    /// allowing any new dispatches. Disconnect metrics were recorded when the
+    /// connected worker was removed, before this entry was retained.
+    pub(crate) const fn retain_for_terminal_publication(&mut self) {
+        self.is_draining = true;
+        self.connection_state = WorkerConnectionState::RetainedForTerminalPublication;
+    }
+
+    /// Whether only the unpublished terminal-operation ledger remains.
+    pub(crate) const fn is_disconnected(&self) -> bool {
+        matches!(
+            self.connection_state,
+            WorkerConnectionState::RetainedForTerminalPublication
+        )
     }
 
     /// Apply immutable per-action limits without changing physical capacity.

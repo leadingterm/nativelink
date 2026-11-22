@@ -29,7 +29,9 @@ use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UpdateForWorker;
-use nativelink_scheduler::api_worker_scheduler::ApiWorkerScheduler;
+use nativelink_scheduler::api_worker_scheduler::{
+    ApiWorkerScheduler, ApiWorkerSchedulerConfig, ApiWorkerSchedulerDependencies,
+};
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::{ActionInfoWithProps, Worker};
 use nativelink_scheduler::worker_registry::WorkerRegistry;
@@ -123,22 +125,26 @@ async fn dispatched() -> Result<Fixture, Error> {
 async fn dispatched_with_deadline(deadline: Option<SystemTime>) -> Result<Fixture, Error> {
     let state_manager = Arc::new(RecordingStateManager::default());
     let scheduler = ApiWorkerScheduler::new_with_clock(
-        state_manager.clone(),
-        Arc::new(PlatformPropertyManager::new(HashMap::new())),
-        WorkerAllocationStrategy::default(),
-        None,
-        None,
-        None,
-        Arc::new(Notify::new()),
-        WORKER_TIMEOUT_S,
-        60,
-        0,
-        Arc::new(WorkerRegistry::new()),
-        None,
-        None,
-        false,
-        Duration::from_secs(15),
-        "scheduler".to_string(),
+        ApiWorkerSchedulerConfig {
+            allocation_strategy: WorkerAllocationStrategy::default(),
+            live_memory_veto: None,
+            resource_escalation: None,
+            reservation_hold: None,
+            worker_timeout_s: WORKER_TIMEOUT_S,
+            unacknowledged_kill_timeout_s: 60,
+            dispatch_ack_timeout_s: 0,
+            has_peers: false,
+            record_ttl: Duration::from_secs(15),
+            scheduler_id: "scheduler".to_string(),
+        },
+        ApiWorkerSchedulerDependencies {
+            worker_state_manager: state_manager.clone(),
+            platform_property_manager: Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            worker_change_notify: Arc::new(Notify::new()),
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            maybe_origin_event_tx: None,
+            resource_sketch: None,
+        },
         Box::new(|| SystemTime::UNIX_EPOCH + Duration::from_secs(NOW)),
     );
     let worker_id = WorkerId::from(String::from("worker"));
