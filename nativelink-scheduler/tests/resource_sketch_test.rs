@@ -880,7 +880,7 @@ fn killed_target_does_not_pollute_mnemonic_and_success_clears_floors() {
 }
 
 #[test]
-fn successful_command_clears_kill_floors_but_retains_measured_peak() {
+fn successful_command_clears_only_measured_floor_and_retains_peak() {
     let sketch = sketch(policy(0, vec![]), small_budget());
     let key = SketchKey::for_attempt(None, Some("Compile"), "killed");
     let fallback = mnemonic("Compile");
@@ -903,13 +903,148 @@ fn successful_command_clears_kill_floors_but_retains_measured_peak() {
     sketch.observe(fallback.clone(), &memory(1_000, NOW));
     let entry = sketch.lookup(&key, NOW).unwrap();
     assert_eq!(entry.killed_peak_memory_kb, 0);
-    assert_eq!(entry.killed_peak_disk_kb, 0);
+    assert_eq!(entry.killed_peak_disk_kb, 16_000);
     assert_eq!(sketch.shape(&entry).memory_kb, 8_000);
     assert_eq!(
         sketch
             .shape(&sketch.lookup(&fallback, NOW).unwrap())
             .memory_kb,
         1_000
+    );
+}
+
+#[test]
+fn unmeasured_success_preserves_floors_until_each_dimension_proves_decay() {
+    let sketch = sketch(policy(0, vec![]), small_budget());
+    let key = target("//fallback-floor", "Compile");
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            cpu_millicores: Some(8_001),
+            peak_memory_kb: 8_001,
+            peak_disk_kb: 8_001,
+            now_s: NOW,
+            ..Observation::default()
+        },
+    );
+    // The kill had no measured peaks: these floors came from reservations.
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            killed_peak_memory_kb: Some(16_000),
+            killed_peak_disk_kb: Some(16_000),
+            killed: true,
+            now_s: NOW + 1,
+            ..Observation::default()
+        },
+    );
+    // A low measurement with an unknown result is not proof of success.
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            peak_memory_kb: 1_000,
+            peak_disk_kb: 1_000,
+            now_s: NOW + 2,
+            ..Observation::default()
+        },
+    );
+    for _ in 0..20 {
+        sketch.observe(
+            key.clone(),
+            &Observation {
+                cpu_millicores: Some(1_000),
+                completed: true,
+                now_s: NOW + 3,
+                ..Observation::default()
+            },
+        );
+    }
+    let entry = sketch.lookup(&key, NOW + 3).unwrap();
+    assert_eq!(
+        (entry.killed_peak_memory_kb, entry.killed_memory_s),
+        (16_000, NOW + 1)
+    );
+    assert_eq!(
+        (entry.killed_peak_disk_kb, entry.killed_disk_s),
+        (16_000, NOW + 1)
+    );
+    let shaped = sketch.shape(&entry);
+    assert_eq!(
+        (shaped.cpu_count, shaped.memory_kb, shaped.disk_kb),
+        (2_000, 16_000, 16_000)
+    );
+
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            peak_memory_kb: 1_000,
+            completed: true,
+            now_s: NOW + 4,
+            ..Observation::default()
+        },
+    );
+    let entry = sketch.lookup(&key, NOW + 4).unwrap();
+    assert_eq!((entry.killed_peak_memory_kb, entry.killed_memory_s), (0, 0));
+    assert_eq!(
+        (entry.killed_peak_disk_kb, entry.killed_disk_s),
+        (16_000, NOW + 1)
+    );
+    assert_eq!(sketch.shape(&entry).memory_kb, 8_001);
+    assert_eq!(sketch.shape(&entry).disk_kb, 16_000);
+
+    for _ in 0..20 {
+        sketch.observe(
+            key.clone(),
+            &Observation {
+                peak_disk_kb: 1_000,
+                completed: true,
+                now_s: NOW + 5,
+                ..Observation::default()
+            },
+        );
+    }
+    let entry = sketch.lookup(&key, NOW + 5).unwrap();
+    assert_eq!((entry.killed_peak_disk_kb, entry.killed_disk_s), (0, 0));
+    let shaped = sketch.shape(&entry);
+    // CPU and disk use their percentiles; memory retains the exact maximum.
+    assert_eq!(
+        (shaped.cpu_count, shaped.memory_kb, shaped.disk_kb),
+        (2_000, 8_001, 2_000)
+    );
+}
+
+#[test]
+fn successful_peak_at_or_above_floor_does_not_clear_it() {
+    let sketch = sketch(policy(0, vec![]), small_budget());
+    let key = target("//floor-boundary", "Compile");
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            killed_peak_memory_kb: Some(16_000),
+            killed_peak_disk_kb: Some(16_000),
+            killed: true,
+            now_s: NOW,
+            ..Observation::default()
+        },
+    );
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            peak_memory_kb: 16_000,
+            peak_disk_kb: 16_001,
+            completed: true,
+            now_s: NOW + 1,
+            ..Observation::default()
+        },
+    );
+    let entry = sketch.lookup(&key, NOW + 1).unwrap();
+    assert_eq!(
+        (entry.killed_peak_memory_kb, entry.killed_memory_s),
+        (16_000, NOW)
+    );
+    assert_eq!(
+        (entry.killed_peak_disk_kb, entry.killed_disk_s),
+        (16_000, NOW)
     );
 }
 

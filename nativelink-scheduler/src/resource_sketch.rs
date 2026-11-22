@@ -20,7 +20,8 @@
 //! a key not seen again is forgotten. A sample counts for between half a
 //! window and a whole one (two half-window histograms per entry), so what a
 //! key used last week stops shaping it. A kill floor is cleared by a later
-//! completed attempt or expires with the window. The families are split over
+//! completed attempt with a positive peak below that floor, or expires with
+//! the window. The families are split over
 //! [`SHARDS`] by key hash so a snapshot or an age-out never holds a lock the
 //! Execute path waits on for long. Nothing on the Execute path reads a file
 //! or parses JSON; a lookup is a hash probe and a 25-bucket scan.
@@ -851,9 +852,9 @@ impl Entry {
     /// samples become the previous ones and the previous ones are gone; two
     /// turns at once clear both. So a sample counts for between half a
     /// window and a whole one, and a rarely seen key keeps its last few
-    /// samples that long and no longer. The kill floor expires a window
-    /// after the kill, or is cleared by a later completed attempt. A seed
-    /// is left as it is: it stands until its first sample.
+    /// samples that long and no longer. A kill floor expires a window after
+    /// the kill, or is cleared by a later completed attempt that measured a
+    /// positive peak below it. A seed stands until its first sample.
     pub fn settle(&mut self, now_s: u64, window_s: u64) {
         if self.seeded {
             return;
@@ -904,10 +905,23 @@ impl Entry {
             half.max_disk_kb = half.max_disk_kb.max(observation.peak_disk_kb);
         }
         if observation.completed && !observation.killed {
-            self.killed_peak_memory_kb = 0;
-            self.killed_memory_s = 0;
-            self.killed_peak_disk_kb = 0;
-            self.killed_disk_s = 0;
+            for (floor, timestamp, peak) in [
+                (
+                    &mut self.killed_peak_memory_kb,
+                    &mut self.killed_memory_s,
+                    observation.peak_memory_kb,
+                ),
+                (
+                    &mut self.killed_peak_disk_kb,
+                    &mut self.killed_disk_s,
+                    observation.peak_disk_kb,
+                ),
+            ] {
+                if peak > 0 && peak < *floor {
+                    *floor = 0;
+                    *timestamp = 0;
+                }
+            }
         }
         if let Some(peak) = observation.killed_peak_memory_kb
             && peak > 0
