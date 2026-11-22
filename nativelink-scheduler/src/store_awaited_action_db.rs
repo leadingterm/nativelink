@@ -587,11 +587,53 @@ struct FleetCapabilities {
     workers: Vec<PlatformProperties>,
     #[serde(default, serialize_with = "serialize_legacy_resource_capacities")]
     resource_capacities: Option<Arc<[ResourceCapacity]>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_capacities_v2: Option<FleetResourceCapacitiesV2>,
 }
 
-// Peer beacons must remain readable by older controllers, whose capacity
-// schema rejects unknown fields. Encode physical limits as legacy ceilings
-// rather than exposing the internal ledger multipliers on the wire.
+/// Full rows separate actual partial facts from original prelaunch policy.
+#[derive(Serialize, Deserialize)]
+struct FleetResourceCapacitiesV2 {
+    observed: Arc<[ResourceCapacity]>,
+    estimates: Arc<[ResourceCapacity]>,
+}
+
+impl From<PeerScheduler> for FleetCapabilities {
+    fn from(peer: PeerScheduler) -> Self {
+        let resource_capacities_v2 = match (&peer.resource_capacities, &peer.resource_estimates) {
+            (Some(observed), Some(estimates)) => Some(FleetResourceCapacitiesV2 {
+                observed: observed.clone(),
+                estimates: estimates.clone(),
+            }),
+            _ => None,
+        };
+        Self {
+            scheduler_id: peer.scheduler_id,
+            workers: peer.workers,
+            resource_capacities: peer.legacy_resource_capacities.or(peer.resource_capacities),
+            resource_capacities_v2,
+        }
+    }
+}
+
+impl From<FleetCapabilities> for PeerScheduler {
+    fn from(fleet: FleetCapabilities) -> Self {
+        let (resource_capacities, resource_estimates) = match fleet.resource_capacities_v2 {
+            Some(v2) => (Some(v2.observed), Some(v2.estimates)),
+            None => (None, fleet.resource_capacities),
+        };
+        Self {
+            scheduler_id: fleet.scheduler_id,
+            workers: fleet.workers,
+            resource_capacities,
+            resource_estimates,
+            legacy_resource_capacities: None,
+        }
+    }
+}
+
+// The v1 view remains strict-old-row compatible. Only v2 carries full source
+// metadata and multipliers; legacy ceilings describe physical action limits.
 fn serialize_legacy_resource_capacities<S>(
     capacities: &Option<Arc<[ResourceCapacity]>>,
     serializer: S,
@@ -655,13 +697,15 @@ impl Serialize for LegacyCeilings<'_> {
 
 #[cfg(test)]
 mod legacy_capacity_wire_tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
+    use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
     use serde::Deserialize;
 
     use super::{
-        FleetCapabilities, ResourceCapacity, SchedulerStoreDataProvider, UpdateFleetCapabilities,
+        PeerScheduler, ResourceCapacity, SchedulerStoreDataProvider, SchedulerStoreDecodeTo,
+        SearchFleetCapabilities, UpdateFleetCapabilities,
     };
 
     #[derive(Deserialize)]
@@ -679,74 +723,180 @@ mod legacy_capacity_wire_tests {
         resource_capacities: Option<Vec<LegacyCapacity>>,
     }
 
-    #[test]
-    fn beacon_uses_legacy_capacity_schema_with_physical_ceilings() {
-        let row: ResourceCapacity = serde_json::from_str(
+    fn policy() -> ResourceCapacity {
+        serde_json::from_str(
             r#"{
-                "minimum": {"cpu": 96000, "memory": 64000, "disk": 100000},
+                "minimum": {"cpu": 32000, "memory": 63000, "disk": 100000},
                 "exact": {"os": "linux"},
-                "pool_multipliers": {"cpu": 3},
-                "action_ceilings": {"other": 7}
+                "pool_multipliers": {"cpu": 2},
+                "physical_sources": {"cpu": {"property": "cpu_count", "scale": 1000}},
+                "action_ceilings": {"cpu": 15000, "other": 7}
             }"#,
         )
-        .unwrap();
-        let mut capped = row.clone();
-        capped.action_ceilings.insert("cpu".into(), 16000);
-        let fleet = FleetCapabilities {
+        .unwrap()
+    }
+
+    fn peer() -> PeerScheduler {
+        PeerScheduler {
             scheduler_id: "scheduler".into(),
             workers: vec![],
-            resource_capacities: Some(Arc::from([row.clone(), capped])),
-        };
-        let bytes = UpdateFleetCapabilities(fleet).try_into_bytes().unwrap();
+            resource_capacities: None,
+            resource_estimates: None,
+            legacy_resource_capacities: None,
+        }
+    }
+
+    fn encode(peer: PeerScheduler) -> bytes::Bytes {
+        UpdateFleetCapabilities(peer.into())
+            .try_into_bytes()
+            .unwrap()
+    }
+
+    fn decode(bytes: bytes::Bytes) -> PeerScheduler {
+        SearchFleetCapabilities::decode(0, bytes).unwrap().into()
+    }
+
+    #[test]
+    fn old_reader_accepts_v2_beacon_with_strict_projected_v1_rows() {
+        let estimate = policy();
+        let mut observed = estimate.clone();
+        observed.minimum.insert("memory".into(), 60000);
+        let mut projection = observed.clone();
+        projection.minimum.insert("cpu".into(), 96000);
+        // The projection's ledger multiplier must still encode physical limits.
+        projection
+            .pool_multipliers
+            .insert("cpu".into(), 3u64.try_into().unwrap());
+        let bytes = encode(PeerScheduler {
+            resource_capacities: Some(Arc::from([observed])),
+            resource_estimates: Some(Arc::from([estimate])),
+            legacy_resource_capacities: Some(Arc::from([projection])),
+            ..peer()
+        });
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            json["resource_capacities"][0]
-                .get("pool_multipliers")
-                .is_none()
-        );
-        assert!(
-            json["resource_capacities"][1]
-                .get("pool_multipliers")
-                .is_none()
-        );
+        let row = json["resource_capacities"][0].as_object().unwrap();
+        assert_eq!(row.len(), 3);
+        assert!(row.contains_key("minimum"));
+        assert!(row.contains_key("exact"));
+        assert!(row.contains_key("action_ceilings"));
+        assert!(json["resource_capacities_v2"].is_object());
         let legacy: LegacyFleet = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(legacy.scheduler_id, "scheduler");
         assert!(legacy.workers.is_empty());
         let rows = legacy.resource_capacities.unwrap();
         assert_eq!(rows[0].minimum["cpu"], 96000);
+        assert_eq!(rows[0].minimum["memory"], 60000);
         assert_eq!(rows[0].exact["os"], "linux");
-        assert_eq!(rows[0].action_ceilings["cpu"], 32000);
-        assert_eq!(rows[0].action_ceilings["memory"], 64000);
+        assert_eq!(rows[0].action_ceilings["cpu"], 15000);
+        assert_eq!(rows[0].action_ceilings["memory"], 60000);
         assert_eq!(rows[0].action_ceilings["disk"], 100_000);
         assert_eq!(rows[0].action_ceilings["other"], 7);
-        assert_eq!(rows[1].action_ceilings["cpu"], 16000);
-        let new_reader: FleetCapabilities = serde_json::from_slice(&bytes).unwrap();
-        let new_rows = new_reader.resource_capacities.unwrap();
-        assert!(new_rows[0].pool_multipliers.is_empty());
-        assert_eq!(new_rows[0].effective_capacity("cpu"), Some(32000));
-
-        // The internal configuration format still retains its multiplier.
-        let internal = serde_json::to_value(&row).unwrap();
-        assert_eq!(internal["pool_multipliers"]["cpu"], 3);
-        let restored: ResourceCapacity = serde_json::from_value(internal).unwrap();
-        assert_eq!(restored, row);
     }
 
     #[test]
-    fn beacon_preserves_absent_and_empty_capacities() {
+    fn v2_round_trip_preserves_partial_facts_metadata_and_original_estimates() {
+        let estimate = policy();
+        let mut observed = estimate.clone();
+        observed.minimum = BTreeMap::from([("memory".into(), 60000)]);
+        let mut projection = estimate.clone();
+        projection.minimum.insert("cpu".into(), 96000);
+        projection.minimum.insert("memory".into(), 60000);
+        let observed: Arc<[ResourceCapacity]> = Arc::from([observed]);
+        let estimates: Arc<[ResourceCapacity]> = Arc::from([estimate]);
+        let bytes = encode(PeerScheduler {
+            resource_capacities: Some(observed.clone()),
+            resource_estimates: Some(estimates.clone()),
+            legacy_resource_capacities: Some(Arc::from([projection])),
+            ..peer()
+        });
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["resource_capacities_v2"]["observed"][0]["pool_multipliers"]["cpu"],
+            2
+        );
+        assert_eq!(
+            json["resource_capacities_v2"]["observed"][0]["physical_sources"]["cpu"]["property"],
+            "cpu_count"
+        );
+        assert_eq!(
+            json["resource_capacities_v2"]["observed"][0]["physical_sources"]["cpu"]["scale"],
+            1000
+        );
+        let decoded = decode(bytes);
+        assert_eq!(decoded.resource_capacities, Some(observed));
+        assert_eq!(decoded.resource_estimates, Some(estimates));
+        assert!(decoded.legacy_resource_capacities.is_none());
+
+        // A received projection must not become this scheduler's own policy.
+        let republished: serde_json::Value = serde_json::from_slice(&encode(decoded)).unwrap();
+        assert_eq!(
+            republished["resource_capacities_v2"]["estimates"][0]["minimum"]["cpu"],
+            32000
+        );
+        assert!(
+            republished["resource_capacities"][0]["minimum"]
+                .get("cpu")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_rows_remain_context_and_retain_worker_shapes() {
+        let workers = vec![PlatformProperties::new(HashMap::from([(
+            "cpu_count".into(),
+            PlatformPropertyValue::Ignore("32".into()),
+        )]))];
+        let bytes = encode(PeerScheduler {
+            workers: workers.clone(),
+            resource_capacities: Some(Arc::from([policy()])),
+            ..peer()
+        });
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("resource_capacities_v2").is_none());
+        let decoded = decode(bytes);
+        assert_eq!(decoded.workers, workers);
+        assert!(decoded.resource_capacities.is_none());
+        let context = decoded.resource_estimates.as_ref().unwrap();
+        assert_eq!(context[0].minimum["cpu"], 32000);
+        assert_eq!(context[0].effective_capacity("cpu"), Some(15000));
+        assert!(context[0].pool_multipliers.is_empty());
+        assert!(context[0].physical_sources.is_empty());
+        assert!(decoded.legacy_resource_capacities.is_none());
+        let republished = decode(encode(decoded));
+        assert!(republished.resource_capacities.is_none());
+        assert!(republished.resource_estimates.is_none());
+    }
+
+    #[test]
+    fn v2_empty_observed_never_falls_back_to_projected_or_estimated_rows() {
+        let estimates: Arc<[ResourceCapacity]> = Arc::from([policy()]);
+        let decoded = decode(encode(PeerScheduler {
+            resource_capacities: Some(Arc::from([])),
+            resource_estimates: Some(estimates.clone()),
+            legacy_resource_capacities: Some(estimates.clone()),
+            ..peer()
+        }));
+        assert_eq!(decoded.resource_capacities, Some(Arc::from([])));
+        assert_eq!(decoded.resource_estimates, Some(estimates));
+        assert!(decoded.legacy_resource_capacities.is_none());
+    }
+
+    #[test]
+    fn beacon_preserves_absent_and_empty_legacy_context_without_actual_facts() {
         for capacities in [None, Some(Arc::from([]))] {
             let expected_empty = capacities.is_some();
-            let fleet = FleetCapabilities {
-                scheduler_id: "scheduler".into(),
-                workers: vec![],
+            let bytes = encode(PeerScheduler {
                 resource_capacities: capacities,
-            };
-            let bytes = UpdateFleetCapabilities(fleet).try_into_bytes().unwrap();
+                ..peer()
+            });
             let legacy: LegacyFleet = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(legacy.resource_capacities.is_some(), expected_empty);
             if let Some(rows) = legacy.resource_capacities {
                 assert!(rows.is_empty());
             }
+            let decoded = decode(bytes);
+            assert!(decoded.resource_capacities.is_none());
+            assert_eq!(decoded.resource_estimates.is_some(), expected_empty);
         }
     }
 }
@@ -1422,14 +1572,7 @@ where
     ) -> Result<Vec<PeerScheduler>, Error> {
         let scheduler_id = local.scheduler_id.clone();
         self.store
-            .update_data(
-                UpdateFleetCapabilities(FleetCapabilities {
-                    scheduler_id: local.scheduler_id,
-                    workers: local.workers,
-                    resource_capacities: local.resource_capacities,
-                }),
-                Some(ttl),
-            )
+            .update_data(UpdateFleetCapabilities(local.into()), Some(ttl))
             .await
             .err_tip(|| "In StoreAwaitedActionDb::exchange_fleet_capabilities publish")?;
 
@@ -1443,11 +1586,7 @@ where
         stream
             .try_filter(|record| futures::future::ready(record.scheduler_id != scheduler_id))
             .try_fold(Vec::new(), |mut peers, record| async move {
-                peers.push(PeerScheduler {
-                    scheduler_id: record.scheduler_id,
-                    workers: record.workers,
-                    resource_capacities: record.resource_capacities,
-                });
+                peers.push(record.into());
                 Ok(peers)
             })
             .await

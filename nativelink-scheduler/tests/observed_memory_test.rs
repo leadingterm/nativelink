@@ -581,6 +581,8 @@ async fn remote_only_capacity_publication_updates_watch_without_conflating_peer_
         scheduler_id: sender.scheduler_id_for_test().to_string(),
         workers: sender.fleet_shapes_for_test().await,
         resource_capacities: Some(current_capacity(sender_worker.as_ref()).capacities.clone()),
+        resource_estimates: Some(Arc::from(capacities.clone())),
+        legacy_resource_capacities: None,
     };
     let (receiver, receiver_worker) = make_scheduler(capacities);
     let mut updates = receiver_worker

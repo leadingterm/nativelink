@@ -288,8 +288,8 @@ use crate::match_outcome::{
     MatchOutcome, PropertyShape, UnsatisfiableReason, explain_unsatisfiable,
 };
 use crate::memory_capacity::{
-    CapacityProperty, eligible_capacity, fit_memory, observe_capacities, peer_capacity,
-    worker_capacity,
+    CapacityProperty, actual_capacities, eligible_capacity, fit_memory, legacy_capacities,
+    observe_capacities, peer_capacity, worker_capacity,
 };
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::resource_sketch::{Observation, ResourceSketch, SketchKey};
@@ -442,10 +442,12 @@ struct ApiWorkerSchedulerImpl {
     resource_escalation: Option<Arc<ResourceEscalationSpec>>,
     /// Current local and peer-local physical capacities used for queued fitting.
     resource_capacity_tx: Option<watch::Sender<Arc<ResourceCapacitySnapshot>>>,
-    /// Current local facts only, or configured estimates for unobserved rows.
+    /// Cached actual-only local facts, independent of peer fitting snapshots.
     local_resource_capacities: Option<Arc<[ResourceCapacity]>>,
-    /// Current peer-local rows, kept separately so advertisements never echo peers.
-    peer_resource_capacities: Vec<Arc<[ResourceCapacity]>>,
+    /// Immutable original configured rows, never derived from advertisements.
+    resource_estimates: Option<Arc<[ResourceCapacity]>>,
+    /// Cached old-reader projection of local facts and original peer context.
+    legacy_resource_capacities: Option<Arc<[ResourceCapacity]>>,
     /// How a queued action that keeps finding no room gets a worker held
     /// for it; unset means never.
     reservation_hold: Option<ReservationHoldSpec>,
@@ -791,7 +793,7 @@ impl ApiWorkerSchedulerImpl {
         self.worker_change_notify.notify_one();
     }
 
-    /// The distinct properties this scheduler's workers registered with.
+    /// Distinct per-action worker shapes for peer static eligibility checks.
     fn fleet_shapes(&self) -> Vec<PlatformProperties> {
         let mut seen = HashSet::new();
         self.workers
@@ -809,17 +811,37 @@ impl ApiWorkerSchedulerImpl {
         else {
             return;
         };
-        if let Some(rows) = observe_capacities(&policy.capacities, current, |row, property| {
+        let rows = actual_capacities(&policy.capacities, |row, property| {
             self.workers
                 .iter()
                 .filter_map(|(_, worker)| {
                     worker_capacity(row, property, &worker.total_platform_properties)
                 })
                 .min()
-        }) {
+        });
+        if rows != *current {
             self.local_resource_capacities = Some(rows);
         }
+        self.refresh_legacy_resource_capacities();
         self.publish_resource_capacities();
+    }
+
+    fn refresh_legacy_resource_capacities(&mut self) {
+        let (Some(policy), Some(actual)) =
+            (&self.resource_escalation, &self.local_resource_capacities)
+        else {
+            return;
+        };
+        let rows = legacy_capacities(
+            policy,
+            actual,
+            self.peer_schedulers
+                .iter()
+                .filter_map(|peer| peer.resource_estimates.as_deref()),
+        );
+        if self.legacy_resource_capacities.as_ref() != Some(&rows) {
+            self.legacy_resource_capacities = Some(rows);
+        }
     }
 
     /// Publish global current facts without making them local knowledge.
@@ -837,10 +859,18 @@ impl ApiWorkerSchedulerImpl {
                         worker_capacity(row, property, &worker.total_platform_properties)
                     })
                     .chain(
-                        self.peer_resource_capacities
+                        self.peer_schedulers
                             .iter()
+                            .filter_map(|peer| peer.resource_capacities.as_ref())
                             .flat_map(|rows| rows.iter())
                             .filter_map(|peer| peer_capacity(row, property, peer)),
+                    )
+                    .chain(
+                        self.peer_schedulers
+                            .iter()
+                            .filter(|peer| peer.resource_capacities.is_none())
+                            .flat_map(|peer| peer.workers.iter())
+                            .filter_map(|totals| worker_capacity(row, property, totals)),
                     )
                     .min()
             });
@@ -875,20 +905,31 @@ impl ApiWorkerSchedulerImpl {
         // even when the union of shapes did not move.
         let mut peer_schedulers = peers.unwrap_or_default();
         peer_schedulers.sort_unstable_by(|a, b| a.scheduler_id.cmp(&b.scheduler_id));
-        let resource_capacities_changed = !self.peer_resource_capacities.iter().eq(peer_schedulers
+        let resource_capacities_changed = !self
+            .peer_schedulers
             .iter()
-            .filter_map(|peer| peer.resource_capacities.as_ref()));
-        self.peer_resource_capacities.clear();
-        self.peer_resource_capacities.extend(
-            peer_schedulers
-                .iter_mut()
-                .filter_map(|peer| peer.resource_capacities.take()),
-        );
-        if resource_capacities_changed && self.publish_resource_capacities() {
-            // Wake queued refits, but do not advertise peer facts as local.
-            self.capacity_changed();
-        }
+            .map(|peer| {
+                (
+                    &peer.resource_capacities,
+                    &peer.resource_estimates,
+                    &peer.workers,
+                )
+            })
+            .eq(peer_schedulers.iter().map(|peer| {
+                (
+                    &peer.resource_capacities,
+                    &peer.resource_estimates,
+                    &peer.workers,
+                )
+            }));
         self.peer_schedulers = peer_schedulers;
+        if resource_capacities_changed {
+            self.refresh_legacy_resource_capacities();
+            if self.publish_resource_capacities() {
+                // Wake queued refits, but do not advertise peer facts as local.
+                self.capacity_changed();
+            }
+        }
         // Freshness bookkeeping: update the warm-up /
         // staleness clocks BEFORE the unchanged-shapes early return, so a
         // successful exchange that happens to return the same shapes still
@@ -2597,16 +2638,14 @@ impl ApiWorkerScheduler {
             .as_ref()
             .and_then(|policy| policy.disk.as_ref().map(|disk| disk.property.clone()));
         let resource_escalation = resource_escalation.map(Arc::new);
-        let (resource_capacity_tx, resource_capacity_rx, local_resource_capacities) =
-            resource_escalation
-                .as_ref()
-                .map_or((None, None, None), |policy| {
-                    let snapshot =
-                        Arc::new(ResourceCapacitySnapshot::new(policy.capacities.clone()));
-                    let local = snapshot.capacities.clone();
-                    let (sender, receiver) = watch::channel(snapshot);
-                    (Some(sender), Some(receiver), Some(local))
-                });
+        let (resource_capacity_tx, resource_capacity_rx, resource_estimates) = resource_escalation
+            .as_ref()
+            .map_or((None, None, None), |policy| {
+                let snapshot = Arc::new(ResourceCapacitySnapshot::new(policy.capacities.clone()));
+                let local = snapshot.capacities.clone();
+                let (sender, receiver) = watch::channel(snapshot);
+                (Some(sender), Some(receiver), Some(local))
+            });
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
@@ -2615,8 +2654,9 @@ impl ApiWorkerScheduler {
                 live_memory_veto,
                 resource_escalation: resource_escalation.clone(),
                 resource_capacity_tx,
-                local_resource_capacities,
-                peer_resource_capacities: Vec::new(),
+                local_resource_capacities: resource_estimates.as_ref().map(|_| Arc::from([])),
+                legacy_resource_capacities: resource_estimates.clone(),
+                resource_estimates,
                 reservation_hold,
                 attempt_events: maybe_origin_event_tx.clone(),
                 lost_results: LostResults::default(),
@@ -2823,19 +2863,9 @@ impl ApiWorkerScheduler {
         PeerScheduler {
             scheduler_id: inner.scheduler_id.clone(),
             workers: inner.fleet_shapes(),
-            resource_capacities: inner.local_resource_capacities.as_ref().map(|rows| {
-                rows.iter()
-                    .filter(|row| {
-                        row.minimum.keys().all(|property| {
-                            inner.workers.iter().any(|(_, worker)| {
-                                worker_capacity(row, property, &worker.total_platform_properties)
-                                    .is_some()
-                            })
-                        })
-                    })
-                    .cloned()
-                    .collect::<Arc<[_]>>()
-            }),
+            resource_capacities: inner.local_resource_capacities.clone(),
+            resource_estimates: inner.resource_estimates.clone(),
+            legacy_resource_capacities: inner.legacy_resource_capacities.clone(),
         }
     }
 
@@ -3055,11 +3085,6 @@ impl WorkerScheduler for ApiWorkerScheduler {
             let mnemonic = metadata
                 .map(|m| m.action_mnemonic.as_str())
                 .filter(|name| !name.is_empty());
-            let key = SketchKey::for_attempt(
-                target,
-                mnemonic,
-                &action_info.inner.command_digest.to_string(),
-            );
             let reservation = |property: Option<&str>, echoed: Option<u64>| {
                 echoed.filter(|value| *value > 0).or_else(|| {
                     match action_info.platform_properties.properties.get(property?) {
@@ -3106,14 +3131,24 @@ impl WorkerScheduler for ApiWorkerScheduler {
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
             };
-            sketch.observe(key, &observation);
-            if !killed
-                && target.is_none_or(str::is_empty)
-                && let Some(mnemonic) = mnemonic
-            {
+            sketch.observe(SketchKey::for_action(&action_info.inner), &observation);
+            if outcome == ResourceOutcome::Completed {
+                if let Some(target) = target.filter(|target| !target.is_empty()) {
+                    sketch.observe(
+                        SketchKey::for_attempt(Some(target), mnemonic, ""),
+                        &observation,
+                    );
+                } else if let Some(mnemonic) = mnemonic {
+                    sketch.observe(
+                        SketchKey::Mnemonic {
+                            mnemonic: Arc::from(mnemonic),
+                        },
+                        &observation,
+                    );
+                }
                 sketch.observe(
-                    SketchKey::Mnemonic {
-                        mnemonic: Arc::from(mnemonic),
+                    SketchKey::Command {
+                        digest: Arc::from(action_info.inner.command_digest.to_string()),
                     },
                     &observation,
                 );

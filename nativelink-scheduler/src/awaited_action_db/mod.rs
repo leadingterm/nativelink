@@ -227,6 +227,13 @@ pub struct PeerScheduler {
     /// The properties each distinct kind of worker connected to the peer
     /// registered with.
     pub workers: Vec<PlatformProperties>,
-    /// Conservative correlated physical capacity rows known to this peer.
+    /// Actual correlated capacity facts, with unknown dimensions omitted.
+    /// Legacy peers do not publish these facts; their rows are estimates.
     pub resource_capacities: Option<Arc<[ResourceCapacity]>>,
+    /// Original configured/prelaunch rows, or raw legacy rows retained only
+    /// as context for a conservative legacy projection, never as actual facts.
+    pub resource_estimates: Option<Arc<[ResourceCapacity]>>,
+    /// Local outgoing projection for legacy readers. Inbound peers always
+    /// leave this unset so projected values cannot become original estimates.
+    pub legacy_resource_capacities: Option<Arc<[ResourceCapacity]>>,
 }

@@ -241,6 +241,80 @@ pub(crate) fn observe_capacities(
     updated.map(Arc::from)
 }
 
+/// Actual-only rows retain policy metadata but never substitute unknown facts
+/// with prelaunch estimates. Called on fleet changes, not beacon publication.
+pub(crate) fn actual_capacities(
+    baseline: &[ResourceCapacity],
+    mut observed: impl FnMut(&ResourceCapacity, &str) -> Option<u64>,
+) -> Arc<[ResourceCapacity]> {
+    baseline
+        .iter()
+        .filter_map(|row| {
+            let minimum = row
+                .minimum
+                .keys()
+                .filter_map(|property| {
+                    observed(row, property).map(|capacity| (property.clone(), capacity))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            (!minimum.is_empty()).then(|| ResourceCapacity {
+                minimum,
+                exact: row.exact.clone(),
+                action_ceilings: row.action_ceilings.clone(),
+                pool_multipliers: row.pool_multipliers.clone(),
+                physical_sources: row.physical_sources.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Old readers select entire rows using non-memory prelaunch minima. Preserve
+/// that context without advertising estimates as actuals in the new protocol.
+pub(crate) fn legacy_capacities<'a>(
+    policy: &ResourceEscalationSpec,
+    actual: &[ResourceCapacity],
+    estimates: impl Iterator<Item = &'a [ResourceCapacity]>,
+) -> Arc<[ResourceCapacity]> {
+    let mut rows = policy.capacities.clone();
+    for row in &mut rows {
+        let observed = actual.iter().find(|actual| {
+            actual.exact == row.exact
+                && actual.pool_multipliers == row.pool_multipliers
+                && actual.physical_sources == row.physical_sources
+                && actual.action_ceilings == row.action_ceilings
+        });
+        // Raising v1 eligibility context must not raise an action limit. For
+        // unknown dimensions preserve the original local physical estimate.
+        for property in row.minimum.keys() {
+            if let Some(ceiling) = observed
+                .and_then(|actual| actual.effective_capacity(property))
+                .or_else(|| row.effective_capacity(property))
+            {
+                row.action_ceilings.insert(property.clone(), ceiling);
+            }
+        }
+        if let Some(memory) =
+            observed.and_then(|actual| actual.minimum.get(&policy.memory.property))
+        {
+            row.minimum.insert(policy.memory.property.clone(), *memory);
+        }
+    }
+    for peer in estimates {
+        for row in &mut rows {
+            for estimate in peer.iter().filter(|peer| peer.exact == row.exact) {
+                for (property, minimum) in &mut row.minimum {
+                    if property != &policy.memory.property
+                        && let Some(remote) = estimate.minimum.get(property)
+                    {
+                        *minimum = (*minimum).max(*remote);
+                    }
+                }
+            }
+        }
+    }
+    rows.into()
+}
+
 pub(crate) fn worker_capacity(
     row: &ResourceCapacity,
     property: &str,
@@ -250,6 +324,20 @@ pub(crate) fn worker_capacity(
         matches!(totals.properties.get(name), Some(PlatformPropertyValue::Exact(actual)) if actual == expected)
     }) {
         return None;
+    }
+    if let Some(source) = row.physical_sources.get(property) {
+        let physical = match totals.properties.get(&source.property)? {
+            PlatformPropertyValue::Minimum(value) => *value,
+            PlatformPropertyValue::Exact(value)
+            | PlatformPropertyValue::Priority(value)
+            | PlatformPropertyValue::Ignore(value)
+            | PlatformPropertyValue::Unknown(value) => value.parse::<u64>().ok()?,
+        };
+        return physical.checked_mul(source.scale.get())?.checked_mul(
+            row.pool_multipliers
+                .get(property)
+                .map_or(1, |factor| factor.get()),
+        );
     }
     match totals.properties.get(property) {
         Some(PlatformPropertyValue::Minimum(capacity)) => Some(*capacity),
@@ -262,9 +350,14 @@ pub(crate) fn peer_capacity(
     property: &str,
     peer: &ResourceCapacity,
 ) -> Option<u64> {
-    (row.exact == peer.exact)
-        .then(|| peer.minimum.get(property).copied())
-        .flatten()
+    if row.exact != peer.exact {
+        return None;
+    }
+    peer.physical_capacity(property)?.checked_mul(
+        row.pool_multipliers
+            .get(property)
+            .map_or(1, |factor| factor.get()),
+    )
 }
 
 #[cfg(test)]
@@ -518,6 +611,107 @@ mod tests {
         ]))
     }
 
+    fn hardware_policy(multiplier: u64) -> ResourceEscalationSpec {
+        serde_json::from_value(json!({
+            "memory": { "property": "memory", "percent": 200, "max_steps": 2 },
+            "headroom_percent": 20,
+            "cpu_property": "cpu",
+            "capacities": [{
+                "minimum": { "memory": ESTIMATE, "cpu": 15_000 * multiplier, "disk": 1024 },
+                "exact": { "fleet": "compile" },
+                "pool_multipliers": { "cpu": multiplier },
+                "physical_sources": { "cpu": { "property": "cpu_count", "scale": 1000 } },
+                "action_ceilings": { "cpu": 16_000 }
+            }]
+        }))
+        .expect("hardware policy")
+    }
+
+    #[test]
+    fn hardware_sources_accept_borrowed_scalar_metadata_and_ignore_sender_ledgers() {
+        let policy = hardware_policy(3);
+        let row = &policy.capacities[0];
+        for scalar in [
+            PlatformPropertyValue::Minimum(32),
+            PlatformPropertyValue::Ignore("32".to_owned()),
+            PlatformPropertyValue::Exact("32".to_owned()),
+            PlatformPropertyValue::Priority("32".to_owned()),
+            PlatformPropertyValue::Unknown("32".to_owned()),
+        ] {
+            let mut totals = worker("compile", ACTUAL, 64_000, 512);
+            totals.properties.insert("cpu_count".to_owned(), scalar);
+            let actual = actual_capacities(&policy.capacities, |row, property| {
+                worker_capacity(row, property, &totals)
+            });
+            assert_eq!(actual[0].minimum["cpu"], 96_000);
+            assert_eq!(actual[0].physical_capacity("cpu"), Some(32_000));
+            assert_eq!(actual[0].effective_capacity("cpu"), Some(16_000));
+            assert_eq!(actual[0].minimum["memory"], ACTUAL);
+            assert_eq!(actual[0].minimum["disk"], 512);
+            assert_eq!(actual[0].physical_sources, row.physical_sources);
+        }
+        let mut remote = row.clone();
+        remote.minimum.clear();
+        remote.minimum.insert("cpu".to_owned(), 64_000);
+        remote
+            .pool_multipliers
+            .insert("cpu".to_owned(), std::num::NonZeroU64::new(2).unwrap());
+        assert_eq!(peer_capacity(row, "cpu", &remote), Some(96_000));
+        assert_eq!(peer_capacity(row, "memory", &remote), None);
+        remote.minimum.insert("cpu".to_owned(), u64::MAX);
+        remote.minimum.insert("memory".to_owned(), ACTUAL);
+        remote.pool_multipliers.clear();
+        assert_eq!(peer_capacity(row, "cpu", &remote), None);
+        assert_eq!(peer_capacity(row, "memory", &remote), Some(ACTUAL));
+    }
+
+    #[test]
+    fn partial_actual_rows_omit_unknown_dimensions_without_discarding_memory() {
+        let policy = hardware_policy(3);
+        let baseline = &policy.capacities;
+        for scalar in [
+            None,
+            Some(PlatformPropertyValue::Ignore("invalid".to_owned())),
+            Some(PlatformPropertyValue::Minimum(u64::MAX)),
+            // Scale fits but applying the receiving multiplier would overflow.
+            Some(PlatformPropertyValue::Minimum(u64::MAX / 1000)),
+        ] {
+            let mut totals = worker("compile", ACTUAL, 64_000, 512);
+            totals.properties.remove("disk");
+            if let Some(scalar) = scalar {
+                totals.properties.insert("cpu_count".to_owned(), scalar);
+            }
+            let actual = actual_capacities(baseline, |row, property| {
+                worker_capacity(row, property, &totals)
+            });
+            assert_eq!(actual.len(), 1);
+            assert_eq!(
+                actual[0].minimum,
+                std::collections::BTreeMap::from([("memory".to_owned(), ACTUAL)])
+            );
+            assert_eq!(actual[0].action_ceilings, baseline[0].action_ceilings);
+            let fitting = observe_capacities(baseline, baseline, |row, property| {
+                peer_capacity(row, property, &actual[0])
+            })
+            .expect("partial memory lowers the fitting row");
+            assert_eq!(fitting[0].minimum["memory"], ACTUAL);
+            assert_eq!(fitting[0].minimum["cpu"], baseline[0].minimum["cpu"]);
+            assert_eq!(fitting[0].minimum["disk"], 1024);
+        }
+        assert!(actual_capacities(baseline, |_, _| None).is_empty());
+        let mut wrong = worker("other", ACTUAL, 64_000, 512);
+        wrong.properties.insert(
+            "cpu_count".to_owned(),
+            PlatformPropertyValue::Ignore("32".to_owned()),
+        );
+        assert!(
+            actual_capacities(baseline, |row, property| {
+                worker_capacity(row, property, &wrong)
+            })
+            .is_empty()
+        );
+    }
+
     #[test]
     fn worker_observations_cover_all_dimensions_and_recover() {
         let policy = policy();
@@ -659,5 +853,43 @@ mod tests {
         let recovered = observe_capacities(&local, &global, |_, _| None)
             .expect("removed peer facts are no longer observations");
         assert_eq!(recovered, local);
+    }
+
+    #[test]
+    fn legacy_context_never_inflates_unknown_action_limits_or_actual_dimensions() {
+        let mut policy = hardware_policy(1);
+        policy.capacities[0]
+            .minimum
+            .insert("cpu".to_owned(), 32_000);
+        policy.capacities[0].action_ceilings.clear();
+        let mut totals = worker("compile", ACTUAL, 64_000, 512);
+        totals.properties.remove("disk");
+        let actual = actual_capacities(&policy.capacities, |row, property| {
+            worker_capacity(row, property, &totals)
+        });
+        assert_eq!(actual[0].minimum.len(), 1);
+        let mut legacy = policy.capacities.clone();
+        legacy[0].minimum.insert("cpu".to_owned(), 96_000);
+        legacy[0].minimum.insert("disk".to_owned(), 2048);
+        legacy[0].minimum.insert("memory".to_owned(), 1);
+        let mut unrelated = legacy.clone();
+        unrelated[0]
+            .exact
+            .insert("fleet".to_owned(), "other".to_owned());
+        unrelated[0].minimum.insert("cpu".to_owned(), u64::MAX);
+        let projected = legacy_capacities(
+            &policy,
+            &actual,
+            [legacy.as_slice(), unrelated.as_slice()].into_iter(),
+        );
+        assert_eq!(projected[0].minimum["cpu"], 96_000);
+        assert_eq!(projected[0].minimum["disk"], 2048);
+        assert_eq!(projected[0].minimum["memory"], ACTUAL);
+        assert_eq!(projected[0].action_ceilings["cpu"], 32_000);
+        assert_eq!(projected[0].action_ceilings["disk"], 1024);
+        assert_eq!(projected[0].action_ceilings["memory"], ACTUAL);
+        assert!(!actual[0].minimum.contains_key("cpu"));
+        assert!(!actual[0].minimum.contains_key("disk"));
+        assert_eq!(policy.capacities[0].minimum["cpu"], 32_000);
     }
 }

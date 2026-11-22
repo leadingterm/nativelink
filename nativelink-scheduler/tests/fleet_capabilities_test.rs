@@ -59,6 +59,8 @@ fn peer(scheduler_id: &str, workers: Vec<PlatformProperties>) -> PeerScheduler {
         scheduler_id: scheduler_id.to_string(),
         workers,
         resource_capacities: None,
+        resource_estimates: None,
+        legacy_resource_capacities: None,
     }
 }
 
@@ -107,6 +109,8 @@ async fn schedulers_see_each_others_fleet_but_not_their_own() -> Result<(), Erro
             scheduler_id: "a".to_string(),
             workers: vec![shape(0)],
             resource_capacities: None,
+            resource_estimates: None,
+            legacy_resource_capacities: None,
         }]
     );
 
@@ -119,6 +123,8 @@ async fn schedulers_see_each_others_fleet_but_not_their_own() -> Result<(), Erro
             scheduler_id: "b".to_string(),
             workers: vec![shape(1), shape(2)],
             resource_capacities: None,
+            resource_estimates: None,
+            legacy_resource_capacities: None,
         }]
     );
 
@@ -150,6 +156,8 @@ async fn republishing_replaces_the_previous_record() -> Result<(), Error> {
             scheduler_id: "b".to_string(),
             workers: vec![],
             resource_capacities: None,
+            resource_estimates: None,
+            legacy_resource_capacities: None,
         }],
         "the peer is still there, with no workers"
     );

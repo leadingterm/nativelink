@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,32 +24,44 @@ mod utils {
 
 use futures::join;
 use nativelink_config::schedulers::{
-    ColdStartSpec, CpuReservationPercentile, HistoricalResourceSpec, SchedulerSpec, SimpleSpec,
+    ColdStartSpec, CpuReservationPercentile, EscalationDimensionSpec, HistoricalResourceSpec,
+    PropertyType, ResourceCapacity, ResourceEscalationSpec, SchedulerSpec, SimpleSpec,
     SizeClassSpec, TimeoutClassSpec,
 };
 use nativelink_config::stores::{MemorySpec, SizePartitioningSpec, StoreSpec};
-use nativelink_error::Error;
+use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
-use nativelink_scheduler::default_scheduler_factory::scheduler_factory;
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+    ActionResourceUsage, ResourceOutcome, update_for_worker,
+};
+use nativelink_scheduler::default_scheduler_factory::{
+    memory_awaited_action_db_factory, scheduler_factory,
+};
 use nativelink_scheduler::historical_resource_scheduler::{
     HistoricalResourceScheduler, replica_id, snapshot_key,
 };
 use nativelink_scheduler::mock_scheduler::MockActionScheduler;
-use nativelink_scheduler::resource_sketch::{Observation, SketchKey};
+use nativelink_scheduler::resource_sketch::{HistoryScope, Observation, SketchKey};
+use nativelink_scheduler::simple_scheduler::SimpleScheduler;
+use nativelink_scheduler::worker::Worker;
+use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
 use nativelink_store::store_manager::StoreManager;
-use nativelink_util::action_messages::{ActionStage, ActionState, MemoryReservation, OperationId};
+use nativelink_util::action_messages::{
+    ActionStage, ActionState, MemoryReservation, OperationId, WorkerId,
+};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::operation_state_manager::ClientStateManager;
 use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_to_baggage};
+use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use opentelemetry::KeyValue;
 use opentelemetry::baggage::BaggageExt;
 use opentelemetry::context::{Context, FutureExt as OtelFutureExt};
 use pretty_assertions::assert_eq;
-use tokio::sync::watch;
+use tokio::sync::{Notify, mpsc, watch};
 use utils::scheduler_utils::{TokioWatchActionStateResult, make_base_action_info};
 
 fn write_hints_file(contents: &str) -> String {
@@ -95,6 +107,272 @@ fn base_spec(hints_file: String, cold_start: Option<ColdStartSpec>) -> Historica
         cold_start,
         scheduler: Box::new(SchedulerSpec::Simple(SimpleSpec::default())),
     }
+}
+
+async fn fitting_scheduler(physical: u64, ceiling: u64) -> Result<(HistoricalResourceScheduler, Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>, mpsc::Receiver<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UpdateForWorker>), Error>{
+    let mut spec = base_spec(String::new(), None);
+    spec.headroom_percent = 20;
+    let sketch = Arc::new(HistoricalResourceScheduler::sketch_from_spec(&spec));
+    let simple_spec = SimpleSpec {
+        supported_platform_properties: Some(HashMap::from([
+            ("memory_kb".to_string(), PropertyType::Minimum),
+            ("cpu_count".to_string(), PropertyType::Minimum),
+        ])),
+        resource_escalation: Some(ResourceEscalationSpec {
+            memory: EscalationDimensionSpec {
+                property: "memory_kb".to_string(),
+                percent: 250,
+                max_steps: 3,
+            },
+            disk: None,
+            headroom_percent: 20,
+            cpu_property: "cpu_count".to_string(),
+            capacity_ignored_properties: Vec::new(),
+            capacities: vec![ResourceCapacity {
+                minimum: BTreeMap::from([
+                    ("memory_kb".to_string(), physical),
+                    ("cpu_count".to_string(), 16),
+                ]),
+                action_ceilings: BTreeMap::from([("memory_kb".to_string(), ceiling)]),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    };
+    let notify = Arc::new(Notify::new());
+    let (simple, workers) = SimpleScheduler::new_with_resource_sketch(
+        &simple_spec,
+        memory_awaited_action_db_factory(0, &notify, SystemTime::now),
+        notify,
+        None,
+        Some(sketch.clone()),
+    );
+    let (tx, mut rx) = mpsc::channel(64);
+    simple
+        .add_worker(Worker::new(
+            WorkerId("arm".to_string()),
+            PlatformProperties::new(HashMap::from([
+                (
+                    "memory_kb".to_string(),
+                    PlatformPropertyValue::Minimum(physical),
+                ),
+                ("cpu_count".to_string(), PlatformPropertyValue::Minimum(16)),
+            ])),
+            tx,
+            now_s(),
+            4,
+        ))
+        .await?;
+    rx.recv().await.expect("worker registration");
+    Ok((
+        HistoricalResourceScheduler::new(&spec, simple.clone(), sketch),
+        simple,
+        workers,
+        rx,
+    ))
+}
+
+fn tagged_context() -> Context {
+    Context::current_with_baggage(vec![KeyValue::new(
+        BAZEL_METADATA_KEY,
+        request_metadata_to_baggage(&RequestMetadata {
+            target_id: "//pkg:foo".to_string(),
+            action_mnemonic: "Compile".to_string(),
+            ..Default::default()
+        }),
+    )])
+}
+
+fn test_action(byte: u8) -> Arc<nativelink_util::action_messages::ActionInfo> {
+    make_base_action_info(SystemTime::now(), DigestInfo::new([byte; 32], 512))
+}
+
+#[nativelink_test]
+async fn aggregate_highmem_estimate_fits_cold_action_without_becoming_floor() -> Result<(), Error> {
+    const GIB: u64 = 1024 * 1024;
+    let (historical, simple, _, mut rx) = fitting_scheduler(63 * GIB, 16 * GIB).await?;
+    let old = test_action(1);
+    let observation = Observation {
+        peak_memory_kb: 80 * GIB,
+        completed: true,
+        now_s: now_s(),
+        ..Default::default()
+    };
+    historical
+        .sketch()
+        .observe(SketchKey::for_action(&old), &observation);
+    historical.sketch().observe(
+        SketchKey::for_attempt(Some("//pkg:foo"), Some("Compile"), ""),
+        &observation,
+    );
+    let Err(error) = historical
+        .add_action(OperationId::default(), old.clone())
+        .with_context(tagged_context())
+        .await
+    else {
+        panic!("original action must retain its 80 GiB floor");
+    };
+    assert_eq!(error.code, Code::FailedPrecondition);
+    let listener = historical
+        .add_action(OperationId::default(), test_action(2))
+        .with_context(tagged_context())
+        .await?;
+    let fitted = listener.as_action_info().await?.0;
+    assert_eq!(fitted.memory_reservation.as_ref().unwrap().minimum_kb, None);
+    assert!(
+        fitted.platform_properties["memory_kb"]
+            .parse::<u64>()
+            .unwrap()
+            <= 16 * GIB
+    );
+    simple.do_try_match_for_test().await?;
+    assert!(matches!(
+        rx.recv().await.unwrap().update,
+        Some(update_for_worker::Update::StartAction(_))
+    ));
+    assert_eq!(
+        historical
+            .sketch()
+            .lookup(&SketchKey::for_action(&old), now_s())
+            .unwrap()
+            .max_memory_kb(),
+        80 * GIB
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn killed_action_floor_does_not_follow_changed_action_digest() -> Result<(), Error> {
+    const GIB: u64 = 1024 * 1024;
+    let (historical, simple, workers, mut rx) = fitting_scheduler(63 * GIB, 16 * GIB).await?;
+    let old = test_action(3);
+    let new = test_action(4);
+    assert_eq!(old.command_digest, new.command_digest);
+    historical.sketch().observe(
+        SketchKey::for_action(&old),
+        &Observation {
+            peak_memory_kb: 17 * GIB,
+            killed_peak_memory_kb: Some(17 * GIB),
+            killed: true,
+            now_s: now_s(),
+            ..Default::default()
+        },
+    );
+    let aggregate = SketchKey::for_attempt(Some("//pkg:foo"), Some("Compile"), "");
+    assert!(historical.sketch().lookup(&aggregate, now_s()).is_none());
+    historical.sketch().observe(
+        aggregate.clone(),
+        &Observation {
+            peak_memory_kb: 10 * 1024,
+            completed: true,
+            now_s: now_s(),
+            ..Default::default()
+        },
+    );
+    let Err(error) = historical
+        .add_action(OperationId::default(), old.clone())
+        .with_context(tagged_context())
+        .await
+    else {
+        panic!("same action must retain its kill floor");
+    };
+    assert_eq!(error.code, Code::FailedPrecondition);
+    let listener = historical
+        .add_action(OperationId::default(), new.clone())
+        .with_context(tagged_context())
+        .await?;
+    assert!(
+        listener.as_action_info().await?.0.platform_properties["memory_kb"]
+            .parse::<u64>()
+            .unwrap()
+            <= 16 * GIB
+    );
+    simple.do_try_match_for_test().await?;
+    let Some(update_for_worker::Update::StartAction(start)) = rx.recv().await.unwrap().update
+    else {
+        panic!("new action should dispatch");
+    };
+    workers
+        .record_action_resource_usage(
+            &WorkerId("arm".to_string()),
+            &OperationId::from(start.operation_id.as_str()),
+            ActionResourceUsage {
+                peak_memory_kb: 10 * 1024,
+                sampled: true,
+                outcome: ResourceOutcome::Completed.into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(
+        historical
+            .sketch()
+            .lookup(&SketchKey::for_action(&new), now_s())
+            .unwrap()
+            .max_memory_kb(),
+        10 * 1024
+    );
+    assert_eq!(
+        historical
+            .sketch()
+            .lookup(&aggregate, now_s())
+            .unwrap()
+            .killed_peak_memory_kb,
+        0
+    );
+    assert_eq!(
+        historical
+            .sketch()
+            .lookup(&SketchKey::for_action(&old), now_s())
+            .unwrap()
+            .max_memory_kb(),
+        17 * GIB
+    );
+    drop(listener);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn standalone_client_floor_survives_historical_fit() -> Result<(), Error> {
+    let (historical, _, _, _) = fitting_scheduler(10_000, 10_000).await?;
+    let mut action = test_action(5);
+    historical.sketch().observe(
+        SketchKey::for_action(&action),
+        &Observation {
+            peak_memory_kb: 8_000,
+            completed: true,
+            now_s: now_s(),
+            ..Default::default()
+        },
+    );
+    Arc::make_mut(&mut action)
+        .platform_properties
+        .insert("memory_kb".to_string(), "12000".to_string());
+    let Err(error) = historical.add_action(OperationId::default(), action).await else {
+        panic!("explicit client floor must not be trimmed");
+    };
+    assert_eq!(error.code, Code::FailedPrecondition);
+    let (historical, _, _, _) = fitting_scheduler(9_000, 9_000).await?;
+    let action = test_action(6);
+    historical.sketch().observe(
+        SketchKey::for_action(&action),
+        &Observation {
+            peak_memory_kb: 8_000,
+            completed: true,
+            now_s: now_s(),
+            ..Default::default()
+        },
+    );
+    let listener = historical
+        .add_action(OperationId::default(), action)
+        .await?;
+    let fitted = listener.as_action_info().await?.0;
+    assert_eq!(
+        fitted.memory_reservation.as_ref().unwrap().minimum_kb,
+        Some(8_000)
+    );
+    assert_eq!(fitted.platform_properties["memory_kb"], "9000");
+    Ok(())
 }
 
 fn make_scheduler_with_spec(
@@ -228,7 +506,7 @@ async fn a_measured_action_is_sized_from_its_own_samples() -> Result<(), Error> 
     assert_eq!(properties["memory_kb"], "600000");
 
     // Two attempts land through the worker scheduler's path.
-    let key = SketchKey::for_attempt(Some("//pkg:t"), Some("Genrule"), "unused");
+    let key = SketchKey::for_action(&base);
     for peak in [3_000_000u64, 3_500_000] {
         scheduler.sketch().observe(
             key.clone(),
@@ -260,7 +538,8 @@ async fn measured_peak_is_forwarded_as_a_trusted_fit_floor() -> Result<(), Error
     let mut spec = base_spec(hints_file.clone(), None);
     spec.headroom_percent = 20;
     let (mock_scheduler, scheduler) = make_scheduler_with_spec(&spec);
-    let key = SketchKey::for_attempt(Some("//pkg:floor"), Some("Compile"), "unused");
+    let base = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
+    let key = SketchKey::for_action(&base);
     scheduler.sketch().observe(
         key,
         &Observation {
@@ -276,13 +555,26 @@ async fn measured_peak_is_forwarded_as_a_trusted_fit_floor() -> Result<(), Error
     for (client_floor, target, mnemonic, expected_floor) in [
         (None, "//pkg:floor", "Compile", Some(8_000)),
         (Some(1_000), "//pkg:floor", "Compile", Some(8_000)),
-        (Some(9_000), "//pkg:floor", "Compile", Some(8_000)),
-        (Some(9_000), "//pkg:seed", "Seed", None),
-        (Some(9_000), "//pkg:cold", "Cold", None),
+        (Some(9_000), "//pkg:floor", "Compile", Some(9_000)),
+        (Some(9_000), "//pkg:seed", "Seed", Some(9_000)),
+        (Some(9_000), "//pkg:cold", "Cold", Some(9_000)),
     ] {
-        let mut action = (*make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest())).clone();
-        action.memory_reservation = client_floor.map(|minimum| MemoryReservation {
-            minimum_kb: Some(minimum),
+        let digest = if target == "//pkg:floor" {
+            0
+        } else if target == "//pkg:seed" {
+            1
+        } else {
+            2
+        };
+        let mut action =
+            (*make_base_action_info(UNIX_EPOCH, DigestInfo::new([digest; 32], 0))).clone();
+        if let Some(floor) = client_floor {
+            action
+                .platform_properties
+                .insert("memory_kb".to_string(), floor.to_string());
+        }
+        action.memory_reservation = Some(MemoryReservation {
+            minimum_kb: Some(99_000),
             desired_kb: Some(9_000),
             cpu_before_memory_fit: None,
             fitted_revision: None,
@@ -312,10 +604,14 @@ async fn measured_peak_is_forwarded_as_a_trusted_fit_floor() -> Result<(), Error
             )))),
         );
         if let Some(expected) = expected_floor {
-            assert_eq!(passed.platform_properties["memory_kb"], "9600");
+            if target == "//pkg:floor" {
+                assert_eq!(passed.platform_properties["memory_kb"], "9600");
+            }
             let intent = passed.memory_reservation.unwrap();
             assert_eq!(intent.minimum_kb, Some(expected));
-            assert_eq!(intent.desired_kb, Some(9_600));
+            if target == "//pkg:floor" {
+                assert_eq!(intent.desired_kb, Some(9_600));
+            }
         } else {
             assert_eq!(passed.memory_reservation, None);
         }
@@ -389,7 +685,10 @@ async fn repeated_replica_restarts_preserve_disjoint_history() -> Result<(), Err
             let entry = sketch.lookup(&key, now).unwrap();
             assert_eq!(entry.memory_samples(), 1);
             assert_eq!(entry.max_memory_kb(), peak);
-            assert_eq!(sketch.shape(&entry).memory_kb, peak);
+            assert_eq!(
+                sketch.shape(&entry, HistoryScope::Aggregate).memory_kb,
+                peak
+            );
             store
                 .update_oneshot(
                     StoreKey::Str(snapshot_key(replica).into()),

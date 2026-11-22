@@ -52,7 +52,7 @@ use uuid::Uuid;
 
 use crate::known_platform_property_provider::KnownPlatformPropertyProvider;
 use crate::resource_sketch::{
-    Budget, Entry, Family, Policy, ResourceSketch, Shaped, SketchKey, Snapshot, Stats,
+    Budget, Entry, Family, HistoryScope, Policy, ResourceSketch, Shaped, SketchKey, Snapshot, Stats,
 };
 
 /// The prefix the sketch snapshots are written under in `snapshot_store`,
@@ -434,8 +434,9 @@ impl core::fmt::Debug for HistoricalResourceScheduler {
 
 impl HistoricalResourceScheduler {
     /// The sketch a spec describes: CPU uses the configured percentile,
-    /// memory the retained maximum, and disk p95, with the spec's headroom,
-    /// ladder, reserved dimensions, budget and window.
+    /// action memory the retained maximum (aggregate predictions use p95),
+    /// and disk p95, with the spec's headroom, ladder, reserved dimensions,
+    /// budget and window.
     #[must_use]
     pub fn sketch_from_spec(spec: &HistoricalResourceSpec) -> ResourceSketch {
         let reserved = Reserved::from_spec(spec);
@@ -789,17 +790,19 @@ impl HistoricalResourceScheduler {
         )
     }
 
-    /// The key ladder, most specific first: `(target, mnemonic)`, then
-    /// `target` alone, then the command digest, then the mnemonic alone.
-    /// The command digest is what reaches clients that send no
-    /// `RequestMetadata`, and the same command regardless of who runs it.
+    /// Exact immutable action first, followed by predictive aggregate fallbacks.
     fn hint_for_action(
         &self,
         action_info: &ActionInfo,
         target_id: Option<&String>,
         action_mnemonic: Option<&String>,
-    ) -> Option<(Entry, &'static str)> {
+    ) -> Option<(Entry, HistoryScope, &'static str)> {
         let ladder = [
+            (
+                Some(SketchKey::for_action(action_info)),
+                HistoryScope::Action,
+                "action",
+            ),
             (
                 target_id
                     .zip(action_mnemonic)
@@ -807,6 +810,7 @@ impl HistoricalResourceScheduler {
                         target: Arc::from(target.as_str()),
                         mnemonic: Some(Arc::from(mnemonic.as_str())),
                     }),
+                HistoryScope::Aggregate,
                 "target",
             ),
             (
@@ -814,28 +818,31 @@ impl HistoricalResourceScheduler {
                     target: Arc::from(target.as_str()),
                     mnemonic: None,
                 }),
+                HistoryScope::Aggregate,
                 "target",
             ),
             (
                 Some(SketchKey::Command {
                     digest: Arc::from(action_info.command_digest.to_string().as_str()),
                 }),
+                HistoryScope::Aggregate,
                 "command_digest",
             ),
             (
                 action_mnemonic.map(|mnemonic| SketchKey::Mnemonic {
                     mnemonic: Arc::from(mnemonic.as_str()),
                 }),
+                HistoryScope::Aggregate,
                 "mnemonic",
             ),
         ];
         let now = now_s();
-        for (key, source) in ladder {
+        for (key, scope, source) in ladder {
             if let Some(key) = key
                 && let Some(entry) = self.sketch.lookup(&key, now)
             {
                 let source = if entry.seeded { "seed" } else { source };
-                return Some((entry, source));
+                return Some((entry, scope, source));
             }
         }
         None
@@ -1044,6 +1051,11 @@ impl ClientStateManager for HistoricalResourceScheduler {
         client_operation_id: OperationId,
         mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
+        let client_floor = action_info
+            .platform_properties
+            .get(&self.memory_property_name)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| value > 0);
         // Only this scheduler can establish a trusted measured floor.
         if action_info.memory_reservation.is_some() {
             Arc::make_mut(&mut action_info).memory_reservation = None;
@@ -1057,35 +1069,23 @@ impl ClientStateManager for HistoricalResourceScheduler {
                 .map(|numbers| (numbers, "file", None))
         } else {
             self.hint_for_action(&action_info, target_id.as_ref(), action_mnemonic.as_ref())
-                .map(|(entry, source)| {
-                    let measured_floor = (!entry.seeded && self.sketch.policy().reserve_memory)
-                        .then_some(entry.max_memory_kb())
+                .map(|(entry, scope, source)| {
+                    let measured_floor = (scope == HistoryScope::Action
+                        && !entry.seeded
+                        && self.sketch.policy().reserve_memory)
+                        .then_some(entry.max_memory_kb().max(entry.killed_peak_memory_kb))
                         .filter(|&value| value > 0);
-                    (self.sketch.shape(&entry), source, measured_floor)
+                    (self.sketch.shape(&entry, scope), source, measured_floor)
                 })
                 .filter(|(shaped, _, _)| !shaped.is_empty())
                 .map(|(shaped, source, floor)| (Numbers::from(&shaped), source, floor))
         }
         .filter(|(numbers, _, _)| *numbers != Numbers::default());
+        let mut measured_floor = None;
         if let Some((shaped, source, floor)) = hint {
             let action = Arc::make_mut(&mut action_info);
             self.apply_minimums(action, shaped);
-            if let Some(floor) = floor {
-                let desired = action
-                    .platform_properties
-                    .get(&self.memory_property_name)
-                    .and_then(|value| value.parse::<u64>().ok());
-                let cpu = action
-                    .platform_properties
-                    .get(&self.cpu_property_name)
-                    .and_then(|value| value.parse::<u64>().ok());
-                action.memory_reservation = Some(MemoryReservation {
-                    minimum_kb: Some(floor),
-                    desired_kb: desired,
-                    cpu_before_memory_fit: cpu,
-                    fitted_revision: None,
-                });
-            }
+            measured_floor = floor;
             record_hint_resolution(source);
         } else {
             let numbers = self.cold_start_numbers(&action_info, action_mnemonic.as_ref());
@@ -1095,6 +1095,25 @@ impl ClientStateManager for HistoricalResourceScheduler {
                 self.apply_defaults(Arc::make_mut(&mut action_info), numbers);
                 record_hint_resolution("cold_start");
             }
+        }
+        let floor = client_floor.into_iter().chain(measured_floor).max();
+        let desired = action_info
+            .platform_properties
+            .get(&self.memory_property_name)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| value > 0);
+        if floor.is_some() || desired.is_some() {
+            let action = Arc::make_mut(&mut action_info);
+            let cpu = action
+                .platform_properties
+                .get(&self.cpu_property_name)
+                .and_then(|value| value.parse::<u64>().ok());
+            action.memory_reservation = Some(MemoryReservation {
+                minimum_kb: floor,
+                desired_kb: desired,
+                cpu_before_memory_fit: cpu,
+                fitted_revision: None,
+            });
         }
         self.scheduler
             .as_ref()

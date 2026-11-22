@@ -35,17 +35,15 @@ use std::sync::Arc;
 use lru::LruCache;
 use nativelink_config::schedulers::{CpuReservationPercentile, SizeClassSpec};
 use nativelink_error::{Code, Error, make_err};
+use nativelink_util::action_messages::ActionInfo;
 use parking_lot::Mutex;
 
 /// Buckets of the log2 histograms, the rollup's `hist_bucket`: bucket 0 for
 /// values under 1000, bucket `i` for `1000 * 2^(i-1) <= v < 1000 * 2^i`.
 pub const HIST_BUCKETS: usize = 25;
 
-/// Generation 3 excludes killed target attempts from mnemonic history.
-/// Generation 2 snapshots can retain their target and command entries, but
-/// their mnemonic entries cannot be separated from killed attempts.
-pub const SAMPLER_GENERATION: u32 = 3;
-const LEGACY_SAMPLER_GENERATION: u32 = 2;
+/// Generation 4 separates immutable action measurements from aggregate hints.
+pub const SAMPLER_GENERATION: u32 = 4;
 
 /// Fixed charge for an entry and its map/Arc bookkeeping. Key contents are
 /// charged separately. The allowance also covers its largest encoded form.
@@ -93,9 +91,25 @@ pub enum SketchKey {
     /// identity every client has, and the same program with the same
     /// arguments regardless of its inputs, so one key gathers every run.
     Command { digest: Arc<str> },
+    /// Measurements for one immutable Action, independent of cacheability.
+    Action { identity: Arc<str> },
 }
 
 impl SketchKey {
+    /// Construct the canonical identity from the instance, digest function and Action digest.
+    pub fn for_action(action: &ActionInfo) -> Self {
+        let instance = action.instance_name();
+        Self::Action {
+            identity: Arc::from(format!(
+                "{}:{}:{}:{}",
+                instance.len(),
+                instance,
+                action.unique_qualifier.digest_function(),
+                action.digest()
+            )),
+        }
+    }
+
     /// The key for an attempt: its target, or its command digest when the
     /// target is absent. Empty strings count as absent.
     pub fn for_attempt(target: Option<&str>, mnemonic: Option<&str>, command_digest: &str) -> Self {
@@ -116,7 +130,7 @@ impl SketchKey {
         match self {
             Self::Target { .. } => Family::Target,
             Self::Mnemonic { .. } => Family::Mnemonic,
-            Self::Command { .. } => Family::Command,
+            Self::Command { .. } | Self::Action { .. } => Family::Command,
         }
     }
 }
@@ -148,6 +162,13 @@ impl Family {
             Self::Command => 2,
         }
     }
+}
+
+/// Whether a selected entry measures this Action or predicts an aggregate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryScope {
+    Action,
+    Aggregate,
 }
 
 /// A log2 histogram with the rollup's buckets, so a snapshot and a rollup
@@ -353,6 +374,7 @@ fn key_bytes(key: &SketchKey) -> u64 {
         }
         SketchKey::Mnemonic { mnemonic } => mnemonic.len() as u64,
         SketchKey::Command { digest } => digest.len() as u64,
+        SketchKey::Action { identity } => identity.len() as u64,
     }
 }
 
@@ -366,6 +388,21 @@ const fn probation_charge(digest: &str) -> u64 {
 
 impl Inner {
     fn insert(&mut self, key: SketchKey, entry: Entry) -> bool {
+        // Snapshot strings use u32 lengths; never retain a key that would be truncated.
+        let encodable = match &key {
+            SketchKey::Target { target, mnemonic } => {
+                u32::try_from(target.len()).is_ok()
+                    && mnemonic
+                        .as_ref()
+                        .is_none_or(|value| u32::try_from(value.len()).is_ok())
+            }
+            SketchKey::Mnemonic { mnemonic } => u32::try_from(mnemonic.len()).is_ok(),
+            SketchKey::Command { digest } => u32::try_from(digest.len()).is_ok(),
+            SketchKey::Action { identity } => u32::try_from(identity.len()).is_ok(),
+        };
+        if !encodable {
+            return false;
+        }
         let i = key.family().index();
         let map = &mut self.families[i];
         let allowance = map.cap().get() as u64 * (ENTRY_BYTES - HASH_SLOT_BYTES);
@@ -513,15 +550,10 @@ impl ResourceSketch {
         }
     }
 
-    /// Records one attempt. A command key with no entry yet earns one on a
-    /// kill or on its second sighting: a digest that ran once and was not
-    /// killed is an action-cache hit next time, so a first sighting only
-    /// goes on probation. A non-killed attempt naming a target and mnemonic
-    /// teaches both; a killed attempt teaches only its target, so it cannot
-    /// inflate the fallback for unrelated targets. Returns whether a sample
-    /// was recorded.
+    /// Records an Action observation or a non-killed aggregate observation.
+    /// Command aggregate entries remain on probation until their second sighting.
     pub fn observe(&self, key: SketchKey, observation: &Observation) -> bool {
-        if observation.killed && key.family() == Family::Mnemonic {
+        if observation.killed && !matches!(key, SketchKey::Action { .. }) {
             return false;
         }
         let mnemonic = match &key {
@@ -545,13 +577,9 @@ impl ResourceSketch {
         let family = key.family();
         let window_s = self.window_s();
         let mut inner = self.shard(&key).lock();
-        if family == Family::Command
+        if let SketchKey::Command { digest } = &key
             && !inner.families[family.index()].contains(&key)
-            && !observation.killed
         {
-            let SketchKey::Command { digest } = &key else {
-                unreachable!("family Command is a Command key");
-            };
             if inner.probation.pop(digest).is_some() {
                 inner.probation_bytes -= probation_charge(digest);
             } else {
@@ -608,10 +636,9 @@ impl ResourceSketch {
         Some(entry)
     }
 
-    /// The reservation for an entry: `ShapeOne` of the hints producer,
-    /// line for line.
-    pub fn shape(&self, entry: &Entry) -> Shaped {
-        shape(&self.policy, entry)
+    /// Shape an exact Action measurement or an aggregate prediction.
+    pub fn shape(&self, entry: &Entry, scope: HistoryScope) -> Shaped {
+        shape(&self.policy, entry, scope)
     }
 
     pub fn stats(&self) -> Stats {
@@ -738,8 +765,8 @@ impl ResourceSketch {
 
     /// Restore a replica's snapshot at startup. Existing entries are left
     /// alone, making replay idempotent and preserving newer local observations.
-    /// Skip expired keys. Generation 2 restores only target and command
-    /// entries because its mnemonic history may contain killed attempts.
+    /// Skip expired keys. Legacy generations restore only target and command
+    /// aggregates; they cannot establish immutable Action measurements.
     pub fn load(&self, snapshot: Snapshot, now_s: u64) -> Result<usize, Error> {
         if !compatible_generation(snapshot.sampler_generation) {
             return Err(make_err!(
@@ -752,8 +779,8 @@ impl ResourceSketch {
         let cutoff = now_s.saturating_sub(self.window_s());
         let mut loaded = 0usize;
         for (key, entry) in snapshot.entries {
-            if snapshot.sampler_generation == LEGACY_SAMPLER_GENERATION
-                && key.family() == Family::Mnemonic
+            if snapshot.sampler_generation != SAMPLER_GENERATION
+                && !matches!(key, SketchKey::Target { .. } | SketchKey::Command { .. })
             {
                 continue;
             }
@@ -784,7 +811,15 @@ impl ResourceSketch {
                 for (key, entry) in inner.families[f.index()].iter().take(limit) {
                     rows.push(HintRow {
                         key: key.clone(),
-                        shaped: shape(&self.policy, entry),
+                        shaped: shape(
+                            &self.policy,
+                            entry,
+                            if matches!(key, SketchKey::Action { .. }) {
+                                HistoryScope::Action
+                            } else {
+                                HistoryScope::Aggregate
+                            },
+                        ),
                         samples: entry.samples,
                         last_seen_s: entry.last_seen_s,
                         seeded: entry.seeded,
@@ -1035,17 +1070,31 @@ fn smallest_dominating_class(
     None
 }
 
-fn shape(policy: &Policy, entry: &Entry) -> Shaped {
+fn shape(policy: &Policy, entry: &Entry, scope: HistoryScope) -> Shaped {
     let headroom = policy.headroom_percent;
+    let killed_memory = if scope == HistoryScope::Action {
+        entry.killed_peak_memory_kb
+    } else {
+        0
+    };
+    let killed_disk = if scope == HistoryScope::Action {
+        entry.killed_peak_disk_kb
+    } else {
+        0
+    };
     // An unreserved dimension is dropped before deciding whether a hint exists.
     let mut memory_kb = shape_dimension(
         &entry.current.memory,
         &entry.previous.memory,
         entry.max_memory_kb(),
-        entry.killed_peak_memory_kb,
+        killed_memory,
         policy.reserve_memory,
         headroom,
-        Statistic::Maximum,
+        if scope == HistoryScope::Action {
+            Statistic::Maximum
+        } else {
+            Statistic::Percentile(CpuReservationPercentile::P95)
+        },
     );
     let mut cpu = shape_dimension(
         &entry.current.cpu,
@@ -1060,7 +1109,7 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
         &entry.current.disk,
         &entry.previous.disk,
         entry.max_disk_kb(),
-        entry.killed_peak_disk_kb,
+        killed_disk,
         policy.reserve_disk,
         headroom,
         Statistic::Percentile(CpuReservationPercentile::P95),
@@ -1069,11 +1118,17 @@ fn shape(policy: &Policy, entry: &Entry) -> Shaped {
         return Shaped::default();
     }
     let mut class = None;
+    let memory_floor = if scope == HistoryScope::Action {
+        entry
+            .max_memory_kb()
+            .max(with_headroom(killed_memory, headroom))
+    } else {
+        0
+    };
     let found = smallest_dominating_class(&policy.classes, memory_kb, cpu, disk_kb).or_else(|| {
         policy.classes.last().filter(|top| {
-            (!policy.reserve_memory || top.memory_kb >= memory_kb)
-                && (!policy.reserve_disk
-                    || top.disk_kb >= with_headroom(entry.killed_peak_disk_kb, headroom))
+            (!policy.reserve_memory || top.memory_kb >= memory_floor)
+                && (!policy.reserve_disk || top.disk_kb >= with_headroom(killed_disk, headroom))
         })
     });
     if let Some(found) = found {
@@ -1108,10 +1163,10 @@ pub struct Snapshot {
 }
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"NLHS";
-const SNAPSHOT_VERSION: u8 = 3;
+const SNAPSHOT_VERSION: u8 = 4;
 
 const fn compatible_generation(generation: u32) -> bool {
-    generation == SAMPLER_GENERATION || generation == LEGACY_SAMPLER_GENERATION
+    generation == SAMPLER_GENERATION || generation == 3 || generation == 2
 }
 
 impl Snapshot {
@@ -1146,7 +1201,7 @@ impl Snapshot {
             ));
         }
         let version = r.u8()?;
-        if version != SNAPSHOT_VERSION {
+        if version != SNAPSHOT_VERSION && version != 3 {
             return Err(make_err!(
                 Code::InvalidArgument,
                 "resource sketch snapshot: version {version}, this build reads {SNAPSHOT_VERSION}"
@@ -1192,6 +1247,7 @@ impl Snapshot {
                 }
                 1 => SketchKey::Mnemonic { mnemonic: r.str()? },
                 2 => SketchKey::Command { digest: r.str()? },
+                4 => SketchKey::Action { identity: r.str()? },
                 tag => {
                     return Err(make_err!(
                         Code::InvalidArgument,
@@ -1359,6 +1415,10 @@ fn encode_entry(out: &mut Vec<u8>, key: &SketchKey, entry: &Entry) {
         SketchKey::Command { digest } => {
             out.push(2);
             put_str(out, digest);
+        }
+        SketchKey::Action { identity } => {
+            out.push(4);
+            put_str(out, identity);
         }
     }
     out.extend_from_slice(&entry.samples.to_le_bytes());

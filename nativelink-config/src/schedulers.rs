@@ -633,9 +633,24 @@ pub struct ResourceCapacity {
     /// Ledger multiplier per property; absent entries default to one.
     #[serde(default)]
     pub pool_multipliers: BTreeMap<String, NonZeroU64>,
+    /// Immutable worker metadata used to derive physical capacities.
+    /// Missing entries use the registered minimum ledger directly.
+    #[serde(default)]
+    pub physical_sources: BTreeMap<String, ResourceCapacitySource>,
     /// Exact properties; a requested key must be present and equal.
     #[serde(default)]
     pub exact: BTreeMap<String, String>,
+}
+
+/// Immutable worker property and conversion into physical resource units.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct ResourceCapacitySource {
+    /// Registered hardware property, independent of the worker's ledger budget.
+    pub property: String,
+    /// Multiplier converting the hardware property to physical resource units.
+    pub scale: NonZeroU64,
 }
 
 impl ResourceCapacity {
@@ -822,8 +837,9 @@ pub struct HistoricalResourceSpec {
     )]
     pub refresh_interval_s: u64,
 
-    /// Headroom over the selected CPU percentile, maximum measured memory,
-    /// and disk p95, as a share of each measurement: 20 reserves 20% more.
+    /// Headroom over the selected CPU percentile, measured memory peak for
+    /// immutable actions (p95 for predictive fallbacks), and disk p95.
+    /// As a share of each measurement: 20 reserves 20% more.
     /// Default: 20
     #[serde(
         default = "default_historical_resource_headroom_percent",

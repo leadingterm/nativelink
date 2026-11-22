@@ -232,7 +232,7 @@ pub fn hints_json(
     let hints = sketch
         .hints(family, limit.unwrap_or(100_000))
         .into_iter()
-        .map(|row| {
+        .filter_map(|row| {
             let (target_id, action_mnemonic, command_digest) = match row.key {
                 SketchKey::Target { target, mnemonic } => (
                     Some(target.to_string()),
@@ -241,8 +241,9 @@ pub fn hints_json(
                 ),
                 SketchKey::Mnemonic { mnemonic } => (None, Some(mnemonic.to_string()), None),
                 SketchKey::Command { digest } => (None, None, Some(digest.to_string())),
+                SketchKey::Action { .. } => return None,
             };
-            HintListing {
+            Some(HintListing {
                 target_id,
                 action_mnemonic,
                 command_digest,
@@ -253,7 +254,7 @@ pub fn hints_json(
                 samples: row.samples,
                 last_seen_s: row.last_seen_s,
                 source: if row.seeded { "seed" } else { "measured" },
-            }
+            })
         })
         .collect();
     let listing = HintsListing {

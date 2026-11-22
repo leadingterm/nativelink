@@ -438,6 +438,8 @@ impl SimpleScheduler {
             scheduler_id: "peer".to_string(),
             workers: peer_fleet,
             resource_capacities: None,
+            resource_estimates: None,
+            legacy_resource_capacities: None,
         }])
         .await;
     }
@@ -2033,6 +2035,7 @@ mod peer_capacity_feedback_tests {
     use tokio::sync::{Notify, mpsc};
 
     use super::SimpleScheduler;
+    use crate::awaited_action_db::PeerScheduler;
     use crate::default_scheduler_factory::memory_awaited_action_db_factory;
     use crate::worker::Worker;
     use crate::worker_scheduler::WorkerScheduler;
@@ -2291,15 +2294,37 @@ mod peer_capacity_feedback_tests {
                 4,
             ))
             .await?;
-            assert!(
-                peer.worker_scheduler
-                    .fleet_advertisement()
-                    .await
-                    .resource_capacities
-                    .as_ref()
-                    .expect("capacity advertisements are enabled")
-                    .is_empty()
+            let partial = peer.worker_scheduler.fleet_advertisement().await;
+            let rows = partial
+                .resource_capacities
+                .as_ref()
+                .expect("capacity advertisements are enabled");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].minimum,
+                BTreeMap::from([("memory_kb".to_owned(), 1)])
             );
+            assert_eq!(
+                partial.resource_estimates.as_ref().unwrap()[0].minimum["memory_kb"],
+                100
+            );
+            let repeated = peer.worker_scheduler.fleet_advertisement().await;
+            assert!(Arc::ptr_eq(
+                rows,
+                repeated.resource_capacities.as_ref().unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                partial.resource_estimates.as_ref().unwrap(),
+                repeated.resource_estimates.as_ref().unwrap(),
+            ));
+            assert!(Arc::ptr_eq(
+                partial.legacy_resource_capacities.as_ref().unwrap(),
+                repeated.legacy_resource_capacities.as_ref().unwrap(),
+            ));
+            local.set_peer_schedulers_for_test(vec![partial]).await;
+            assert_eq!(capacity.borrow().capacities[0].minimum["memory_kb"], 1);
+            assert_eq!(capacity.borrow().capacities[0].minimum["cpu_count"], 100);
+            assert_eq!(capacity.borrow().capacities[0].minimum["disk_kb"], 100);
             peer.remove_worker(&incomplete_id).await?;
             local
                 .add_worker(worker(local_id.clone(), local_value, tx.clone()))
@@ -2352,6 +2377,351 @@ mod peer_capacity_feedback_tests {
                 assert_eq!(capacity.borrow().capacities[0].minimum[property], 100);
             }
         }
+        Ok(())
+    }
+
+    fn hardware_scheduler(multiplier: u64) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
+        let spec = SimpleSpec {
+            supported_platform_properties: Some(HashMap::from([
+                ("memory_kb".to_owned(), PropertyType::Minimum),
+                ("disk_kb".to_owned(), PropertyType::Minimum),
+                ("cpu_millicores".to_owned(), PropertyType::Minimum),
+                ("cpu_count".to_owned(), PropertyType::Ignore),
+                ("fleet".to_owned(), PropertyType::Exact),
+            ])),
+            resource_escalation: Some(serde_json::from_value(serde_json::json!({
+                "memory": { "property": "memory_kb", "percent": 200, "max_steps": 2 },
+                "disk": { "property": "disk_kb", "percent": 200, "max_steps": 2 },
+                "headroom_percent": 20,
+                "cpu_property": "cpu_millicores",
+                "capacities": [{
+                    "minimum": { "memory_kb": 63_000, "cpu_millicores": 32_000 * multiplier, "disk_kb": 100_000 },
+                    "exact": { "fleet": "compile" },
+                    "pool_multipliers": { "cpu_millicores": multiplier },
+                    "physical_sources": { "cpu_millicores": { "property": "cpu_count", "scale": 1000 } },
+                    "action_ceilings": { "cpu_millicores": 16_000 }
+                }]
+            })).expect("hardware policy")),
+            ..SimpleSpec::default()
+        };
+        let notify = Arc::new(Notify::new());
+        SimpleScheduler::new_with_callback(
+            &spec,
+            memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
+            || async {},
+            notify,
+            MockInstantWrapped::default,
+            None,
+        )
+    }
+
+    #[nativelink_test]
+    async fn legacy_projection_preserves_memory_without_echoing_prelaunch_context()
+    -> Result<(), Error> {
+        const NOW_TIME: u64 = 10_000;
+        MockClock::set_time(Duration::from_secs(NOW_TIME));
+        let (a, a_worker) = hardware_scheduler(1);
+        let (b, b_worker) = hardware_scheduler(1);
+        let (receiver, receiver_worker) = hardware_scheduler(3);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut hardware = Worker::new(
+            WorkerId("actual-hardware".to_owned()),
+            PlatformProperties::new(HashMap::from([
+                (
+                    "fleet".to_owned(),
+                    PlatformPropertyValue::Exact("compile".to_owned()),
+                ),
+                (
+                    "cpu_count".to_owned(),
+                    PlatformPropertyValue::Ignore("32".to_owned()),
+                ),
+                // The sender's oversubscribed ledger is not its physical CPU.
+                (
+                    "cpu_millicores".to_owned(),
+                    PlatformPropertyValue::Minimum(64_000),
+                ),
+                (
+                    "memory_kb".to_owned(),
+                    PlatformPropertyValue::Minimum(60_000),
+                ),
+                ("disk_kb".to_owned(), PlatformPropertyValue::Minimum(80_000)),
+            ])),
+            tx,
+            NOW_TIME,
+            4,
+        );
+        hardware.set_action_ceilings(&HashMap::from([
+            ("cpu_millicores".to_owned(), 16_000),
+            ("memory_kb".to_owned(), 4_000),
+        ]));
+        a.add_worker(hardware).await?;
+        let original = a.worker_scheduler.fleet_advertisement().await;
+        assert_eq!(
+            original.workers[0].properties["cpu_count"],
+            PlatformPropertyValue::Ignore("32".to_owned())
+        );
+        assert_eq!(
+            original.workers[0].properties["cpu_millicores"],
+            PlatformPropertyValue::Minimum(16_000)
+        );
+        assert_eq!(
+            original.workers[0].properties["memory_kb"],
+            PlatformPropertyValue::Minimum(4_000)
+        );
+        let actual = original.resource_capacities.as_ref().unwrap();
+        assert_eq!(actual[0].minimum["cpu_millicores"], 32_000);
+        assert_eq!(actual[0].effective_capacity("cpu_millicores"), Some(16_000));
+        assert_eq!(actual[0].minimum["memory_kb"], 60_000);
+        assert_eq!(actual[0].minimum["disk_kb"], 80_000);
+        // Static eligibility uses the capped shapes above; V2 capacity facts
+        // must still expose the full physical pool, not those action limits.
+        receiver
+            .set_peer_schedulers_for_test(vec![original.clone()])
+            .await;
+        let receiver_capacity = receiver_worker.resource_capacity_updates().unwrap();
+        assert_eq!(
+            receiver_capacity.borrow().capacities[0].minimum["cpu_millicores"],
+            96_000
+        );
+        assert_eq!(
+            receiver_capacity.borrow().capacities[0].physical_capacity("cpu_millicores"),
+            Some(32_000)
+        );
+        assert_eq!(
+            receiver_capacity.borrow().capacities[0].minimum["memory_kb"],
+            60_000
+        );
+        assert_eq!(
+            receiver_capacity.borrow().capacities[0].minimum["disk_kb"],
+            80_000
+        );
+
+        let mut old_estimate = original.resource_estimates.as_ref().unwrap()[0].clone();
+        old_estimate
+            .minimum
+            .insert("cpu_millicores".to_owned(), 96_000);
+        old_estimate.minimum.insert("disk_kb".to_owned(), 120_000);
+        old_estimate.minimum.insert("memory_kb".to_owned(), 1);
+        old_estimate.pool_multipliers.clear();
+        old_estimate.physical_sources.clear();
+        let old = PeerScheduler {
+            scheduler_id: "old".to_owned(),
+            workers: Vec::new(),
+            resource_capacities: None,
+            resource_estimates: Some(Arc::from([old_estimate.clone()])),
+            legacy_resource_capacities: None,
+        };
+        b.set_peer_schedulers_for_test(vec![old.clone()]).await;
+        let b_capacity = b_worker.resource_capacity_updates().unwrap();
+        // Legacy policy rows, including their memory minimum, are not actuals.
+        assert_eq!(
+            b_capacity.borrow().capacities[0].minimum["memory_kb"],
+            63_000
+        );
+        a.set_peer_schedulers_for_test(vec![old]).await;
+        let a_old = a.worker_scheduler.fleet_advertisement().await;
+        let b_old = b.worker_scheduler.fleet_advertisement().await;
+        let projected = &a_old.legacy_resource_capacities.as_ref().unwrap()[0];
+        assert_eq!(projected.minimum["cpu_millicores"], 96_000);
+        assert_eq!(projected.minimum["disk_kb"], 120_000);
+        assert_eq!(projected.minimum["memory_kb"], 60_000);
+        assert_eq!(projected.action_ceilings["cpu_millicores"], 16_000);
+        assert_eq!(projected.action_ceilings["disk_kb"], 80_000);
+        assert_eq!(
+            a_old.resource_capacities.as_ref().unwrap()[0].minimum["cpu_millicores"],
+            32_000
+        );
+        assert_eq!(
+            a_old.resource_estimates.as_ref().unwrap()[0].minimum["cpu_millicores"],
+            32_000
+        );
+        assert!(Arc::ptr_eq(
+            actual,
+            a_old.resource_capacities.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            original.resource_estimates.as_ref().unwrap(),
+            a_old.resource_estimates.as_ref().unwrap()
+        ));
+        // Reproduce the old whole-row eligibility filter: CPU/disk still match,
+        // so the old controller can lower memory despite its larger baseline.
+        assert!(
+            old_estimate
+                .minimum
+                .iter()
+                .filter(|(name, _)| name.as_str() != "memory_kb")
+                .all(|(name, minimum)| projected
+                    .minimum
+                    .get(name)
+                    .is_some_and(|actual| actual >= minimum))
+        );
+        assert_eq!(projected.minimum["memory_kb"].min(63_000), 60_000);
+
+        // Both new controllers previously projected the old 96k context. Their
+        // original 32k estimates, not those projections, govern subsequent v1.
+        a.set_peer_schedulers_for_test(vec![b_old]).await;
+        b.set_peer_schedulers_for_test(vec![a_old]).await;
+        let a_capacity = a_worker.resource_capacity_updates().unwrap();
+        for _ in 0..3 {
+            let a_local = a.worker_scheduler.fleet_advertisement().await;
+            let b_local = b.worker_scheduler.fleet_advertisement().await;
+            for local in [&a_local, &b_local] {
+                let legacy = &local.legacy_resource_capacities.as_ref().unwrap()[0];
+                assert_eq!(legacy.minimum["cpu_millicores"], 32_000);
+                assert_eq!(legacy.minimum["disk_kb"], 100_000);
+                assert_eq!(
+                    local.resource_estimates.as_ref().unwrap()[0].minimum["memory_kb"],
+                    63_000
+                );
+            }
+            assert!(b_local.resource_capacities.as_ref().unwrap().is_empty());
+            a.set_peer_schedulers_for_test(vec![b_local]).await;
+            b.set_peer_schedulers_for_test(vec![a_local]).await;
+            for capacity in [&a_capacity, &b_capacity] {
+                assert_eq!(
+                    capacity.borrow().capacities[0].physical_capacity("cpu_millicores"),
+                    Some(32_000)
+                );
+                assert_eq!(capacity.borrow().capacities[0].minimum["memory_kb"], 60_000);
+                assert_eq!(capacity.borrow().capacities[0].minimum["disk_kb"], 80_000);
+            }
+        }
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn legacy_worker_hardware_is_actual_even_without_versioned_rows() -> Result<(), Error> {
+        MockClock::set_time(Duration::from_secs(10_000));
+        let (scheduler, worker) = hardware_scheduler(3);
+        let original = scheduler.worker_scheduler.fleet_advertisement().await;
+        let peer = PeerScheduler {
+            scheduler_id: "legacy".to_owned(),
+            workers: vec![PlatformProperties::new(HashMap::from([
+                (
+                    "fleet".to_owned(),
+                    PlatformPropertyValue::Exact("compile".to_owned()),
+                ),
+                (
+                    "cpu_count".to_owned(),
+                    PlatformPropertyValue::Ignore("32".to_owned()),
+                ),
+                (
+                    "cpu_millicores".to_owned(),
+                    PlatformPropertyValue::Minimum(64_000),
+                ),
+                (
+                    "memory_kb".to_owned(),
+                    PlatformPropertyValue::Minimum(60_000),
+                ),
+            ]))],
+            resource_capacities: None,
+            resource_estimates: original.resource_estimates,
+            legacy_resource_capacities: None,
+        };
+        scheduler
+            .set_peer_schedulers_for_test(vec![peer.clone()])
+            .await;
+        let capacities = worker.resource_capacity_updates().unwrap();
+        {
+            let snapshot = capacities.borrow();
+            assert_eq!(
+                snapshot.capacities[0].physical_capacity("cpu_millicores"),
+                Some(32_000)
+            );
+            assert_eq!(snapshot.capacities[0].minimum["memory_kb"], 60_000);
+            assert_eq!(snapshot.capacities[0].minimum["disk_kb"], 100_000);
+        }
+        let outgoing = scheduler.worker_scheduler.fleet_advertisement().await;
+        assert!(outgoing.resource_capacities.as_ref().unwrap().is_empty());
+        assert_eq!(
+            outgoing.legacy_resource_capacities.as_ref().unwrap()[0].minimum["memory_kb"],
+            63_000
+        );
+        // V2's explicit empty observed view is authoritative, even when the
+        // advertisement also retains worker metadata or prelaunch context.
+        let mut versioned = peer;
+        versioned.resource_capacities = Some(Arc::from([]));
+        scheduler
+            .set_peer_schedulers_for_test(vec![versioned])
+            .await;
+        let snapshot = capacities.borrow();
+        assert_eq!(
+            snapshot.capacities[0].physical_capacity("cpu_millicores"),
+            Some(32_000)
+        );
+        assert_eq!(snapshot.capacities[0].minimum["memory_kb"], 63_000);
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn partial_memory_facts_cross_peers_without_cpu_or_disk_estimate_leakage()
+    -> Result<(), Error> {
+        const NOW_TIME: u64 = 10_000;
+        MockClock::set_time(Duration::from_secs(NOW_TIME));
+        let (source, _) = hardware_scheduler(1);
+        let (receiver, receiver_worker) = hardware_scheduler(3);
+        let (tx, _rx) = mpsc::channel(64);
+        let id = WorkerId("memory-only".to_owned());
+        source
+            .add_worker(Worker::new(
+                id.clone(),
+                PlatformProperties::new(HashMap::from([
+                    (
+                        "fleet".to_owned(),
+                        PlatformPropertyValue::Exact("compile".to_owned()),
+                    ),
+                    (
+                        "memory_kb".to_owned(),
+                        PlatformPropertyValue::Minimum(60_000),
+                    ),
+                    // Without cpu_count metadata the ledger is not a CPU fact.
+                    (
+                        "cpu_millicores".to_owned(),
+                        PlatformPropertyValue::Minimum(64_000),
+                    ),
+                ])),
+                tx,
+                NOW_TIME,
+                4,
+            ))
+            .await?;
+        let partial = source.worker_scheduler.fleet_advertisement().await;
+        let rows = partial.resource_capacities.as_ref().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].minimum,
+            BTreeMap::from([("memory_kb".to_owned(), 60_000)])
+        );
+        assert_eq!(
+            partial.resource_estimates.as_ref().unwrap()[0].minimum["memory_kb"],
+            63_000
+        );
+        receiver.set_peer_schedulers_for_test(vec![partial]).await;
+        let capacities = receiver_worker.resource_capacity_updates().unwrap();
+        {
+            let snapshot = capacities.borrow();
+            assert_eq!(snapshot.capacities[0].minimum["memory_kb"], 60_000);
+            assert_eq!(snapshot.capacities[0].minimum["cpu_millicores"], 96_000);
+            assert_eq!(snapshot.capacities[0].minimum["disk_kb"], 100_000);
+        }
+        let outgoing = receiver.worker_scheduler.fleet_advertisement().await;
+        assert!(outgoing.resource_capacities.as_ref().unwrap().is_empty());
+        assert_eq!(
+            outgoing.resource_estimates.as_ref().unwrap()[0].minimum["memory_kb"],
+            63_000
+        );
+        assert_eq!(
+            outgoing.legacy_resource_capacities.as_ref().unwrap()[0].minimum["memory_kb"],
+            63_000
+        );
+        source.remove_worker(&id).await?;
+        receiver
+            .set_peer_schedulers_for_test(vec![source.worker_scheduler.fleet_advertisement().await])
+            .await;
+        assert_eq!(
+            capacities.borrow().capacities[0].minimum["memory_kb"],
+            63_000
+        );
         Ok(())
     }
 }

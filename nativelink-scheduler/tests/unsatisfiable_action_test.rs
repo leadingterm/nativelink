@@ -1184,7 +1184,7 @@ async fn learned_large_class_waits_for_pool_when_timeout_allows_cold_start() -> 
         );
         Arc::make_mut(&mut input).platform_properties = cpu_action_properties();
         sketch.observe(
-            SketchKey::for_attempt(None, None, &input.command_digest.to_string()),
+            SketchKey::for_action(&input),
             &Observation {
                 peak_memory_kb: 32_000_000,
                 killed: true,
