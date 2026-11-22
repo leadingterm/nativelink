@@ -1012,7 +1012,7 @@ build at the main scheduler directly though.
 | `learn_from_workers` | boolean | — | `false` | Opt in to learning reservations from worker measurements. Defaults to false: existing configurations keep using `hints_file` and its refresh interval. In learning mode the file is only a startup seed. |
 | `hints_file` | string | — | `""` | JSON hints file. With learning disabled, reload it at `refresh_interval_s` and preserve the last usable hints if a reload fails. In learning mode, seed the scheduler's sketch from it, read once at start when no snapshot is loaded. The scheduler learns what every kind of action uses from the usage its workers report, so a file is only worth having for a fresh fleet that inherits another's history: the admin API's `/scheduler/{instance}/hints` is this shape. A seeded hint stands until the first real sample of its key. |
 | `refresh_interval_s` | integer (uint64) | — | 30 seconds | Reload interval for `hints_file` when `learn_from_workers` is false. Zero reads once. Refresh happens in the background, outside Execute. Ignored only when learning is explicitly enabled. |
-| `headroom_percent` | integer (uint64) | — | 20 | Headroom over the selected CPU percentile, maximum measured memory, and disk p95, as a share of each measurement: 20 reserves 20% more. |
+| `headroom_percent` | integer (uint64) | — | 20 | Headroom over the selected CPU percentile, measured memory peak for immutable actions (p95 for predictive fallbacks), and disk p95. As a share of each measurement: 20 reserves 20% more. |
 | `cpu_reservation_percentile` | [CpuReservationPercentile](#cpureservationpercentile) | — | 95 | Percentile of attempt-average CPU used for learned reservations. Must be an integer from 1 through 100. |
 | `window_days` | integer (uint64) | — | 7 | A key not measured for this many days is forgotten. Within the window, two half-window histograms retain each sample for between half and one full window. A kill floor is cleared by a subsequent completed attempt or expires this many days after the kill. Measured memory peaks continue to shape reservations while retained. |
 | `memory_budget_bytes` | integer (uint64) | — | 512 MiB, holding roughly | Accounting budget for the learned sketch, including keys, map and probation storage and reserved snapshot working memory. One quarter funds resident entries; the remainder allows encoding/loading snapshots. Long keys reduce the number of retained entries. This is conservative allocation accounting, not a process RSS limit (allocator overhead and other scheduler data are separate). 55,000 target keys plus mnemonic and command families with short keys. An explicitly configured budget is unchanged. Size the process memory limit above this budget plus the scheduler's other allocations. |
@@ -1691,6 +1691,7 @@ Platform properties declared by a configured worker type.
 | `minimum` | map of string to integer (uint64) | — | — | Aggregate ledger capacities, including the resource and CPU properties. |
 | `action_ceilings` | map of string to integer (uint64) | — | — | Explicit per-action ceilings; absent entries use the effective capacity. |
 | `pool_multipliers` | map of string to integer (uint64) | — | — | Ledger multiplier per property; absent entries default to one. |
+| `physical_sources` | map of string to [ResourceCapacitySource](#resourcecapacitysource) | — | — | Immutable worker metadata used to derive physical capacities. Missing entries use the registered minimum ledger directly. |
 | `exact` | map of string to string | — | — | Exact properties; a requested key must be present and equal. |
 
 ## ExperimentalRedisSchedulerBackend
@@ -1777,6 +1778,15 @@ specified.
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `scheduler` | string | Yes | — | Scheduler used to configure the capabilities of remote execution. |
+
+## ResourceCapacitySource
+
+Immutable worker property and conversion into physical resource units.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `property` | string | Yes | — | Registered hardware property, independent of the worker's ledger budget. |
+| `scale` | integer (uint64) | Yes | — | Multiplier converting the hardware property to physical resource units. |
 
 ## HttpCompressionAlgorithm
 
