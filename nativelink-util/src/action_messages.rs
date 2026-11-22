@@ -295,7 +295,7 @@ impl Display for ActionUniqueKey {
 /// Original reservation intent and the observed capacity revision used to fit it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MemoryReservation {
-    /// Explicit minimum memory in KiB, if supplied.
+    /// Explicit client minimum or trusted measured memory floor in KiB.
     pub minimum_kb: Option<u64>,
     /// Desired memory in KiB before fitting, if supplied.
     pub desired_kb: Option<u64>,

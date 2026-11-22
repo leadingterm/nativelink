@@ -32,7 +32,7 @@ use nativelink_error::{Code, Error, ResultExt, make_input_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, RootMetricsComponent,
 };
-use nativelink_util::action_messages::{ActionInfo, OperationId};
+use nativelink_util::action_messages::{ActionInfo, MemoryReservation, OperationId};
 use nativelink_util::metrics::{
     record_hint_resolution, record_hints_family, record_hints_snapshot,
     record_hints_snapshot_failure,
@@ -433,8 +433,9 @@ impl core::fmt::Debug for HistoricalResourceScheduler {
 }
 
 impl HistoricalResourceScheduler {
-    /// The sketch a spec describes: its headroom, ladder and reserved
-    /// dimensions as the shaping policy, its budget and window.
+    /// The sketch a spec describes: CPU uses the configured percentile,
+    /// memory the retained maximum, and disk p95, with the spec's headroom,
+    /// ladder, reserved dimensions, budget and window.
     #[must_use]
     pub fn sketch_from_spec(spec: &HistoricalResourceSpec) -> ResourceSketch {
         let reserved = Reserved::from_spec(spec);
@@ -1043,22 +1044,48 @@ impl ClientStateManager for HistoricalResourceScheduler {
         client_operation_id: OperationId,
         mut action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
+        // Only this scheduler can establish a trusted measured floor.
+        if action_info.memory_reservation.is_some() {
+            Arc::make_mut(&mut action_info).memory_reservation = None;
+        }
         let (target_id, action_mnemonic) = Self::current_metadata();
         // An entry that shapes to all zero (nothing measured on a dimension
         // the fleet reserves) reserves nothing, so it is no hint: the
         // cold-start policy applies and the metric says so.
         let hint = if let Some(file) = &self.file_hints {
             file.lookup(&action_info, target_id.as_ref(), action_mnemonic.as_ref())
-                .map(|numbers| (numbers, "file"))
+                .map(|numbers| (numbers, "file", None))
         } else {
             self.hint_for_action(&action_info, target_id.as_ref(), action_mnemonic.as_ref())
-                .map(|(entry, source)| (self.sketch.shape(&entry), source))
-                .filter(|(shaped, _)| !shaped.is_empty())
-                .map(|(shaped, source)| (Numbers::from(&shaped), source))
+                .map(|(entry, source)| {
+                    let measured_floor = (!entry.seeded && self.sketch.policy().reserve_memory)
+                        .then_some(entry.max_memory_kb())
+                        .filter(|&value| value > 0);
+                    (self.sketch.shape(&entry), source, measured_floor)
+                })
+                .filter(|(shaped, _, _)| !shaped.is_empty())
+                .map(|(shaped, source, floor)| (Numbers::from(&shaped), source, floor))
         }
-        .filter(|(numbers, _)| *numbers != Numbers::default());
-        if let Some((shaped, source)) = hint {
-            self.apply_minimums(Arc::make_mut(&mut action_info), shaped);
+        .filter(|(numbers, _, _)| *numbers != Numbers::default());
+        if let Some((shaped, source, floor)) = hint {
+            let action = Arc::make_mut(&mut action_info);
+            self.apply_minimums(action, shaped);
+            if let Some(floor) = floor {
+                let desired = action
+                    .platform_properties
+                    .get(&self.memory_property_name)
+                    .and_then(|value| value.parse::<u64>().ok());
+                let cpu = action
+                    .platform_properties
+                    .get(&self.cpu_property_name)
+                    .and_then(|value| value.parse::<u64>().ok());
+                action.memory_reservation = Some(MemoryReservation {
+                    minimum_kb: Some(floor),
+                    desired_kb: desired,
+                    cpu_before_memory_fit: cpu,
+                    fitted_revision: None,
+                });
+            }
             record_hint_resolution(source);
         } else {
             let numbers = self.cold_start_numbers(&action_info, action_mnemonic.as_ref());

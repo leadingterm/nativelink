@@ -288,7 +288,8 @@ use crate::match_outcome::{
     MatchOutcome, PropertyShape, UnsatisfiableReason, explain_unsatisfiable,
 };
 use crate::memory_capacity::{
-    CapacityProperty, eligible_capacity, fit_memory, observe_capacities, peer_memory, worker_memory,
+    CapacityProperty, eligible_capacity, fit_memory, observe_capacities, peer_capacity,
+    worker_capacity,
 };
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::resource_sketch::{Observation, ResourceSketch, SketchKey};
@@ -801,56 +802,48 @@ impl ApiWorkerSchedulerImpl {
             .collect()
     }
 
-    /// Rebuild local facts from immutable worker totals, never free/busy memory.
+    /// Rebuild local facts from immutable worker totals, never free/busy resources.
     fn refresh_local_resource_capacities(&mut self) {
         let (Some(policy), Some(current)) =
             (&self.resource_escalation, &self.local_resource_capacities)
         else {
             return;
         };
-        if let Some(rows) = observe_capacities(
-            &policy.capacities,
-            current,
-            &policy.memory.property,
-            |row| {
-                self.workers
-                    .iter()
-                    .filter_map(|(_, worker)| {
-                        worker_memory(
-                            row,
-                            &policy.memory.property,
-                            &worker.total_platform_properties,
-                        )
-                    })
-                    .min()
-            },
-        ) {
+        if let Some(rows) = observe_capacities(&policy.capacities, current, |row, property| {
+            self.workers
+                .iter()
+                .filter_map(|(_, worker)| {
+                    worker_capacity(row, property, &worker.total_platform_properties)
+                })
+                .min()
+        }) {
             self.local_resource_capacities = Some(rows);
-            self.publish_resource_capacities();
         }
+        self.publish_resource_capacities();
     }
 
     /// Publish global current facts without making them local knowledge.
     fn publish_resource_capacities(&self) -> bool {
-        let (Some(policy), Some(local), Some(sender)) = (
-            &self.resource_escalation,
-            &self.local_resource_capacities,
-            &self.resource_capacity_tx,
-        ) else {
+        let (Some(policy), Some(sender)) = (&self.resource_escalation, &self.resource_capacity_tx)
+        else {
             return false;
         };
         let current = sender.borrow();
-        let updated = if self.peer_resource_capacities.is_empty() {
-            (current.capacities != *local).then(|| local.clone())
-        } else {
-            observe_capacities(local, &current.capacities, &policy.memory.property, |row| {
-                self.peer_resource_capacities
+        let updated =
+            observe_capacities(&policy.capacities, &current.capacities, |row, property| {
+                self.workers
                     .iter()
-                    .flat_map(|rows| rows.iter())
-                    .filter_map(|peer| peer_memory(row, &policy.memory.property, peer))
+                    .filter_map(|(_, worker)| {
+                        worker_capacity(row, property, &worker.total_platform_properties)
+                    })
+                    .chain(
+                        self.peer_resource_capacities
+                            .iter()
+                            .flat_map(|rows| rows.iter())
+                            .filter_map(|peer| peer_capacity(row, property, peer)),
+                    )
                     .min()
-            })
-        };
+            });
         drop(current);
         if let Some(capacities) = updated {
             sender.send_replace(Arc::new(ResourceCapacitySnapshot {
@@ -2830,7 +2823,19 @@ impl ApiWorkerScheduler {
         PeerScheduler {
             scheduler_id: inner.scheduler_id.clone(),
             workers: inner.fleet_shapes(),
-            resource_capacities: inner.local_resource_capacities.clone(),
+            resource_capacities: inner.local_resource_capacities.as_ref().map(|rows| {
+                rows.iter()
+                    .filter(|row| {
+                        row.minimum.keys().all(|property| {
+                            inner.workers.iter().any(|(_, worker)| {
+                                worker_capacity(row, property, &worker.total_platform_properties)
+                                    .is_some()
+                            })
+                        })
+                    })
+                    .cloned()
+                    .collect::<Arc<[_]>>()
+            }),
         }
     }
 
@@ -3042,9 +3047,17 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 ),
         ) {
             let metadata = action_info.origin_metadata.bazel_metadata.as_ref();
+            let target = metadata.map(|m| m.target_id.as_str());
+            let killed = !matches!(
+                outcome,
+                ResourceOutcome::Unknown | ResourceOutcome::Completed
+            );
+            let mnemonic = metadata
+                .map(|m| m.action_mnemonic.as_str())
+                .filter(|name| !name.is_empty());
             let key = SketchKey::for_attempt(
-                metadata.map(|m| m.target_id.as_str()),
-                metadata.map(|m| m.action_mnemonic.as_str()),
+                target,
+                mnemonic,
                 &action_info.inner.command_digest.to_string(),
             );
             let reservation = |property: Option<&str>, echoed: Option<u64>| {
@@ -3087,15 +3100,24 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 peak_disk_kb: resource_usage.peak_disk_kb,
                 killed_peak_memory_kb: memory_floor,
                 killed_peak_disk_kb: disk_floor,
-                killed: !matches!(
-                    outcome,
-                    ResourceOutcome::Unknown | ResourceOutcome::Completed
-                ),
+                killed,
+                completed: outcome == ResourceOutcome::Completed,
                 now_s: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
             };
             sketch.observe(key, &observation);
+            if !killed
+                && target.is_none_or(str::is_empty)
+                && let Some(mnemonic) = mnemonic
+            {
+                sketch.observe(
+                    SketchKey::Mnemonic {
+                        mnemonic: Arc::from(mnemonic),
+                    },
+                    &observation,
+                );
+            }
         }
 
         let Some(origin_event_tx) = self.maybe_origin_event_tx.as_ref() else {

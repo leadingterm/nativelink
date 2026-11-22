@@ -2069,6 +2069,7 @@ mod peer_capacity_feedback_tests {
                     ]),
                     exact: BTreeMap::from([("fleet".to_string(), "compile".to_string())]),
                     action_ceilings: BTreeMap::from([("memory_kb".to_string(), ACTION_CEILING_KB)]),
+                    ..Default::default()
                 }],
             }),
             ..SimpleSpec::default()
@@ -2127,16 +2128,16 @@ mod peer_capacity_feedback_tests {
             OBSERVED_KB
         );
 
-        // B knows A's smaller pool globally, but has no local observation:
-        // its outgoing row must remain the configured physical estimate.
+        // B knows A's smaller pool globally but has no local facts to advertise.
         let b_local = b.worker_scheduler.fleet_advertisement().await;
         assert!(b_local.workers.is_empty());
-        let b_rows = b_local
-            .resource_capacities
-            .as_ref()
-            .expect("B advertises its configured estimate");
-        assert_eq!(b_rows[0].minimum["memory_kb"], ESTIMATE_KB);
-        assert_eq!(b_rows[0].action_ceilings["memory_kb"], ACTION_CEILING_KB);
+        assert!(
+            b_local
+                .resource_capacities
+                .as_ref()
+                .expect("B supports capacity advertisements")
+                .is_empty()
+        );
         a.set_peer_schedulers_for_test(vec![b_local]).await;
         assert_eq!(
             a_capacity.borrow().capacities[0].minimum["memory_kb"],
@@ -2178,12 +2179,13 @@ mod peer_capacity_feedback_tests {
             let b_local = b.worker_scheduler.fleet_advertisement().await;
             assert!(a_local.workers.is_empty());
             for local in [&a_local, &b_local] {
-                let rows = local
-                    .resource_capacities
-                    .as_ref()
-                    .expect("local estimate remains advertised");
-                assert_eq!(rows[0].minimum["memory_kb"], ESTIMATE_KB);
-                assert_eq!(rows[0].action_ceilings["memory_kb"], ACTION_CEILING_KB);
+                assert!(
+                    local
+                        .resource_capacities
+                        .as_ref()
+                        .expect("local capacity advertisements are enabled")
+                        .is_empty()
+                );
             }
             a.set_peer_schedulers_for_test(vec![b_local]).await;
             b.set_peer_schedulers_for_test(vec![a_local]).await;
@@ -2206,6 +2208,150 @@ mod peer_capacity_feedback_tests {
         assert!(Arc::ptr_eq(&b_stable, &b_capacity.borrow()));
         assert_eq!(a_stable.revision, a_capacity.borrow().revision);
         assert_eq!(b_stable.revision, b_capacity.borrow().revision);
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn local_and_peer_actual_capacities_replace_estimates() -> Result<(), Error> {
+        const NOW_TIME: u64 = 10_000;
+        MockClock::set_time(Duration::from_secs(NOW_TIME));
+        let properties = ["memory_kb", "disk_kb", "cpu_count"];
+        let spec = SimpleSpec {
+            supported_platform_properties: Some(
+                properties
+                    .iter()
+                    .map(|name| ((*name).to_string(), PropertyType::Minimum))
+                    .collect(),
+            ),
+            resource_escalation: Some(ResourceEscalationSpec {
+                memory: EscalationDimensionSpec {
+                    property: "memory_kb".to_string(),
+                    percent: 250,
+                    max_steps: 3,
+                },
+                disk: None,
+                headroom_percent: 25,
+                cpu_property: "cpu_count".to_string(),
+                capacity_ignored_properties: Vec::new(),
+                capacities: vec![ResourceCapacity {
+                    minimum: properties
+                        .iter()
+                        .map(|name| ((*name).to_string(), 100))
+                        .collect(),
+                    ..Default::default()
+                }],
+            }),
+            ..SimpleSpec::default()
+        };
+        let make_scheduler = || {
+            let notify = Arc::new(Notify::new());
+            SimpleScheduler::new_with_callback(
+                &spec,
+                memory_awaited_action_db_factory(0, &notify, MockInstantWrapped::default),
+                || async {},
+                notify,
+                MockInstantWrapped::default,
+                None,
+            )
+        };
+        for local_value in [80, 120] {
+            let (local, local_worker) = make_scheduler();
+            let (peer, _) = make_scheduler();
+            let capacity = local_worker
+                .resource_capacity_updates()
+                .expect("capacity watch is enabled");
+            let (tx, _rx) = mpsc::channel(64);
+            let local_id = WorkerId(format!("local-{local_value}"));
+            let peer_id = WorkerId(format!("peer-{local_value}"));
+            let worker = |id, value, tx| {
+                Worker::new(
+                    id,
+                    PlatformProperties::new(
+                        properties
+                            .iter()
+                            .map(|name| {
+                                ((*name).to_string(), PlatformPropertyValue::Minimum(value))
+                            })
+                            .collect(),
+                    ),
+                    tx,
+                    NOW_TIME,
+                    4,
+                )
+            };
+            let incomplete_id = WorkerId(format!("incomplete-{local_value}"));
+            peer.add_worker(Worker::new(
+                incomplete_id.clone(),
+                PlatformProperties::new(HashMap::from([(
+                    "memory_kb".to_string(),
+                    PlatformPropertyValue::Minimum(1),
+                )])),
+                tx.clone(),
+                NOW_TIME,
+                4,
+            ))
+            .await?;
+            assert!(
+                peer.worker_scheduler
+                    .fleet_advertisement()
+                    .await
+                    .resource_capacities
+                    .as_ref()
+                    .expect("capacity advertisements are enabled")
+                    .is_empty()
+            );
+            peer.remove_worker(&incomplete_id).await?;
+            local
+                .add_worker(worker(local_id.clone(), local_value, tx.clone()))
+                .await?;
+            local.set_peers_unknown_for_test().await;
+            for property in properties {
+                assert_eq!(
+                    capacity.borrow().capacities[0].minimum[property],
+                    local_value
+                );
+            }
+            let empty_peer = peer.worker_scheduler.fleet_advertisement().await;
+            assert!(empty_peer.resource_capacities.as_ref().unwrap().is_empty());
+            local.set_peer_schedulers_for_test(vec![empty_peer]).await;
+            for property in properties {
+                assert_eq!(
+                    capacity.borrow().capacities[0].minimum[property],
+                    local_value
+                );
+            }
+
+            let peer_value = if local_value == 80 { 60 } else { 140 };
+            peer.add_worker(worker(peer_id.clone(), peer_value, tx))
+                .await?;
+            local
+                .set_peer_schedulers_for_test(vec![
+                    peer.worker_scheduler.fleet_advertisement().await,
+                ])
+                .await;
+            for property in properties {
+                assert_eq!(
+                    capacity.borrow().capacities[0].minimum[property],
+                    local_value.min(peer_value)
+                );
+            }
+            peer.remove_worker(&peer_id).await?;
+            local
+                .set_peer_schedulers_for_test(vec![
+                    peer.worker_scheduler.fleet_advertisement().await,
+                ])
+                .await;
+            for property in properties {
+                assert_eq!(
+                    capacity.borrow().capacities[0].minimum[property],
+                    local_value
+                );
+            }
+            local.remove_worker(&local_id).await?;
+            for property in properties {
+                assert_eq!(capacity.borrow().capacities[0].minimum[property], 100);
+            }
+        }
         Ok(())
     }
 }

@@ -57,17 +57,7 @@ where
 {
     let mut largest = None;
     for capacity in rows {
-        let effective = |name: &str| {
-            capacity.minimum.get(name).map(|physical| {
-                (*physical).min(
-                    capacity
-                        .action_ceilings
-                        .get(name)
-                        .copied()
-                        .unwrap_or(*physical),
-                )
-            })
-        };
+        let effective = |name: &str| capacity.effective_capacity(name);
         // Original explicit intent is tested before selecting a row. Learned or
         // previously fitted memory must never exclude a legitimate future fleet.
         if reservation.and_then(|r| r.minimum_kb).is_some_and(|floor| {
@@ -129,12 +119,12 @@ where
         }
         let (Some(ceiling), Some(physical), Some(cpu)) = (
             effective(property),
-            capacity.minimum.get(property),
+            capacity.physical_capacity(property),
             effective(&policy.cpu_property),
         ) else {
             continue;
         };
-        let candidate = (ceiling, *physical, cpu);
+        let candidate = (ceiling, physical, cpu);
         largest = Some(largest.map_or(candidate, |previous| candidate.max(previous)));
     }
     Ok(largest)
@@ -229,65 +219,52 @@ pub(crate) fn apply_memory_fit(
     }
 }
 
-/// Recompute from current facts, bounded by the baseline's physical capacities.
-/// An unobserved row uses its baseline estimate; unchanged values share storage.
-/// Both slices retain the immutable policy's row ordering and non-memory fields.
+/// Recompute each dimension from current facts, falling back to its baseline
+/// estimate when unobserved. Unchanged values share storage.
+/// Both slices retain the immutable policy's row ordering and non-minimum fields.
 pub(crate) fn observe_capacities(
     baseline: &[ResourceCapacity],
     current: &[ResourceCapacity],
-    memory_property: &str,
-    mut observed: impl FnMut(&ResourceCapacity) -> Option<u64>,
+    mut observed: impl FnMut(&ResourceCapacity, &str) -> Option<u64>,
 ) -> Option<Arc<[ResourceCapacity]>> {
     let mut updated: Option<Vec<ResourceCapacity>> = None;
     for (index, row) in baseline.iter().enumerate() {
-        let Some(&estimate) = row.minimum.get(memory_property) else {
-            continue;
-        };
-        let memory = observed(row).unwrap_or(estimate).min(estimate);
-        if current[index].minimum.get(memory_property) == Some(&memory) {
-            continue;
-        }
-        let rows = updated.get_or_insert_with(|| current.to_vec());
-        if let Some(value) = rows[index].minimum.get_mut(memory_property) {
-            *value = memory;
+        for (property, &estimate) in &row.minimum {
+            let capacity = observed(row, property).unwrap_or(estimate);
+            if current[index].minimum.get(property) == Some(&capacity) {
+                continue;
+            }
+            let rows = updated.get_or_insert_with(|| current.to_vec());
+            rows[index].minimum.insert(property.clone(), capacity);
         }
     }
     updated.map(Arc::from)
 }
 
-pub(crate) fn worker_memory(
+pub(crate) fn worker_capacity(
     row: &ResourceCapacity,
-    memory_property: &str,
+    property: &str,
     totals: &PlatformProperties,
 ) -> Option<u64> {
     if !row.exact.iter().all(|(name, expected)| {
         matches!(totals.properties.get(name), Some(PlatformPropertyValue::Exact(actual)) if actual == expected)
-    }) || !row.minimum.iter().all(|(name, expected)| {
-        name == memory_property || matches!(totals.properties.get(name), Some(PlatformPropertyValue::Minimum(actual)) if actual >= expected)
     }) {
         return None;
     }
-    match totals.properties.get(memory_property) {
-        Some(PlatformPropertyValue::Minimum(memory)) => Some(*memory),
+    match totals.properties.get(property) {
+        Some(PlatformPropertyValue::Minimum(capacity)) => Some(*capacity),
         _ => None,
     }
 }
 
-pub(crate) fn peer_memory(
+pub(crate) fn peer_capacity(
     row: &ResourceCapacity,
-    memory_property: &str,
+    property: &str,
     peer: &ResourceCapacity,
 ) -> Option<u64> {
-    (row.exact == peer.exact
-        && row.minimum.iter().all(|(name, expected)| {
-            name == memory_property
-                || peer
-                    .minimum
-                    .get(name)
-                    .is_some_and(|actual| actual >= expected)
-        }))
-    .then(|| peer.minimum.get(memory_property).copied())
-    .flatten()
+    (row.exact == peer.exact)
+        .then(|| peer.minimum.get(property).copied())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -304,6 +281,25 @@ mod tests {
 
     const ESTIMATE: u64 = 63 * 1024 * 1024;
     const ACTUAL: u64 = 62_229 * 1024;
+
+    #[test]
+    fn physical_and_effective_capacities_share_ledger_conversion() {
+        let row: ResourceCapacity = serde_json::from_value(json!({
+            "minimum": { "cpu": 96000, "memory": 64000, "disk": 100_000 },
+            "pool_multipliers": { "cpu": 3 },
+            "action_ceilings": { "cpu": 16000, "memory": 32000, "disk": 200_000, "missing": 1 }
+        }))
+        .expect("valid row");
+        for (property, physical, effective) in [
+            ("cpu", Some(32_000), Some(16_000)),
+            ("memory", Some(64_000), Some(32_000)),
+            ("disk", Some(100_000), Some(100_000)),
+            ("missing", None, None),
+        ] {
+            assert_eq!(row.physical_capacity(property), physical);
+            assert_eq!(row.effective_capacity(property), effective);
+        }
+    }
 
     fn policy() -> ResourceEscalationSpec {
         // A nominal 64 GiB fleet starts with its already-reserved 63 GiB
@@ -391,6 +387,57 @@ mod tests {
     }
 
     #[test]
+    fn observed_oversubscribed_cpu_uses_physical_per_action_capacity() {
+        let mut policy = policy();
+        policy.capacities[0]
+            .minimum
+            .insert("cpu".to_owned(), 45_000);
+        policy.capacities[0].pool_multipliers.insert(
+            "cpu".to_owned(),
+            std::num::NonZeroU64::new(3).expect("nonzero multiplier"),
+        );
+        let mut rows = policy.capacities.clone();
+        rows[0].minimum.insert("cpu".to_owned(), 96_000);
+        rows[0].minimum.insert("memory".to_owned(), ACTUAL);
+        let snapshot = ResourceCapacitySnapshot::new(rows.clone());
+        let info = action(None, Some(ACTUAL), Some(32_000));
+        let fit = fit_memory(&info, &policy, &snapshot, &manager()).expect("physical CPU fits");
+        assert_eq!(fit.cpu, Some(32_000));
+
+        rows[0].action_ceilings.insert("cpu".to_owned(), 16_000);
+        let snapshot = ResourceCapacitySnapshot::new(rows);
+        let info = action(None, Some(ACTUAL), Some(1));
+        let fit = fit_memory(&info, &policy, &snapshot, &manager()).expect("explicit CPU cap fits");
+        assert_eq!(fit.cpu, Some(16_000));
+        let info = action(None, Some(ACTUAL), Some(32_000));
+        assert!(fit_memory(&info, &policy, &snapshot, &manager()).is_err());
+    }
+
+    #[test]
+    fn whole_pool_comparison_uses_unmultiplied_capacity_not_action_ceiling() {
+        let mut policy = policy();
+        policy.capacities[0].pool_multipliers.insert(
+            "memory".to_owned(),
+            std::num::NonZeroU64::new(2).expect("nonzero multiplier"),
+        );
+        let mut rows = policy.capacities.clone();
+        rows[0].minimum.insert("memory".to_owned(), 2 * ACTUAL);
+        let info = action(None, Some(ACTUAL), Some(1));
+        let snapshot = ResourceCapacitySnapshot::new(rows.clone());
+        let fit = fit_memory(&info, &policy, &snapshot, &manager()).expect("whole pool");
+        assert_eq!(fit.memory_kb, Some(ACTUAL));
+        assert_eq!(fit.cpu, Some(8));
+
+        rows[0]
+            .action_ceilings
+            .insert("memory".to_owned(), ACTUAL - 1);
+        let snapshot = ResourceCapacitySnapshot::new(rows);
+        let fit = fit_memory(&info, &policy, &snapshot, &manager()).expect("explicit ceiling");
+        assert_eq!(fit.memory_kb, Some(ACTUAL - 1));
+        assert_eq!(fit.cpu, Some(1));
+    }
+
+    #[test]
     fn explicit_floor_is_never_clamped_and_larger_future_fleet_remains_eligible() {
         let mut policy = policy();
         let mut snapshot = measured(&policy);
@@ -459,7 +506,7 @@ mod tests {
         }
     }
 
-    fn worker(fleet: &str, memory: u64, cpu: u64) -> PlatformProperties {
+    fn worker(fleet: &str, memory: u64, cpu: u64, disk: u64) -> PlatformProperties {
         PlatformProperties::new(HashMap::from([
             (
                 "fleet".to_owned(),
@@ -467,79 +514,113 @@ mod tests {
             ),
             ("memory".to_owned(), PlatformPropertyValue::Minimum(memory)),
             ("cpu".to_owned(), PlatformPropertyValue::Minimum(cpu)),
-            ("disk".to_owned(), PlatformPropertyValue::Minimum(1024)),
+            ("disk".to_owned(), PlatformPropertyValue::Minimum(disk)),
         ]))
     }
 
     #[test]
-    fn current_worker_observations_recover_and_reobserve_after_removal() {
+    fn worker_observations_cover_all_dimensions_and_recover() {
         let policy = policy();
         let original: Arc<[ResourceCapacity]> = policy.capacities.clone().into();
-        for totals in [worker("other", ACTUAL, 8), worker("compile", ACTUAL, 7)] {
-            assert!(
-                observe_capacities(&policy.capacities, &original, "memory", |row| {
-                    worker_memory(row, "memory", &totals)
-                })
-                .is_none()
-            );
-        }
-        let totals = worker("compile", ACTUAL, 8);
-        let learned = observe_capacities(&policy.capacities, &original, "memory", |row| {
-            worker_memory(row, "memory", &totals)
-        })
-        .expect("actual memory is below the estimate");
-        assert_eq!(learned[0].minimum["memory"], ACTUAL);
+        let wrong_fleet = worker("other", ACTUAL, 1, 1);
         assert!(
-            observe_capacities(&policy.capacities, &learned, "memory", |row| {
-                worker_memory(row, "memory", &totals)
+            observe_capacities(&policy.capacities, &original, |row, property| {
+                worker_capacity(row, property, &wrong_fleet)
             })
             .is_none()
         );
-        let restored = observe_capacities(&policy.capacities, &learned, "memory", |_| None)
-            .expect("removing the last observation restores the estimate");
+        // Every other dimension is below its estimate as well; none is a selector.
+        let below = worker("compile", ACTUAL, 7, 512);
+        let learned = observe_capacities(&policy.capacities, &original, |row, property| {
+            worker_capacity(row, property, &below)
+        })
+        .expect("actual capacities below the estimates");
+        for (property, expected) in [("memory", ACTUAL), ("cpu", 7), ("disk", 512)] {
+            assert_eq!(learned[0].minimum[property], expected);
+        }
+        assert!(
+            observe_capacities(&policy.capacities, &learned, |row, property| {
+                worker_capacity(row, property, &below)
+            })
+            .is_none()
+        );
+        let above = worker("compile", ESTIMATE + 1, 16, 2048);
+        let raised = observe_capacities(&policy.capacities, &learned, |row, property| {
+            worker_capacity(row, property, &above)
+        })
+        .expect("current capacity may exceed the estimate");
+        for (property, expected) in [("memory", ESTIMATE + 1), ("cpu", 16), ("disk", 2048)] {
+            assert_eq!(raised[0].minimum[property], expected);
+        }
+        let restored = observe_capacities(&policy.capacities, &raised, |_, _| None)
+            .expect("removing the last observation restores the estimates");
         assert_eq!(restored, original);
-        let reobserved = observe_capacities(&policy.capacities, &restored, "memory", |row| {
-            worker_memory(row, "memory", &totals)
+        let reobserved = observe_capacities(&policy.capacities, &restored, |row, property| {
+            worker_capacity(row, property, &below)
         })
-        .expect("the same worker's current totals are observed on reconnect");
+        .expect("reconnected worker is observed again");
         assert_eq!(reobserved, learned);
-        let higher = observe_capacities(&policy.capacities, &learned, "memory", |_| {
-            Some(ESTIMATE + 1)
-        })
-        .expect("a higher replacement raises capacity, bounded by configuration");
-        assert_eq!(higher, original);
     }
 
     #[test]
-    fn current_observations_keep_distinct_rows_and_other_minima_correlated() {
+    fn missing_worker_and_peer_dimensions_use_their_baseline_estimates() {
+        let policy = policy();
+        let baseline = &policy.capacities;
+        let mut totals = worker("compile", ACTUAL, 7, 512);
+        totals.properties.remove("cpu");
+        totals.properties.insert(
+            "disk".to_owned(),
+            PlatformPropertyValue::Exact("not a minimum".to_owned()),
+        );
+        let observed = observe_capacities(baseline, baseline, |row, property| {
+            worker_capacity(row, property, &totals)
+        })
+        .expect("memory is observed independently");
+        assert_eq!(observed[0].minimum["memory"], ACTUAL);
+        assert_eq!(observed[0].minimum["cpu"], 8);
+        assert_eq!(observed[0].minimum["disk"], 1024);
+
+        let mut peer = baseline[0].clone();
+        peer.minimum.remove("cpu");
+        peer.minimum.insert("disk".to_owned(), 2048);
+        let observed = observe_capacities(baseline, baseline, |row, property| {
+            peer_capacity(row, property, &peer)
+        })
+        .expect("peer disk is observed independently");
+        assert_eq!(observed[0].minimum["cpu"], 8);
+        assert_eq!(observed[0].minimum["disk"], 2048);
+    }
+
+    #[test]
+    fn observations_are_minimized_per_dimension_and_exact_row() {
         let mut policy = policy();
         let mut other = policy.capacities[0].clone();
         other.exact.insert("fleet".to_owned(), "other".to_owned());
         policy.capacities.push(other);
-        let local = observe_capacities(&policy.capacities, &policy.capacities, "memory", |row| {
-            worker_memory(row, "memory", &worker("compile", ACTUAL, 8))
-        })
-        .expect("compile row changes");
-        assert_eq!(local[0].minimum["memory"], ACTUAL);
-        assert_eq!(local[1].minimum["memory"], ESTIMATE);
-        let both = observe_capacities(&policy.capacities, &local, "memory", |row| {
-            [worker("compile", ACTUAL, 8), worker("other", ACTUAL - 1, 8)]
+        let workers = [
+            worker("compile", ACTUAL, 16, 256),
+            worker("compile", ESTIMATE + 1, 4, 2048),
+        ];
+        let local = observe_capacities(&policy.capacities, &policy.capacities, |row, property| {
+            workers
                 .iter()
-                .filter_map(|totals| worker_memory(row, "memory", totals))
+                .filter_map(|totals| worker_capacity(row, property, totals))
                 .min()
         })
-        .expect("only the second row changes");
-        assert_eq!(both[0].minimum["memory"], ACTUAL);
-        assert_eq!(both[1].minimum["memory"], ACTUAL - 1);
-        let remaining = observe_capacities(&policy.capacities, &both, "memory", |row| {
-            worker_memory(row, "memory", &worker("other", ACTUAL - 1, 8))
+        .expect("compile row changes");
+        for (property, expected) in [("memory", ACTUAL), ("cpu", 4), ("disk", 256)] {
+            assert_eq!(local[0].minimum[property], expected);
+            assert_eq!(
+                local[1].minimum[property],
+                policy.capacities[1].minimum[property]
+            );
+        }
+        let remaining = observe_capacities(&policy.capacities, &local, |row, property| {
+            worker_capacity(row, property, &workers[1])
         })
-        .expect("only the compile row returns to its estimate");
-        assert_eq!(remaining[0].minimum["memory"], ESTIMATE);
-        assert_eq!(remaining[1].minimum["memory"], ACTUAL - 1);
-        for row in remaining.iter() {
-            assert_eq!(row.minimum["cpu"], 8);
-            assert_eq!(row.minimum["disk"], 1024);
+        .expect("remaining worker supplies its actual capacities");
+        for (property, expected) in [("memory", ESTIMATE + 1), ("cpu", 4), ("disk", 2048)] {
+            assert_eq!(remaining[0].minimum[property], expected);
         }
     }
 
@@ -549,24 +630,34 @@ mod tests {
         let local: Arc<[ResourceCapacity]> = policy.capacities.clone().into();
         let mut peer = policy.capacities[0].clone();
         peer.minimum.insert("memory".to_owned(), ACTUAL);
+        peer.minimum.insert("cpu".to_owned(), 16);
+        peer.minimum.insert("disk".to_owned(), 512);
         peer.action_ceilings.insert("memory".to_owned(), 1);
-        let global = observe_capacities(&local, &local, "memory", |row| {
-            peer_memory(row, "memory", &peer)
+        let global = observe_capacities(&local, &local, |row, property| {
+            peer_capacity(row, property, &peer)
         })
-        .expect("peer's lower physical memory changes the global rows");
-        assert_eq!(global[0].minimum["memory"], ACTUAL);
-        assert_eq!(local[0].minimum["memory"], ESTIMATE);
+        .expect("peer physical capacities change the global rows");
+        for (property, expected) in [("memory", ACTUAL), ("cpu", 16), ("disk", 512)] {
+            assert_eq!(global[0].minimum[property], expected);
+            assert_eq!(
+                local[0].minimum[property],
+                policy.capacities[0].minimum[property]
+            );
+        }
         assert!(global[0].action_ceilings.is_empty());
-        assert_eq!(global[0].minimum["cpu"], 8);
-        assert_eq!(global[0].minimum["disk"], 1024);
         assert!(
-            observe_capacities(&local, &global, "memory", |row| {
-                peer_memory(row, "memory", &peer)
+            observe_capacities(&local, &global, |row, property| {
+                peer_capacity(row, property, &peer)
             })
             .is_none()
         );
-        let recovered = observe_capacities(&local, &global, "memory", |_| None)
-            .expect("unknown, removed or expired peer facts are no longer observations");
+        let mut different = peer.clone();
+        different
+            .exact
+            .insert("fleet".to_owned(), "other".to_owned());
+        assert_eq!(peer_capacity(&local[0], "cpu", &different), None);
+        let recovered = observe_capacities(&local, &global, |_, _| None)
+            .expect("removed peer facts are no longer observations");
         assert_eq!(recovered, local);
     }
 }

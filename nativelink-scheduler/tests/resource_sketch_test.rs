@@ -47,7 +47,7 @@ const NOW: u64 = 7 * 86_400;
 
 #[test]
 fn sampler_generation_identifies_peak_floor_format() {
-    assert_eq!(SAMPLER_GENERATION, 2);
+    assert_eq!(SAMPLER_GENERATION, 3);
 }
 
 /// One shard, so the eviction order is the one LRU order of each family;
@@ -73,9 +73,28 @@ fn command(digest: &str) -> SketchKey {
     SketchKey::for_attempt(None, None, digest)
 }
 
+fn mnemonic(name: &str) -> SketchKey {
+    SketchKey::Mnemonic {
+        mnemonic: name.into(),
+    }
+}
+
+#[test]
+fn attempt_without_target_uses_command_even_with_mnemonic() {
+    assert_eq!(
+        SketchKey::for_attempt(None, Some("Compile"), "digest"),
+        command("digest")
+    );
+    assert_eq!(
+        SketchKey::for_attempt(Some(""), Some("Compile"), "digest"),
+        command("digest")
+    );
+}
+
 fn memory(peak_kb: u64, now_s: u64) -> Observation {
     Observation {
         peak_memory_kb: peak_kb,
+        completed: true,
         now_s,
         ..Observation::default()
     }
@@ -153,6 +172,7 @@ fn cpu_percentile_uses_both_windows_and_preserves_other_dimensions() {
             killed_peak_memory_kb: (i == 19).then_some(15_000),
             killed_peak_disk_kb: (i == 19).then_some(17_000),
             killed: i == 19,
+            completed: i != 19,
             now_s: if i < 10 { boundary - 1 } else { boundary },
         };
         median.observe(key.clone(), &observation);
@@ -170,6 +190,98 @@ fn cpu_percentile_uses_both_windows_and_preserves_other_dimensions() {
     assert_eq!(maximum.shape(&entry).cpu_count, 12_000);
     assert_eq!(p95.shape(&entry).memory_kb, shaped.memory_kb);
     assert_eq!(maximum.shape(&entry).disk_kb, shaped.disk_kb);
+}
+
+#[test]
+fn dimensions_share_shaping_contract_with_distinct_statistics() {
+    for (cpu, memory_enabled, disk, expected) in [
+        (true, true, true, (2_500, 10_002, 2_500)),
+        (true, false, false, (2_500, 0, 0)),
+        (false, true, false, (0, 10_002, 0)),
+        (false, false, true, (0, 0, 2_500)),
+        (false, false, false, (0, 0, 0)),
+    ] {
+        let mut configured = policy(25, vec![]);
+        configured.cpu_reservation_percentile = CpuReservationPercentile::new(50).unwrap();
+        configured.reserve_cpu = cpu;
+        configured.reserve_memory = memory_enabled;
+        configured.reserve_disk = disk;
+        let sketch = sketch(configured, small_budget());
+        let key = target("//dimensions", "X");
+        for i in 0..20 {
+            let value = if i == 19 { 8_001 } else { 1_000 };
+            sketch.observe(
+                key.clone(),
+                &Observation {
+                    cpu_millicores: Some(value),
+                    peak_memory_kb: value,
+                    peak_disk_kb: value,
+                    now_s: NOW,
+                    ..Observation::default()
+                },
+            );
+        }
+        let shaped = sketch.shape(&sketch.lookup(&key, NOW).unwrap());
+        assert_eq!(
+            (shaped.cpu_count, shaped.memory_kb, shaped.disk_kb),
+            expected
+        );
+    }
+}
+
+#[test]
+fn rare_memory_peak_survives_rotation_and_snapshot_until_expiry() {
+    let sketch = sketch(policy(20, vec![]), small_budget());
+    let key = target("//rare-peak", "X");
+    sketch.observe(key.clone(), &memory(8_000_001, NOW - 1));
+    for _ in 0..100 {
+        sketch.observe(key.clone(), &memory(1_000, NOW));
+    }
+    let entry = sketch.lookup(&key, NOW).unwrap();
+    assert_eq!(entry.memory_p95_upper(), 2_000);
+    assert_eq!(entry.previous.max_memory_kb, 8_000_001);
+    assert_eq!(entry.current.max_memory_kb, 1_000);
+    assert_eq!(sketch.shape(&entry).memory_kb, 9_600_002);
+
+    let bytes = sketch.encode_snapshot(NOW);
+    let restored = self::sketch(policy(20, vec![]), small_budget());
+    restored
+        .load(Snapshot::decode(&bytes, usize::MAX).unwrap(), NOW)
+        .unwrap();
+    let loaded = restored.lookup(&key, NOW).unwrap();
+    assert_eq!(loaded, entry);
+    assert_eq!(restored.shape(&loaded).memory_kb, 9_600_002);
+
+    let expiry = NOW + 7 * 86_400 / 2;
+    restored.age_out(expiry);
+    let expired = restored.lookup(&key, expiry).unwrap();
+    assert_eq!(expired.max_memory_kb(), 1_000);
+    assert_eq!(restored.shape(&expired).memory_kb, 1_200);
+}
+
+#[test]
+fn class_fallback_never_undersizes_measured_memory() {
+    for (class_memory, expected_class, expected_memory) in
+        [(9_000, None, 10_002), (11_000, Some("top"), 11_000)]
+    {
+        let sketch = sketch(
+            policy(25, vec![class("top", 1_000, class_memory, 0)]),
+            small_budget(),
+        );
+        let key = target("//class-peak", "X");
+        sketch.observe(
+            key.clone(),
+            &Observation {
+                cpu_millicores: Some(4_000),
+                peak_memory_kb: 8_001,
+                now_s: NOW,
+                ..Observation::default()
+            },
+        );
+        let shaped = sketch.shape(&sketch.lookup(&key, NOW).unwrap());
+        assert_eq!(shaped.class.as_deref(), expected_class);
+        assert_eq!(shaped.memory_kb, expected_memory);
+    }
 }
 
 #[test]
@@ -228,8 +340,7 @@ fn snapshot_reinterprets_cpu_percentile_without_changing_snapshot() {
     assert_eq!(restored.encode_snapshot(NOW), bytes);
 }
 
-/// One sample reserves exactly what it used, plus headroom; the bucket's
-/// upper bound only applies once the maximum is above it.
+/// A steady maximum receives headroom even when its histogram bucket is wider.
 #[test]
 fn shape_caps_the_bucket_by_the_exact_maximum() {
     let sketch = sketch(policy(20, vec![]), small_budget());
@@ -455,6 +566,7 @@ fn a_snapshot_round_trips_and_ages_out() {
             killed_peak_memory_kb: Some(123_456),
             killed_peak_disk_kb: Some(77),
             killed: true,
+            completed: false,
             now_s: now,
         },
     );
@@ -463,12 +575,12 @@ fn a_snapshot_round_trips_and_ages_out() {
     let snapshot = sketch.snapshot(now);
     assert_eq!(
         snapshot.entries.len(),
-        3,
-        "//old left out, the mnemonics in"
+        2,
+        "//old and the killed attempt's mnemonic are absent"
     );
-    assert_eq!(sketch.stats().entries, [2, 2, 1], "nothing dropped yet");
+    assert_eq!(sketch.stats().entries, [2, 1, 1], "nothing dropped yet");
     assert_eq!(sketch.age_out(now), 2, "//old and its mnemonic X dropped");
-    assert_eq!(sketch.stats().entries, [1, 1, 1]);
+    assert_eq!(sketch.stats().entries, [1, 0, 1]);
     assert_eq!(sketch.snapshot(now), snapshot);
     let bytes = snapshot.encode();
     let decoded = Snapshot::decode(&bytes, usize::MAX).unwrap();
@@ -492,7 +604,7 @@ fn a_snapshot_round_trips_and_ages_out() {
     assert!(!entry.seeded);
 
     let fresh = self::sketch(policy(0, vec![]), small_budget());
-    assert_eq!(fresh.load(decoded.clone(), now).unwrap(), 3);
+    assert_eq!(fresh.load(decoded.clone(), now).unwrap(), 2);
     // The command key's first sighting was probation; one sample counted.
     assert_eq!(fresh.lookup(&command("cc-9"), now).unwrap().samples, 1);
     // Replaying the same owned snapshot does not count samples again.
@@ -561,17 +673,11 @@ fn the_budget_and_the_listing() {
         small_budget(),
     );
     sketch.observe(target("//a", "X"), &memory(1000, 1));
-    sketch.observe(
-        SketchKey::for_attempt(None, Some("Link"), "unused"),
-        &memory(2000, 2),
-    );
+    sketch.observe(mnemonic("Link"), &memory(2000, 2));
     let rows = sketch.hints(None, 10);
     // The target, its mnemonic X, and Link; most recently seen first.
     assert_eq!(rows.len(), 3);
-    assert_eq!(
-        rows[0].key,
-        SketchKey::for_attempt(None, Some("Link"), "unused")
-    );
+    assert_eq!(rows[0].key, mnemonic("Link"));
     let a = rows
         .iter()
         .find(|row| row.key == target("//a", "X"))
@@ -624,7 +730,7 @@ fn samples_leave_with_the_window_and_the_kill_floor_expires() {
     assert_eq!(
         sketch.shape(&entry).memory_kb,
         7_500_000,
-        "the kill still holds"
+        "the retained maximum still holds"
     );
     // Eight days on: two half-windows past the big samples and a window
     // past the kill. The tick ages the key; the small samples are what is
@@ -663,7 +769,7 @@ fn a_named_attempt_teaches_its_mnemonic() {
     let sketch = sketch(policy(0, vec![]), small_budget());
     sketch.observe(target("//a", "Javac"), &memory(3_000_000, 1));
     sketch.observe(target("//b", "Javac"), &memory(1_000_000, 2));
-    let javac = SketchKey::for_attempt(None, Some("Javac"), "unused");
+    let javac = mnemonic("Javac");
     let entry = sketch.lookup(&javac, NOW).unwrap();
     assert_eq!(entry.samples, 2);
     assert_eq!(entry.max_memory_kb(), 3_000_000);
@@ -677,6 +783,173 @@ fn a_named_attempt_teaches_its_mnemonic() {
     sketch.observe(javac.clone(), &memory(1_000, 4));
     assert_eq!(sketch.stats().samples, [3, 3, 0]);
     assert_eq!(sketch.lookup(&javac, NOW).unwrap().samples, 3);
+}
+
+#[test]
+fn killed_target_does_not_pollute_mnemonic_and_success_clears_floors() {
+    let sketch = sketch(policy(0, vec![]), small_budget());
+    let key = target("//large", "Compile");
+    let mnemonic = mnemonic("Compile");
+    for _ in 0..20 {
+        sketch.observe(
+            target("//small", "Compile"),
+            &Observation {
+                cpu_millicores: Some(1_000),
+                peak_memory_kb: 1_000,
+                peak_disk_kb: 1_000,
+                now_s: NOW,
+                ..Observation::default()
+            },
+        );
+    }
+    let fallback = sketch.lookup(&mnemonic, NOW).unwrap();
+    assert!(!sketch.observe(
+        mnemonic.clone(),
+        &Observation {
+            peak_memory_kb: 16_000,
+            killed: true,
+            now_s: NOW,
+            ..Observation::default()
+        },
+    ));
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            cpu_millicores: Some(8_001),
+            peak_memory_kb: 8_001,
+            peak_disk_kb: 8_001,
+            killed_peak_memory_kb: Some(16_000),
+            killed_peak_disk_kb: Some(16_000),
+            killed: true,
+            completed: false,
+            now_s: NOW,
+        },
+    );
+    assert_eq!(sketch.lookup(&mnemonic, NOW).unwrap(), fallback);
+    let killed = sketch.shape(&sketch.lookup(&key, NOW).unwrap());
+    assert_eq!(
+        (killed.cpu_count, killed.memory_kb, killed.disk_kb),
+        (8_001, 16_000, 16_000)
+    );
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            now_s: NOW,
+            ..Observation::default()
+        },
+    );
+    let unknown = sketch.lookup(&key, NOW).unwrap();
+    assert_eq!(unknown.killed_peak_memory_kb, 16_000);
+    assert_eq!(unknown.killed_peak_disk_kb, 16_000);
+
+    for _ in 0..20 {
+        sketch.observe(
+            key.clone(),
+            &Observation {
+                cpu_millicores: Some(1_000),
+                peak_memory_kb: 1_000,
+                peak_disk_kb: 1_000,
+                completed: true,
+                now_s: NOW,
+                ..Observation::default()
+            },
+        );
+    }
+    let entry = sketch.lookup(&key, NOW).unwrap();
+    assert_eq!(entry.killed_peak_memory_kb, 0);
+    assert_eq!(entry.killed_peak_disk_kb, 0);
+    let shaped = sketch.shape(&entry);
+    assert_eq!(
+        (shaped.cpu_count, shaped.memory_kb, shaped.disk_kb),
+        (2_000, 8_001, 2_000)
+    );
+    let fallback = sketch.shape(&sketch.lookup(&mnemonic, NOW).unwrap());
+    assert_eq!(
+        (fallback.cpu_count, fallback.memory_kb, fallback.disk_kb),
+        (1_000, 1_000, 1_000)
+    );
+
+    let expiry = NOW + 7 * 86_400;
+    sketch.observe(key.clone(), &memory(1_000, expiry));
+    assert_eq!(
+        sketch
+            .shape(&sketch.lookup(&key, expiry).unwrap())
+            .memory_kb,
+        1_000
+    );
+}
+
+#[test]
+fn successful_command_clears_kill_floors_but_retains_measured_peak() {
+    let sketch = sketch(policy(0, vec![]), small_budget());
+    let key = SketchKey::for_attempt(None, Some("Compile"), "killed");
+    let fallback = mnemonic("Compile");
+    sketch.observe(fallback.clone(), &memory(1_000, NOW));
+    let before = sketch.lookup(&fallback, NOW).unwrap();
+    sketch.observe(
+        key.clone(),
+        &Observation {
+            peak_memory_kb: 8_000,
+            peak_disk_kb: 8_000,
+            killed_peak_memory_kb: Some(16_000),
+            killed_peak_disk_kb: Some(16_000),
+            killed: true,
+            now_s: NOW,
+            ..Observation::default()
+        },
+    );
+    assert_eq!(sketch.lookup(&fallback, NOW).unwrap(), before);
+    sketch.observe(key.clone(), &memory(1_000, NOW));
+    sketch.observe(fallback.clone(), &memory(1_000, NOW));
+    let entry = sketch.lookup(&key, NOW).unwrap();
+    assert_eq!(entry.killed_peak_memory_kb, 0);
+    assert_eq!(entry.killed_peak_disk_kb, 0);
+    assert_eq!(sketch.shape(&entry).memory_kb, 8_000);
+    assert_eq!(
+        sketch
+            .shape(&sketch.lookup(&fallback, NOW).unwrap())
+            .memory_kb,
+        1_000
+    );
+}
+
+#[test]
+fn legacy_snapshot_restores_narrow_keys_but_discards_mnemonic_history() {
+    let sketch = sketch(policy(0, vec![]), small_budget());
+    let target = target("//legacy", "Compile");
+    let mnemonic = mnemonic("Compile");
+    let command = command("legacy");
+    sketch.observe(target.clone(), &memory(8_001, NOW));
+    sketch.observe(command.clone(), &memory(4_000, NOW));
+    sketch.observe(command.clone(), &memory(4_000, NOW));
+    let mut legacy = sketch.snapshot(NOW);
+    legacy.sampler_generation = 2;
+    let bytes = legacy.encode();
+    assert_eq!(Snapshot::compatible_written_at(&bytes).unwrap(), NOW);
+    let restored = self::sketch(policy(0, vec![]), small_budget());
+    assert_eq!(
+        restored
+            .load(Snapshot::decode(&bytes, usize::MAX).unwrap(), NOW)
+            .unwrap(),
+        2
+    );
+    assert_eq!(restored.lookup(&mnemonic, NOW), None);
+    assert_eq!(
+        restored
+            .shape(&restored.lookup(&target, NOW).unwrap())
+            .memory_kb,
+        8_001
+    );
+    assert_eq!(
+        restored
+            .shape(&restored.lookup(&command, NOW).unwrap())
+            .memory_kb,
+        4_000
+    );
+    assert_eq!(
+        restored.snapshot(NOW).sampler_generation,
+        SAMPLER_GENERATION
+    );
 }
 
 /// Independent u16 saturation previously turned a 0.4% tail into the p95.
@@ -693,7 +966,7 @@ fn busy_histogram_preserves_the_distribution_and_snapshot_counts() {
     let entry = sketch.lookup(&key, NOW).unwrap();
     assert_eq!(entry.memory_samples(), 1_004_000);
     assert_eq!(entry.memory_p95_upper(), 2000);
-    assert_eq!(sketch.shape(&entry).memory_kb, 2000);
+    assert_eq!(sketch.shape(&entry).memory_kb, 8_000_000);
     let bytes = sketch.encode_snapshot(NOW);
     let restored = self::sketch(policy(0, vec![]), small_budget());
     restored

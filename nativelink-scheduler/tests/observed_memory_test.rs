@@ -68,7 +68,7 @@ fn capacity(fleet: &str, memory_kb: u64) -> ResourceCapacity {
             ("fleet".to_string(), fleet.to_string()),
             ("ISA".to_string(), "arm64".to_string()),
         ]),
-        action_ceilings: BTreeMap::new(),
+        ..Default::default()
     }
 }
 

@@ -39,7 +39,8 @@ use nativelink_util::store_trait::{
 };
 use nativelink_util::task::JoinHandleDropGuard;
 use opentelemetry::KeyValue;
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Serialize, Serializer};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{error, warn};
 
@@ -584,8 +585,170 @@ impl SchedulerStoreDataProvider for UpdateClientKeepalive<'_> {
 struct FleetCapabilities {
     scheduler_id: String,
     workers: Vec<PlatformProperties>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_legacy_resource_capacities")]
     resource_capacities: Option<Arc<[ResourceCapacity]>>,
+}
+
+// Peer beacons must remain readable by older controllers, whose capacity
+// schema rejects unknown fields. Encode physical limits as legacy ceilings
+// rather than exposing the internal ledger multipliers on the wire.
+fn serialize_legacy_resource_capacities<S>(
+    capacities: &Option<Arc<[ResourceCapacity]>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match capacities {
+        Some(capacities) => serializer.serialize_some(&LegacyCapacities(capacities)),
+        None => serializer.serialize_none(),
+    }
+}
+
+struct LegacyCapacities<'a>(&'a [ResourceCapacity]);
+
+impl Serialize for LegacyCapacities<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for capacity in self.0 {
+            seq.serialize_element(&LegacyCapacity {
+                minimum: &capacity.minimum,
+                exact: &capacity.exact,
+                action_ceilings: LegacyCeilings(capacity),
+            })?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+struct LegacyCapacity<'a> {
+    minimum: &'a std::collections::BTreeMap<String, u64>,
+    exact: &'a std::collections::BTreeMap<String, String>,
+    action_ceilings: LegacyCeilings<'a>,
+}
+
+struct LegacyCeilings<'a>(&'a ResourceCapacity);
+
+impl Serialize for LegacyCeilings<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let capacity = self.0;
+        let extra = capacity
+            .action_ceilings
+            .keys()
+            .filter(|key| !capacity.minimum.contains_key(*key))
+            .count();
+        let mut map = serializer.serialize_map(Some(capacity.minimum.len() + extra))?;
+        for key in capacity.minimum.keys() {
+            if let Some(ceiling) = capacity.effective_capacity(key) {
+                map.serialize_entry(key, &ceiling)?;
+            }
+        }
+        for (key, ceiling) in &capacity.action_ceilings {
+            if !capacity.minimum.contains_key(key) {
+                map.serialize_entry(key, ceiling)?;
+            }
+        }
+        map.end()
+    }
+}
+
+#[cfg(test)]
+mod legacy_capacity_wire_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use serde::Deserialize;
+
+    use super::{
+        FleetCapabilities, ResourceCapacity, SchedulerStoreDataProvider, UpdateFleetCapabilities,
+    };
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyCapacity {
+        minimum: BTreeMap<String, u64>,
+        exact: BTreeMap<String, String>,
+        action_ceilings: BTreeMap<String, u64>,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyFleet {
+        scheduler_id: String,
+        workers: Vec<serde_json::Value>,
+        resource_capacities: Option<Vec<LegacyCapacity>>,
+    }
+
+    #[test]
+    fn beacon_uses_legacy_capacity_schema_with_physical_ceilings() {
+        let row: ResourceCapacity = serde_json::from_str(
+            r#"{
+                "minimum": {"cpu": 96000, "memory": 64000, "disk": 100000},
+                "exact": {"os": "linux"},
+                "pool_multipliers": {"cpu": 3},
+                "action_ceilings": {"other": 7}
+            }"#,
+        )
+        .unwrap();
+        let mut capped = row.clone();
+        capped.action_ceilings.insert("cpu".into(), 16000);
+        let fleet = FleetCapabilities {
+            scheduler_id: "scheduler".into(),
+            workers: vec![],
+            resource_capacities: Some(Arc::from([row.clone(), capped])),
+        };
+        let bytes = UpdateFleetCapabilities(fleet).try_into_bytes().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["resource_capacities"][0]
+                .get("pool_multipliers")
+                .is_none()
+        );
+        assert!(
+            json["resource_capacities"][1]
+                .get("pool_multipliers")
+                .is_none()
+        );
+        let legacy: LegacyFleet = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.scheduler_id, "scheduler");
+        assert!(legacy.workers.is_empty());
+        let rows = legacy.resource_capacities.unwrap();
+        assert_eq!(rows[0].minimum["cpu"], 96000);
+        assert_eq!(rows[0].exact["os"], "linux");
+        assert_eq!(rows[0].action_ceilings["cpu"], 32000);
+        assert_eq!(rows[0].action_ceilings["memory"], 64000);
+        assert_eq!(rows[0].action_ceilings["disk"], 100_000);
+        assert_eq!(rows[0].action_ceilings["other"], 7);
+        assert_eq!(rows[1].action_ceilings["cpu"], 16000);
+        let new_reader: FleetCapabilities = serde_json::from_slice(&bytes).unwrap();
+        let new_rows = new_reader.resource_capacities.unwrap();
+        assert!(new_rows[0].pool_multipliers.is_empty());
+        assert_eq!(new_rows[0].effective_capacity("cpu"), Some(32000));
+
+        // The internal configuration format still retains its multiplier.
+        let internal = serde_json::to_value(&row).unwrap();
+        assert_eq!(internal["pool_multipliers"]["cpu"], 3);
+        let restored: ResourceCapacity = serde_json::from_value(internal).unwrap();
+        assert_eq!(restored, row);
+    }
+
+    #[test]
+    fn beacon_preserves_absent_and_empty_capacities() {
+        for capacities in [None, Some(Arc::from([]))] {
+            let expected_empty = capacities.is_some();
+            let fleet = FleetCapabilities {
+                scheduler_id: "scheduler".into(),
+                workers: vec![],
+                resource_capacities: capacities,
+            };
+            let bytes = UpdateFleetCapabilities(fleet).try_into_bytes().unwrap();
+            let legacy: LegacyFleet = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(legacy.resource_capacities.is_some(), expected_empty);
+            if let Some(rows) = legacy.resource_capacities {
+                assert!(rows.is_empty());
+            }
+        }
+    }
 }
 
 struct UpdateFleetCapabilities(FleetCapabilities);

@@ -56,17 +56,47 @@ fn capacity_serde_defaults_and_rejects_unknown_fields() {
     let empty: ResourceCapacity = serde_json::from_str("{}").expect("empty maps default");
     assert!(empty.minimum.is_empty());
     assert!(empty.exact.is_empty());
+    assert!(empty.action_ceilings.is_empty());
+    assert!(empty.pool_multipliers.is_empty());
     let capacity: ResourceCapacity =
         serde_json::from_str(r#"{"minimum":{"memory_kb":12345},"exact":{"ISA":"arm64"}}"#)
             .expect("capacity parses");
     assert_eq!(capacity.minimum.get("memory_kb"), Some(&12_345));
     assert_eq!(capacity.exact.get("ISA").map(String::as_str), Some("arm64"));
+    assert!(capacity.pool_multipliers.is_empty());
+    assert_eq!(capacity.effective_capacity("memory_kb"), Some(12_345));
     assert!(serde_json::from_str::<ResourceCapacity>(r#"{"memory_kb":12345}"#).is_err());
+    assert!(
+        serde_json::from_str::<ResourceCapacity>(r#"{"pool_multipliers":{"cpu_count":0}}"#)
+            .is_err()
+    );
+}
+
+#[test]
+fn effective_capacity_converts_ledgers_and_respects_explicit_ceilings() {
+    let mut row: ResourceCapacity = serde_json::from_str(
+        r#"{
+            "minimum":{"cpu":96000,"memory":64000,"disk":100000},
+            "pool_multipliers":{"cpu":3}
+        }"#,
+    )
+    .expect("valid capacity");
+    assert_eq!(row.effective_capacity("cpu"), Some(32_000));
+    assert_eq!(row.effective_capacity("memory"), Some(64_000));
+    assert_eq!(row.effective_capacity("disk"), Some(100_000));
+    assert_eq!(row.effective_capacity("missing"), None);
+    row.action_ceilings.insert("cpu".into(), 16_000);
+    row.action_ceilings.insert("memory".into(), 32_000);
+    row.action_ceilings.insert("disk".into(), 200_000);
+    row.action_ceilings.insert("missing".into(), 1);
+    assert_eq!(row.effective_capacity("cpu"), Some(16_000));
+    assert_eq!(row.effective_capacity("memory"), Some(32_000));
+    assert_eq!(row.effective_capacity("disk"), Some(100_000));
+    assert_eq!(row.effective_capacity("missing"), None);
 }
 
 fn capacity(memory: u64, disk: u64, cpu: u64) -> ResourceCapacity {
     ResourceCapacity {
-        action_ceilings: BTreeMap::new(),
         minimum: BTreeMap::from([
             ("memory_kb".to_string(), memory),
             ("disk_kb".to_string(), disk),
@@ -77,11 +107,12 @@ fn capacity(memory: u64, disk: u64, cpu: u64) -> ResourceCapacity {
             ("fleet".to_string(), "compile".to_string()),
             ("sandbox".to_string(), "isolated".to_string()),
         ]),
+        ..Default::default()
     }
 }
 
 fn make_scheduler() -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
-    // The larger-memory fleet cannot satisfy a 1,000 KiB disk request.
+    // Matching worker observations replace these nominal estimates.
     make_scheduler_with_capacities(vec![
         capacity(100_000, 100_000, 8),
         capacity(200_000, 500, 16),
@@ -130,19 +161,36 @@ fn make_scheduler_with_capacities(
 }
 
 async fn add_worker(scheduler: &SimpleScheduler) -> Result<mpsc::Receiver<UpdateForWorker>, Error> {
+    add_worker_with_capacity(scheduler, 100_000, 100_000, 8).await
+}
+
+async fn add_worker_with_capacity(
+    scheduler: &SimpleScheduler,
+    memory: u64,
+    disk: u64,
+    cpu: u64,
+) -> Result<mpsc::Receiver<UpdateForWorker>, Error> {
+    add_named_worker(scheduler, WORKER, memory, disk, cpu, false).await
+}
+
+async fn add_named_worker(
+    scheduler: &SimpleScheduler,
+    id: &str,
+    memory: u64,
+    disk: u64,
+    cpu: u64,
+    draining: bool,
+) -> Result<mpsc::Receiver<UpdateForWorker>, Error> {
     let (tx, mut rx) = mpsc::channel(64);
-    let worker = Worker::new(
-        WorkerId(WORKER.to_string()),
+    let mut worker = Worker::new(
+        WorkerId(id.to_string()),
         PlatformProperties::new(HashMap::from([
             (
                 "memory_kb".to_string(),
-                PlatformPropertyValue::Minimum(200_000),
+                PlatformPropertyValue::Minimum(memory),
             ),
-            (
-                "disk_kb".to_string(),
-                PlatformPropertyValue::Minimum(100_000),
-            ),
-            ("cpu_count".to_string(), PlatformPropertyValue::Minimum(16)),
+            ("disk_kb".to_string(), PlatformPropertyValue::Minimum(disk)),
+            ("cpu_count".to_string(), PlatformPropertyValue::Minimum(cpu)),
             (
                 "ISA".to_string(),
                 PlatformPropertyValue::Exact("arm64".to_string()),
@@ -160,6 +208,7 @@ async fn add_worker(scheduler: &SimpleScheduler) -> Result<mpsc::Receiver<Update
         NOW_TIME,
         4,
     );
+    worker.is_draining = draining;
     scheduler
         .add_worker(worker)
         .await
@@ -349,7 +398,11 @@ async fn exact_properties_bound_escalation_and_impossible_peaks() -> Result<(), 
         }
         let (scheduler, worker) =
             make_scheduler_with_capacities(vec![capacity(100_000, 100_000, 8), large]);
-        let mut rx = add_worker(&scheduler).await?;
+        let mut rx = if key.is_empty() {
+            add_worker_with_capacity(&scheduler, 200_000, 100_000, 16).await?
+        } else {
+            add_worker(&scheduler).await?
+        };
         let mut listener = add_action(&scheduler, 50_000, 1_000).await?;
         let first = next_dispatch(&mut rx).await;
         kill(
@@ -450,7 +503,7 @@ async fn eligible_capacity_clamps_and_reserves_whole_cpu_then_kill_is_terminal()
     )
     .await?;
     let second = next_dispatch(&mut rx).await;
-    // The 200,000 KiB fleet is ineligible because its disk is only 500 KiB.
+    // The matching worker's actual pool, rather than the nominal rows, bounds retries.
     assert_eq!(property(&second, "memory_kb"), 100_000);
     assert_eq!(property(&second, "cpu_count"), 8);
     kill(
@@ -481,7 +534,7 @@ async fn policy_ceiling_retries_without_whole_cpu_then_stops() -> Result<(), Err
         .insert("memory_kb".to_string(), 100_000);
     limited.action_ceilings.insert("cpu_count".to_string(), 4);
     let (scheduler, worker) = make_scheduler_with_capacities(vec![limited]);
-    let mut rx = add_worker(&scheduler).await?;
+    let mut rx = add_worker_with_capacity(&scheduler, 200_000, 100_000, 16).await?;
     let mut listener = add_action(&scheduler, 50_000, 1_000).await?;
     let first = next_dispatch(&mut rx).await;
     kill(
@@ -520,7 +573,7 @@ async fn physical_resource_cap_reserves_only_allowed_cpu() -> Result<(), Error> 
     let mut limited = capacity(100_000, 100_000, 16);
     limited.action_ceilings.insert("cpu_count".to_string(), 4);
     let (scheduler, worker) = make_scheduler_with_capacities(vec![limited]);
-    let mut rx = add_worker(&scheduler).await?;
+    let mut rx = add_worker_with_capacity(&scheduler, 100_000, 100_000, 16).await?;
     let _listener = add_action(&scheduler, 50_000, 1_000).await?;
     let first = next_dispatch(&mut rx).await;
     kill(
@@ -539,15 +592,17 @@ async fn physical_resource_cap_reserves_only_allowed_cpu() -> Result<(), Error> 
 
 #[nativelink_test]
 async fn eligibility_ignores_the_dimension_being_escalated() -> Result<(), Error> {
-    let (scheduler, worker) = make_scheduler();
-    let mut rx = add_worker(&scheduler).await?;
-    let _listener = add_action(&scheduler, 110_000, 1_000).await?;
+    let (scheduler, worker) = make_scheduler_with_capacities(vec![capacity(200_000, 100_000, 16)]);
+    let mut rx = add_worker_with_capacity(&scheduler, 200_000, 100_000, 16).await?;
+    let _listener = add_action(&scheduler, 150_000, 1_000).await?;
     let first = next_dispatch(&mut rx).await;
+    // The smaller worker contributes actual capacity but cannot take the retry.
+    let _small_rx = add_named_worker(&scheduler, "small_worker", 100_000, 100_000, 8, true).await?;
     kill(
         worker.as_ref(),
         &first.operation_id,
         ResourceOutcome::KilledMemory,
-        110_000,
+        150_000,
         99_000,
     )
     .await?;

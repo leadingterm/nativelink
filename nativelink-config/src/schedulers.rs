@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU64;
 
 #[cfg(feature = "dev-schema")]
 use schemars::JsonSchema;
@@ -623,15 +624,40 @@ pub struct ResourceEscalationSpec {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct ResourceCapacity {
-    /// Minimum-property capacities, including the resource and CPU properties.
+    /// Aggregate ledger capacities, including the resource and CPU properties.
     #[serde(default)]
     pub minimum: BTreeMap<String, u64>,
-    /// Per-action ceilings; absent entries use the physical minimum capacity.
+    /// Explicit per-action ceilings; absent entries use the effective capacity.
     #[serde(default)]
     pub action_ceilings: BTreeMap<String, u64>,
+    /// Ledger multiplier per property; absent entries default to one.
+    #[serde(default)]
+    pub pool_multipliers: BTreeMap<String, NonZeroU64>,
     /// Exact properties; a requested key must be present and equal.
     #[serde(default)]
     pub exact: BTreeMap<String, String>,
+}
+
+impl ResourceCapacity {
+    /// Returns the physical per-action capacity after removing ledger oversubscription.
+    pub fn physical_capacity(&self, property: &str) -> Option<u64> {
+        self.minimum.get(property).map(|minimum| {
+            let multiplier = self
+                .pool_multipliers
+                .get(property)
+                .map_or(1, |value| value.get());
+            minimum / multiplier
+        })
+    }
+
+    /// Returns physical capacity capped by any explicit operator ceiling.
+    pub fn effective_capacity(&self, property: &str) -> Option<u64> {
+        self.physical_capacity(property).map(|capacity| {
+            self.action_ceilings
+                .get(property)
+                .map_or(capacity, |ceiling| capacity.min(*ceiling))
+        })
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -796,8 +822,8 @@ pub struct HistoricalResourceSpec {
     )]
     pub refresh_interval_s: u64,
 
-    /// Headroom over the selected CPU percentile and memory and disk p95,
-    /// as a share of each measurement: 20 reserves 20% more.
+    /// Headroom over the selected CPU percentile, maximum measured memory,
+    /// and disk p95, as a share of each measurement: 20 reserves 20% more.
     /// Default: 20
     #[serde(
         default = "default_historical_resource_headroom_percent",
@@ -815,8 +841,9 @@ pub struct HistoricalResourceSpec {
 
     /// A key not measured for this many days is forgotten. Within the
     /// window, two half-window histograms retain each sample for between
-    /// half and one full window. A memory kill stops lifting the
-    /// key's reservation this many days after it.
+    /// half and one full window. A kill floor is cleared by a subsequent
+    /// completed attempt or expires this many days after the kill. Measured
+    /// memory peaks continue to shape reservations while retained.
     /// Default: 7
     #[serde(
         default = "default_historical_resource_window_days",

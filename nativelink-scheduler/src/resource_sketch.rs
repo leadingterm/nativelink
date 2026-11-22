@@ -19,8 +19,8 @@
 //! LRU families with capacities from a byte budget, and a window after which
 //! a key not seen again is forgotten. A sample counts for between half a
 //! window and a whole one (two half-window histograms per entry), so what a
-//! key used last week stops shaping it, and a kill floor expires with the
-//! window. The families are split over
+//! key used last week stops shaping it. A kill floor is cleared by a later
+//! completed attempt or expires with the window. The families are split over
 //! [`SHARDS`] by key hash so a snapshot or an age-out never holds a lock the
 //! Execute path waits on for long. Nothing on the Execute path reads a file
 //! or parses JSON; a lookup is a hash probe and a 25-bucket scan.
@@ -40,10 +40,11 @@ use parking_lot::Mutex;
 /// values under 1000, bucket `i` for `1000 * 2^(i-1) <= v < 1000 * 2^i`.
 pub const HIST_BUCKETS: usize = 25;
 
-/// Bumped by hand when the worker's sampler changes what a measurement
-/// means (the process-group fix of v1.8.2 is the example). A snapshot of
-/// another generation is dropped at load and the sketch starts empty.
-pub const SAMPLER_GENERATION: u32 = 2;
+/// Generation 3 excludes killed target attempts from mnemonic history.
+/// Generation 2 snapshots can retain their target and command entries, but
+/// their mnemonic entries cannot be separated from killed attempts.
+pub const SAMPLER_GENERATION: u32 = 3;
+const LEGACY_SAMPLER_GENERATION: u32 = 2;
 
 /// Fixed charge for an entry and its map/Arc bookkeeping. Key contents are
 /// charged separately. The allowance also covers its largest encoded form.
@@ -85,29 +86,26 @@ pub enum SketchKey {
         target: Arc<str>,
         mnemonic: Option<Arc<str>>,
     },
-    /// The client named a mnemonic and no target.
+    /// Aggregate fallback for actions sharing a mnemonic.
     Mnemonic { mnemonic: Arc<str> },
-    /// The client named neither. The `Command` digest as `hash-size`: an
+    /// The client named no target. The `Command` digest as `hash-size`: an
     /// identity every client has, and the same program with the same
     /// arguments regardless of its inputs, so one key gathers every run.
     Command { digest: Arc<str> },
 }
 
 impl SketchKey {
-    /// The key for an attempt: the target when the client sent one, else
-    /// the mnemonic, else the command digest. Empty strings count as absent.
+    /// The key for an attempt: its target, or its command digest when the
+    /// target is absent. Empty strings count as absent.
     pub fn for_attempt(target: Option<&str>, mnemonic: Option<&str>, command_digest: &str) -> Self {
         let target = target.filter(|s| !s.is_empty());
         let mnemonic = mnemonic.filter(|s| !s.is_empty());
-        match (target, mnemonic) {
-            (Some(target), mnemonic) => Self::Target {
+        match target {
+            Some(target) => Self::Target {
                 target: Arc::from(target),
                 mnemonic: mnemonic.map(Arc::from),
             },
-            (None, Some(mnemonic)) => Self::Mnemonic {
-                mnemonic: Arc::from(mnemonic),
-            },
-            (None, None) => Self::Command {
+            None => Self::Command {
                 digest: Arc::from(command_digest),
             },
         }
@@ -266,6 +264,8 @@ pub struct Observation {
     pub killed_peak_disk_kb: Option<u64>,
     /// Any kill, for the probation rule.
     pub killed: bool,
+    /// Whether the attempt completed, as opposed to an unknown outcome.
+    pub completed: bool,
     pub now_s: u64,
 }
 
@@ -515,11 +515,14 @@ impl ResourceSketch {
     /// Records one attempt. A command key with no entry yet earns one on a
     /// kill or on its second sighting: a digest that ran once and was not
     /// killed is an action-cache hit next time, so a first sighting only
-    /// goes on probation. An attempt that names a target and a mnemonic is
-    /// recorded under both its target key and the mnemonic family, so a
-    /// target the sketch has not seen is sized from its kind of action
-    /// rather than the cold start. Returns whether a sample was recorded.
+    /// goes on probation. A non-killed attempt naming a target and mnemonic
+    /// teaches both; a killed attempt teaches only its target, so it cannot
+    /// inflate the fallback for unrelated targets. Returns whether a sample
+    /// was recorded.
     pub fn observe(&self, key: SketchKey, observation: &Observation) -> bool {
+        if observation.killed && key.family() == Family::Mnemonic {
+            return false;
+        }
         let mnemonic = match &key {
             SketchKey::Target {
                 mnemonic: Some(mnemonic),
@@ -528,7 +531,10 @@ impl ResourceSketch {
             _ => None,
         };
         let recorded = self.observe_one(key, observation);
-        if recorded && let Some(mnemonic) = mnemonic {
+        if recorded
+            && !observation.killed
+            && let Some(mnemonic) = mnemonic
+        {
             self.observe_one(SketchKey::Mnemonic { mnemonic }, observation);
         }
         recorded
@@ -731,9 +737,10 @@ impl ResourceSketch {
 
     /// Restore a replica's snapshot at startup. Existing entries are left
     /// alone, making replay idempotent and preserving newer local observations.
-    /// Skip expired keys and refuse an incompatible sampler generation.
+    /// Skip expired keys. Generation 2 restores only target and command
+    /// entries because its mnemonic history may contain killed attempts.
     pub fn load(&self, snapshot: Snapshot, now_s: u64) -> Result<usize, Error> {
-        if snapshot.sampler_generation != SAMPLER_GENERATION {
+        if !compatible_generation(snapshot.sampler_generation) {
             return Err(make_err!(
                 Code::FailedPrecondition,
                 "resource sketch snapshot is of sampler generation {}, this build is {}",
@@ -744,6 +751,11 @@ impl ResourceSketch {
         let cutoff = now_s.saturating_sub(self.window_s());
         let mut loaded = 0usize;
         for (key, entry) in snapshot.entries {
+            if snapshot.sampler_generation == LEGACY_SAMPLER_GENERATION
+                && key.family() == Family::Mnemonic
+            {
+                continue;
+            }
             if !entry.seeded && entry.last_seen_s < cutoff {
                 continue;
             }
@@ -840,8 +852,8 @@ impl Entry {
     /// turns at once clear both. So a sample counts for between half a
     /// window and a whole one, and a rarely seen key keeps its last few
     /// samples that long and no longer. The kill floor expires a window
-    /// after the kill. A seed is left as it is: it stands until its first
-    /// sample.
+    /// after the kill, or is cleared by a later completed attempt. A seed
+    /// is left as it is: it stands until its first sample.
     pub fn settle(&mut self, now_s: u64, window_s: u64) {
         if self.seeded {
             return;
@@ -890,6 +902,12 @@ impl Entry {
         if observation.peak_disk_kb > 0 {
             half.disk.add(observation.peak_disk_kb);
             half.max_disk_kb = half.max_disk_kb.max(observation.peak_disk_kb);
+        }
+        if observation.completed && !observation.killed {
+            self.killed_peak_memory_kb = 0;
+            self.killed_memory_s = 0;
+            self.killed_peak_disk_kb = 0;
+            self.killed_disk_s = 0;
         }
         if let Some(peak) = observation.killed_peak_memory_kb
             && peak > 0
@@ -953,6 +971,33 @@ fn with_headroom(value: u64, headroom_percent: u64) -> u64 {
     u64::try_from(product.div_ceil(100)).unwrap_or(u64::MAX)
 }
 
+#[derive(Clone, Copy)]
+enum Statistic {
+    Percentile(CpuReservationPercentile),
+    Maximum,
+}
+
+fn shape_dimension(
+    current: &Hist,
+    previous: &Hist,
+    maximum: u64,
+    killed_peak: u64,
+    enabled: bool,
+    headroom: u64,
+    statistic: Statistic,
+) -> u64 {
+    if !enabled {
+        return 0;
+    }
+    let value = match statistic {
+        Statistic::Percentile(percentile) => {
+            percentile_capped(current.percentile_upper_with(previous, percentile), maximum)
+        }
+        Statistic::Maximum => maximum,
+    };
+    with_headroom(value.max(killed_peak), headroom)
+}
+
 /// The first class that holds the shaped dimensions.
 fn smallest_dominating_class(
     classes: &[SizeClassSpec],
@@ -978,48 +1023,41 @@ fn smallest_dominating_class(
 
 fn shape(policy: &Policy, entry: &Entry) -> Shaped {
     let headroom = policy.headroom_percent;
-    let mut memory_kb = with_headroom(
-        percentile_capped(entry.memory_p95_upper(), entry.max_memory_kb()),
+    // An unreserved dimension is dropped before deciding whether a hint exists.
+    let mut memory_kb = shape_dimension(
+        &entry.current.memory,
+        &entry.previous.memory,
+        entry.max_memory_kb(),
+        entry.killed_peak_memory_kb,
+        policy.reserve_memory,
         headroom,
+        Statistic::Maximum,
     );
-    memory_kb = memory_kb.max(with_headroom(entry.killed_peak_memory_kb, headroom));
-    // A zero or missing CPU measurement must not impose a CPU minimum.
-    let mut cpu = with_headroom(
-        percentile_capped(
-            entry
-                .current
-                .cpu
-                .percentile_upper_with(&entry.previous.cpu, policy.cpu_reservation_percentile),
-            entry.max_cpu_millicores(),
-        ),
+    let mut cpu = shape_dimension(
+        &entry.current.cpu,
+        &entry.previous.cpu,
+        entry.max_cpu_millicores(),
+        0,
+        policy.reserve_cpu,
         headroom,
+        Statistic::Percentile(policy.cpu_reservation_percentile),
     );
-    let mut disk_kb = with_headroom(
-        percentile_capped(entry.disk_p95_upper(), entry.max_disk_kb()),
+    let mut disk_kb = shape_dimension(
+        &entry.current.disk,
+        &entry.previous.disk,
+        entry.max_disk_kb(),
+        entry.killed_peak_disk_kb,
+        policy.reserve_disk,
         headroom,
+        Statistic::Percentile(CpuReservationPercentile::P95),
     );
-    disk_kb = disk_kb.max(with_headroom(entry.killed_peak_disk_kb, headroom));
-    // A number on a dimension the fleet does not reserve says nothing about
-    // the ones it does, so it is dropped before anything is decided from
-    // it: a disk-only measurement is no measurement, and the cold start
-    // applies, rather than the smallest class.
-    if !policy.reserve_cpu {
-        cpu = 0;
-    }
-    if !policy.reserve_memory {
-        memory_kb = 0;
-    }
-    if !policy.reserve_disk {
-        disk_kb = 0;
-    }
     if memory_kb == 0 && cpu == 0 && disk_kb == 0 {
         return Shaped::default();
     }
     let mut class = None;
     let found = smallest_dominating_class(&policy.classes, memory_kb, cpu, disk_kb).or_else(|| {
         policy.classes.last().filter(|top| {
-            (!policy.reserve_memory
-                || top.memory_kb >= with_headroom(entry.killed_peak_memory_kb, headroom))
+            (!policy.reserve_memory || top.memory_kb >= memory_kb)
                 && (!policy.reserve_disk
                     || top.disk_kb >= with_headroom(entry.killed_peak_disk_kb, headroom))
         })
@@ -1057,6 +1095,10 @@ pub struct Snapshot {
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"NLHS";
 const SNAPSHOT_VERSION: u8 = 3;
+
+const fn compatible_generation(generation: u32) -> bool {
+    generation == SAMPLER_GENERATION || generation == LEGACY_SAMPLER_GENERATION
+}
 
 impl Snapshot {
     /// A compact binary form: histograms as their non-zero buckets, since
@@ -1103,7 +1145,7 @@ impl Snapshot {
     /// and sampler. Discovery never needs to allocate full histogram entries.
     pub fn compatible_written_at(bytes: &[u8]) -> Result<u64, Error> {
         let (generation, written_at) = Self::read_header(&mut Reader { bytes, at: 0 })?;
-        if generation != SAMPLER_GENERATION {
+        if !compatible_generation(generation) {
             return Err(make_err!(
                 Code::FailedPrecondition,
                 "resource sketch snapshot: incompatible sampler generation {generation}"

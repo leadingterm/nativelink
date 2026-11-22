@@ -40,7 +40,7 @@ use nativelink_scheduler::resource_sketch::{Observation, SketchKey};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
 use nativelink_store::store_manager::StoreManager;
-use nativelink_util::action_messages::{ActionStage, ActionState, OperationId};
+use nativelink_util::action_messages::{ActionStage, ActionState, MemoryReservation, OperationId};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::operation_state_manager::ClientStateManager;
 use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_to_baggage};
@@ -205,9 +205,8 @@ async fn an_action_digest_only_hint_seeds_nothing() -> Result<(), Error> {
     Ok(())
 }
 
-/// What the workers report is what sizes the next run: an attempt observed
-/// twice is reserved its measured p95 with the headroom, and the seed it
-/// replaced is gone.
+/// What the workers report is what sizes the next run: the measured maximum
+/// gets headroom, and the seed it replaced is gone.
 #[nativelink_test]
 async fn a_measured_action_is_sized_from_its_own_samples() -> Result<(), Error> {
     let hints_file = write_hints_file(
@@ -248,10 +247,79 @@ async fn a_measured_action_is_sized_from_its_own_samples() -> Result<(), Error> 
         Some(("//pkg:t", "Genrule")),
     )
     .await?;
-    // The p95 bucket of 3.5M KiB is [2M, 4M), capped by the exact maximum,
-    // plus 20 percent.
+    // The exact 3.5M KiB maximum plus 20 percent.
     assert_eq!(properties["memory_kb"], "4200000");
     assert_eq!(properties["cpu_count"], "1440");
+    drop(fs::remove_file(hints_file));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn measured_peak_is_forwarded_as_a_trusted_fit_floor() -> Result<(), Error> {
+    let hints_file = write_hints_file("[]");
+    let mut spec = base_spec(hints_file.clone(), None);
+    spec.headroom_percent = 20;
+    let (mock_scheduler, scheduler) = make_scheduler_with_spec(&spec);
+    let key = SketchKey::for_attempt(Some("//pkg:floor"), Some("Compile"), "unused");
+    scheduler.sketch().observe(
+        key,
+        &Observation {
+            peak_memory_kb: 8_000,
+            now_s: now_s(),
+            ..Observation::default()
+        },
+    );
+    scheduler.sketch().seed(
+        SketchKey::for_attempt(Some("//pkg:seed"), Some("Seed"), "unused"),
+        nativelink_scheduler::resource_sketch::Entry::seeded(0, 5_000, 0, 1, now_s()),
+    );
+    for (client_floor, target, mnemonic, expected_floor) in [
+        (None, "//pkg:floor", "Compile", Some(8_000)),
+        (Some(1_000), "//pkg:floor", "Compile", Some(8_000)),
+        (Some(9_000), "//pkg:floor", "Compile", Some(8_000)),
+        (Some(9_000), "//pkg:seed", "Seed", None),
+        (Some(9_000), "//pkg:cold", "Cold", None),
+    ] {
+        let mut action = (*make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest())).clone();
+        action.memory_reservation = client_floor.map(|minimum| MemoryReservation {
+            minimum_kb: Some(minimum),
+            desired_kb: Some(9_000),
+            cpu_before_memory_fit: None,
+            fitted_revision: None,
+        });
+        let action = Arc::new(action);
+        let operation = OperationId::default();
+        let (_tx, rx) = watch::channel(Arc::new(ActionState {
+            client_operation_id: OperationId::default(),
+            stage: ActionStage::Queued,
+            action_digest: action.unique_qualifier.digest(),
+            last_transition_timestamp: SystemTime::now(),
+        }));
+        let context = Context::current_with_baggage(vec![KeyValue::new(
+            BAZEL_METADATA_KEY,
+            request_metadata_to_baggage(&RequestMetadata {
+                target_id: target.to_string(),
+                action_mnemonic: mnemonic.to_string(),
+                ..Default::default()
+            }),
+        )]);
+        let (_, (_, passed)) = join!(
+            scheduler
+                .add_action(operation.clone(), action.clone())
+                .with_context(context),
+            mock_scheduler.expect_add_action(Ok(Box::new(TokioWatchActionStateResult::new(
+                operation, action, rx,
+            )))),
+        );
+        if let Some(expected) = expected_floor {
+            assert_eq!(passed.platform_properties["memory_kb"], "9600");
+            let intent = passed.memory_reservation.unwrap();
+            assert_eq!(intent.minimum_kb, Some(expected));
+            assert_eq!(intent.desired_kb, Some(9_600));
+        } else {
+            assert_eq!(passed.memory_reservation, None);
+        }
+    }
     drop(fs::remove_file(hints_file));
     Ok(())
 }
@@ -283,8 +351,7 @@ async fn a_new_target_is_sized_from_its_mnemonic() -> Result<(), Error> {
         Some(("//lib:never-seen", "Javac")),
     )
     .await?;
-    // The p95 bucket of the two Javac samples is [2M, 4M), capped by the
-    // exact maximum.
+    // The mnemonic fallback retains the exact measured maximum.
     assert_eq!(properties["memory_kb"], "3000000");
     drop(fs::remove_file(hints_file));
     Ok(())
