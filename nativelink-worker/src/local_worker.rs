@@ -88,6 +88,31 @@ impl Drop for ActionsInTransitGuard {
     }
 }
 
+/// Tracks post-response background cleanups so single-use exit and graceful
+/// shutdown drain wait for directory removal even after `execution_response`
+/// has already freed the action slot.
+struct CleanupInFlightGuard {
+    cleanups_in_flight: Arc<AtomicU64>,
+    actions_notify: Arc<tokio::sync::Notify>,
+}
+
+impl CleanupInFlightGuard {
+    fn new(cleanups_in_flight: Arc<AtomicU64>, actions_notify: Arc<tokio::sync::Notify>) -> Self {
+        cleanups_in_flight.fetch_add(1, Ordering::Release);
+        Self {
+            cleanups_in_flight,
+            actions_notify,
+        }
+    }
+}
+
+impl Drop for CleanupInFlightGuard {
+    fn drop(&mut self) {
+        self.cleanups_in_flight.fetch_sub(1, Ordering::Release);
+        self.actions_notify.notify_waiters();
+    }
+}
+
 /// If we lose connection to the worker api server we will wait this many seconds
 /// before trying to connect, doubling on every failed attempt up to
 /// `CONNECTION_RETRY_MAX_DELAY_S`, with jitter so a fleet that lost its
@@ -674,6 +699,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // A counter of actions that are in-flight, this is similar to actions_in_transit but
         // includes the AC upload and notification to the scheduler.
         let actions_in_flight = Arc::new(AtomicU64::new(0));
+        // A counter of post-response cleanups running off the critical path.
+        let cleanups_in_flight = Arc::new(AtomicU64::new(0));
         // Set to true when shutting down, this stops any new StartAction.
         let mut shutting_down = false;
 
@@ -681,6 +708,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             if self.config.single_use
                 && self.accepted_action.load(Ordering::Acquire)
                 && actions_in_flight.load(Ordering::Acquire) == 0
+                && cleanups_in_flight.load(Ordering::Acquire) == 0
             {
                 // The action, CAS/AC uploads, cleanup, and execution_response
                 // acknowledgment have all completed. This container is spent.
@@ -887,7 +915,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     resource_usage,
                                                 })
                                             })
-                                            // Cleanup must run even if an earlier step failed.
+                                            // Recover classified-kill outcomes on transfer error,
+                                            // and mark cleanup pending before publishing so any
+                                            // immediate retry reusing this operation_id waits for
+                                            // post-response cleanup instead of seeing AlreadyExists.
                                             .then(|result| async move {
                                                 let result = match result {
                                                     Err(err) => {
@@ -909,22 +940,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     }
                                                     ok => ok,
                                                 };
-                                                resources.cleanup_started.store(true, Ordering::Release);
-                                                // Cancellation drops only the waiter; expiry
-                                                // joins the same cleanup through its completion ack.
-                                                let cleanup_resources = resources.clone();
-                                                let cleanup = background_spawn!("action_cleanup", async move {
-                                                    let result = action.cleanup().await;
-                                                    cleanup_resources.cleanup_finished.notify_one();
-                                                    result
-                                                });
-                                                if let Err(e) = cleanup.await.err_tip(|| "Could not join action cleanup").and_then(|result| result) {
-                                                    if result.as_ref().is_ok_and(|finished| is_killed(finished.resource_usage.as_ref())) {
-                                                        warn!(?e, "Action cleanup failed after a classified kill");
-                                                    } else {
-                                                        return Result::<FinishedActionResult, Error>::Err(e).merge(result);
-                                                    }
-                                                }
+                                                action.mark_cleanup_pending();
                                                 result
                                             })
                                     }).await
@@ -1000,10 +1016,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                 }
                             };
 
-                            // A single deadline includes the ack, setup, execution, cleanup,
+                            // A single deadline includes the ack, setup, execution,
                             // cache write, and final stream publication. It is never restarted
-                            // after an acknowledgement or a phase transition.
+                            // after an acknowledgement or a phase transition. Post-response
+                            // cleanup runs after publication so directory removal stays off
+                            // the critical path.
                             let actions_in_flight = actions_in_flight.clone();
+                            let cleanups_in_flight = cleanups_in_flight.clone();
                             let actions_notify = actions_notify.clone();
                             let running_operations_done = running_operations.clone();
                             let tracked_done = tracked_operation_id.clone();
@@ -1024,7 +1043,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             futures.push(async move {
                                 let result = async {
                                     if run_attempt(manager, attempt_operation_id, attempt_deadline,
-                                        resources, digest_hasher, normal_attempt).await?
+                                        resources.clone(), digest_hasher, normal_attempt).await?
                                     {
                                         // Expiry is terminal, never the InternalError retry path.
                                         // This is the expiry notification, not more attempt work.
@@ -1034,9 +1053,49 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     }
                                     Ok(())
                                 }.await;
+                                let cleanup_action = resources
+                                    .action
+                                    .lock()
+                                    .take()
+                                    .filter(|_| !resources.cleanup_started.swap(true, Ordering::AcqRel));
+                                // Arm the cleanup-in-flight count before freeing the action slot
+                                // so single-use exit and shutdown drain never observe both at 0
+                                // before post-response cleanup finishes.
+                                let cleanup_guard = cleanup_action.as_ref().map(|_| {
+                                    CleanupInFlightGuard::new(
+                                        cleanups_in_flight,
+                                        actions_notify.clone(),
+                                    )
+                                });
                                 running_operations_done.lock().remove(&tracked_done);
                                 actions_in_flight.fetch_sub(1, Ordering::Release);
-                                actions_notify.notify_one();
+                                actions_notify.notify_waiters();
+                                if let (Some(action), Some(cleanup_guard)) =
+                                    (cleanup_action, cleanup_guard)
+                                {
+                                    action.mark_cleanup_pending();
+                                    let cleanup_resources = resources.clone();
+                                    let cleanup_operation_id = tracked_done;
+                                    let cleanup_task = background_spawn!("action_cleanup", async move {
+                                        let _guard = cleanup_guard;
+                                        if let Err(err) = action.cleanup().await {
+                                            warn!(
+                                                ?err,
+                                                operation_id = %cleanup_operation_id,
+                                                "Post-response action cleanup failed"
+                                            );
+                                        }
+                                        cleanup_resources.cleanup_finished.notify_one();
+                                    });
+                                    // On normal completion, wait inside this FuturesUnordered entry
+                                    // (without blocking other actions or stream reads) so single-use
+                                    // workers wake and exit as soon as cleanup finishes. On a stream
+                                    // error, return immediately to reconnect while background cleanup
+                                    // finishes (awaited by `kill_all`).
+                                    if result.is_ok() {
+                                        drop(cleanup_task.await);
+                                    }
+                                }
                                 result
                             }.boxed());
                         }
@@ -1049,6 +1108,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     let shutdown_guard = complete_msg.map_err(|e|
                         Error::from_std_err(Code::Internal, &e).append("Failed to receive shutdown message"))?;
                     let actions_in_flight = actions_in_flight.clone();
+                    let cleanups_in_flight = cleanups_in_flight.clone();
                     let actions_notify = actions_notify.clone();
                     let drain_on_shutdown = self.config.drain_on_shutdown;
                     // The GoingAway messages below are bounded: a stalled
@@ -1073,17 +1133,26 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         } else {
                             Ok(())
                         };
-                        // Wait for in-flight operations to be fully completed,
-                        // for as long as one action is allowed to run.
+                        // Wait for in-flight operations and post-response cleanups to
+                        // be fully completed, for as long as one action is allowed to run.
                         let wait = async {
-                            while actions_in_flight.load(Ordering::Acquire) > 0 {
-                                actions_notify.notified().await;
+                            loop {
+                                let notified = actions_notify.notified();
+                                tokio::pin!(notified);
+                                notified.as_mut().enable();
+                                if actions_in_flight.load(Ordering::Acquire) == 0
+                                    && cleanups_in_flight.load(Ordering::Acquire) == 0
+                                {
+                                    break;
+                                }
+                                notified.await;
                             }
                         };
                         if time::timeout(drain_deadline, wait).await.is_err() {
                             error!(
                                 actions_in_flight = actions_in_flight.load(Ordering::Acquire),
-                                "Drain deadline passed with actions still in flight; shutting down anyway"
+                                cleanups_in_flight = cleanups_in_flight.load(Ordering::Acquire),
+                                "Drain deadline passed with actions or cleanups still in flight; shutting down anyway"
                             );
                         }
                         if !drain_on_shutdown {

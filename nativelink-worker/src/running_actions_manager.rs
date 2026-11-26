@@ -2782,6 +2782,11 @@ pub trait RunningAction: Sync + Send + Sized + Unpin + 'static {
     /// Cleanup any residual files, handles or other junk resulting from running the action.
     fn cleanup(self: Arc<Self>) -> impl Future<Output = Result<Arc<Self>, Error>> + Send;
 
+    /// Marks that execution and result collection are done and cleanup will run
+    /// after the response is published, so a retry reusing the same operation id
+    /// waits for cleanup rather than failing with `AlreadyExists`.
+    fn mark_cleanup_pending(&self) {}
+
     /// Returns the final result. As a general rule this action should be thought of as
     /// a consumption of `self`, meaning once a return happens here the lifetime of `Self`
     /// is over and any action performed on it after this call is undefined behavior.
@@ -3012,6 +3017,7 @@ pub struct RunningActionImpl {
     kill_token: watch::Sender<bool>,
     state: Mutex<RunningActionImplState>,
     has_manager_entry: AtomicBool,
+    cleanup_pending: AtomicBool,
     did_cleanup: AtomicBool,
     /// The sampler's latest memory figure and the pressure monitor's kill
     /// request; see [`ActionMemoryWatch`].
@@ -3019,6 +3025,11 @@ pub struct RunningActionImpl {
 }
 
 impl RunningActionImpl {
+    /// Whether this action has finished executing and is waiting on or running
+    /// its post-response cleanup.
+    pub fn is_cleanup_pending(&self) -> bool {
+        self.cleanup_pending.load(Ordering::Acquire)
+    }
     /// The memory the sampler last saw this action hold, 0 before a sample.
     pub fn last_memory_kb(&self) -> u64 {
         self.memory_watch.last_memory_kb()
@@ -3089,6 +3100,7 @@ impl RunningActionImpl {
             // The constructor can fail the operation-id uniqueness check
             // immediately after this object is created.
             has_manager_entry: AtomicBool::new(false),
+            cleanup_pending: AtomicBool::new(false),
             // The action directory already exists before registration.
             did_cleanup: AtomicBool::new(false),
             memory_watch: Arc::new(ActionMemoryWatch::default()),
@@ -5364,6 +5376,10 @@ impl RunningAction for RunningActionImpl {
         res
     }
 
+    fn mark_cleanup_pending(&self) {
+        self.cleanup_pending.store(true, Ordering::Release);
+    }
+
     async fn get_finished_result(self: Arc<Self>) -> Result<ActionResult, Error> {
         self.metrics()
             .clone()
@@ -6212,18 +6228,51 @@ impl RunningActionsManagerImpl {
         let mut has_waited = false;
 
         loop {
+            // Arm the waiter before checking running/cleanup state so a
+            // completion in between cannot lose the wakeup.
+            let notified = self.cleanup_complete_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let pending_cleanup = {
+                let running_actions = self.running_actions.lock();
+                if let Some(existing) = running_actions.get(operation_id).and_then(Weak::upgrade) {
+                    if existing.is_cleanup_pending() {
+                        true
+                    } else {
+                        return Err(make_err!(
+                            Code::AlreadyExists,
+                            "Action with operation_id {} is already running",
+                            operation_id
+                        ));
+                    }
+                } else {
+                    false
+                }
+            };
+
             // The mark is held for the removal below, so it cannot race the
             // orphan sweep's removal of the same tree; while someone else
-            // holds it, this waits.
-            let mark = self.perform_cleanup(operation_id.clone());
-            if let Some(_cleaning_guard) = mark {
-                let action_is_running = self
+            // holds it, or while a post-response cleanup is pending for this
+            // operation, this waits without taking the mark out from under
+            // `do_cleanup`.
+            let mark = if pending_cleanup {
+                None
+            } else {
+                self.perform_cleanup(operation_id.clone())
+            };
+            if let Some(cleaning_guard) = mark {
+                let existing = self
                     .running_actions
                     .lock()
                     .get(operation_id)
-                    .and_then(Weak::upgrade)
-                    .is_some();
-                if action_is_running {
+                    .and_then(Weak::upgrade);
+                if let Some(existing) = existing {
+                    if existing.is_cleanup_pending() {
+                        // Release the mark immediately so `do_cleanup` can take it.
+                        drop(cleaning_guard);
+                        continue;
+                    }
                     return Err(make_err!(
                         Code::AlreadyExists,
                         "Action with operation_id {} is already running",
@@ -6328,7 +6377,7 @@ impl RunningActionsManagerImpl {
             );
 
             tokio::select! {
-                () = self.cleanup_complete_notify.notified() => {},
+                () = notified => {},
                 () = tokio::time::sleep(backoff) => {
                     // Exponential backoff
                     backoff = (backoff * 2).min(self.max_cleanup_backoff);
@@ -6623,6 +6672,7 @@ impl RunningActionsManagerImpl {
         self.disk_reservations_kb.lock().remove(operation_id);
         // No need to copy anything, we just are telling the receivers an event happened.
         self.action_done_tx.send_modify(|()| {});
+        self.cleanup_complete_notify.notify_waiters();
         result.map(|_| ())
     }
 
@@ -6808,6 +6858,7 @@ pub async fn memory_pressure_monitor_with(
             .lock()
             .values()
             .filter_map(Weak::upgrade)
+            .filter(|action| !action.is_cleanup_pending())
             .collect();
         let Some(victim) = pick_pressure_victim(running.iter().map(|action| PressureCandidate {
             item: action,
@@ -6917,6 +6968,7 @@ async fn disk_pressure_monitor(manager: Weak<RunningActionsManagerImpl>, policy:
             .lock()
             .values()
             .filter_map(Weak::upgrade)
+            .filter(|action| !action.is_cleanup_pending())
             .collect();
         let Some(victim) = pick_pressure_victim(running.iter().map(|action| PressureCandidate {
             item: action,

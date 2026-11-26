@@ -7116,6 +7116,79 @@ exit 0
         Ok(())
     }
 
+    /// Reusing an `operation_id` while a finished action is awaiting or running
+    /// post-response cleanup waits for cleanup to finish instead of failing with
+    /// `AlreadyExists` or racing the directory removal, while an actively running
+    /// action still rejects duplicate registration with `AlreadyExists`.
+    #[nativelink_test]
+    async fn reused_directory_waits_for_post_response_cleanup_before_recreating()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let (running_actions_manager, store) =
+            manager_for_cleanup_tests(&root_action_directory).await?;
+        let action_digest = empty_action_digest(&store).await?;
+        let operation_id = OperationId::default();
+
+        let first = running_actions_manager
+            .create_and_add_action(
+                "test-worker".to_string(),
+                start_execute_with(action_digest, &operation_id),
+            )
+            .await?;
+        let action_dir = format!("{root_action_directory}/{operation_id}");
+        let stale_marker = format!("{action_dir}/stale-from-first");
+        tokio::fs::write(&stale_marker, b"old").await?;
+
+        // While the first action is actively running, reusing the same
+        // operation_id must still fail closed with AlreadyExists.
+        let active_dup = running_actions_manager
+            .create_and_add_action(
+                "test-worker".to_string(),
+                start_execute_with(action_digest, &operation_id),
+            )
+            .await
+            .expect_err("actively running action must reject duplicate operation_id");
+        assert_eq!(active_dup.code, Code::AlreadyExists);
+
+        // Once the first action has published its response and marked cleanup
+        // pending, a second action reusing the same directory must wait for
+        // cleanup to complete before recreating the directory.
+        first.mark_cleanup_pending();
+        let manager = running_actions_manager.clone();
+        let start_execute = start_execute_with(action_digest, &operation_id);
+        let mut reused = tokio::spawn(async move {
+            manager
+                .create_and_add_action("test-worker".to_string(), start_execute)
+                .await
+        });
+        tokio::select! {
+            res = &mut reused => panic!("reused directory did not wait for pending cleanup: {res:?}"),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        assert!(
+            Path::new(&stale_marker).exists(),
+            "first action directory must remain untouched until cleanup runs"
+        );
+
+        // Complete the first action's post-response cleanup; the waiting retry
+        // must immediately proceed and create a fresh directory.
+        first.cleanup().await?;
+        let second = tokio::time::timeout(Duration::from_secs(5), reused)
+            .await
+            .expect("reused directory did not unblock after cleanup")??;
+        assert!(
+            Path::new(&action_dir).exists(),
+            "reused directory must be recreated"
+        );
+        assert!(
+            !Path::new(&stale_marker).exists(),
+            "stale files from the first action must be gone"
+        );
+        second.cleanup().await?;
+        Ok(())
+    }
+
     /// that has settled is removed by the sweep; a running action's is kept.
     #[nativelink_test]
     async fn orphan_sweep_removes_settled_unowned_directories()

@@ -286,9 +286,7 @@ impl MockRunningAction {
         self.expect_prepare_action(Ok(())).await?;
         self.expect_execute(Ok(())).await?;
         self.upload_results(Ok(())).await?;
-        let result = self.get_finished_result(result).await;
-        self.cleanup(Ok(())).await?;
-        result
+        self.get_finished_result(result).await
     }
 
     pub(crate) async fn expect_prepare_action(

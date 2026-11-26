@@ -419,7 +419,7 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
         .await;
 
     // Now the RunningAction needs to send a series of state updates. This shortcuts them
-    // into a single call (shortcut for prepare, execute, upload, collect_results, cleanup).
+    // into a single call (shortcut for prepare, execute, upload, collect_results).
     running_action
         .simple_expect_get_finished_result(Ok(ActionResult::default()))
         .await?;
@@ -430,6 +430,9 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
         .expect_cache_action_result()
         .await;
     assert_eq!(digest_hasher, DigestHasherFunc::Blake3);
+
+    test_context.client.expect_execution_response(Ok(())).await;
+    running_action.cleanup(Ok(())).await?;
 
     Ok(())
 }
@@ -591,7 +594,7 @@ async fn start_action_lifecycle_test(single_use: bool) -> Result<(), Error> {
     }
 
     // Now the RunningAction needs to send a series of state updates. This shortcuts them
-    // into a single call (shortcut for prepare, execute, upload, collect_results, cleanup).
+    // into a single call (shortcut for prepare, execute, upload, collect_results).
     running_action
         .simple_expect_get_finished_result(Ok(action_result.clone()))
         .await?;
@@ -631,6 +634,9 @@ async fn start_action_lifecycle_test(single_use: bool) -> Result<(), Error> {
             resource_usage: None,
         }
     );
+
+    // Cleanup runs after the response has been sent.
+    running_action.cleanup(Ok(())).await?;
 
     if single_use {
         let going_away = test_context.client.going_away_count.clone();
@@ -752,12 +758,6 @@ async fn upload_failure_response_test(killed: bool, cleanup_fails: bool) -> Resu
             .get_finished_result(Ok(action_result.clone()))
             .await?;
     }
-    let cleanup = if cleanup_fails {
-        Err(make_err!(Code::Internal, "cleanup failed"))
-    } else {
-        Ok(())
-    };
-    running_action.cleanup(cleanup).await?;
 
     if killed {
         let (stored_digest, stored_result, _) = test_context
@@ -768,6 +768,12 @@ async fn upload_failure_response_test(killed: bool, cleanup_fails: bool) -> Resu
         assert_eq!(stored_result, action_result);
     }
     let response = test_context.client.expect_execution_response(Ok(())).await;
+    let cleanup = if cleanup_fails {
+        Err(make_err!(Code::Internal, "cleanup failed"))
+    } else {
+        Ok(())
+    };
+    running_action.cleanup(cleanup).await?;
     if killed {
         assert_eq!(
             response.result,
@@ -1244,12 +1250,12 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
         .expect_prepare_action(Err(missing_input.clone()))
         .await?;
 
-    // Cleanup is still called even when prepare_action fails.
-    running_action.cleanup(Ok(())).await?;
-
     // The worker should respond with FailedPrecondition wrapped in an ExecuteResponse,
     // NOT an InternalError. This allows Bazel to re-upload the missing artifacts.
     let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+
+    // Cleanup still runs after the failure response is delivered.
+    running_action.cleanup(Ok(())).await?;
 
     // The digest rides along as context, which the execute response turns
     // into the PreconditionFailure detail Bazel re-uploads on.
@@ -1371,11 +1377,11 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
         .expect_prepare_action(Err(other_not_found_error.clone()))
         .await?;
 
-    // Cleanup is still called even when prepare_action fails.
-    running_action.cleanup(Ok(())).await?;
-
     // The worker should respond with InternalError since this is not a CAS blob miss.
     let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+
+    // Cleanup still runs after the failure response is delivered.
+    running_action.cleanup(Ok(())).await?;
 
     assert_eq!(
         execution_response,
@@ -2302,5 +2308,235 @@ async fn registration_flag_follows_the_scheduler_connection() -> Result<(), Erro
         }
         other => panic!("a lost registration must read Initializing, got {other:?}"),
     }
+    Ok(())
+}
+
+/// Action cleanup runs off the critical path: the worker caches the result and
+/// sends `execution_response` to the scheduler before `action.cleanup()`
+/// completes, then still runs cleanup to completion in the background.
+#[nativelink_test]
+async fn execution_response_is_sent_before_cleanup_completes() -> Result<(), Error> {
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+    test_context
+        .client
+        .expect_connect_worker(Ok(streaming_response))
+        .await;
+
+    let worker_id = "foobar".to_string();
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::ConnectionResult(ConnectionResult {
+                    worker_id: worker_id.clone(),
+                    dispatch_ack: false,
+                    memory_property: String::new(),
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    let action_digest = DigestInfo::new([7u8; 32], 12);
+    let action_info = ActionInfo {
+        memory_reservation: None,
+        pre_fit_reservation: None,
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(5),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            execution_scope: None,
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::StartAction(StartExecute {
+                    request_metadata: None,
+                    execute_request: Some((&action_info).into()),
+                    operation_id: "op-async-cleanup".to_string(),
+                    queued_timestamp: None,
+                    platform: Some(Platform::default()),
+                    worker_id,
+                    attempt_deadline: None,
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    let running_action = Arc::new(MockRunningAction::new());
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+    running_action.expect_prepare_action(Ok(())).await?;
+    running_action.expect_execute(Ok(())).await?;
+    running_action.upload_results(Ok(())).await?;
+    let expected_result = ActionResult {
+        exit_code: 0,
+        ..Default::default()
+    };
+    running_action
+        .get_finished_result(Ok(expected_result.clone()))
+        .await?;
+
+    // Do NOT answer `running_action.cleanup(...)` yet. Caching and
+    // `execution_response` must complete while cleanup has not finished.
+    let (stored_digest, stored_result, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        test_context.actions_manager.expect_cache_action_result(),
+    )
+    .await
+    .map_err(|_| make_input_err!("cache_action_result blocked on action.cleanup()"))?;
+    assert_eq!(stored_digest, action_digest);
+    assert_eq!(stored_result, expected_result);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        test_context.client.expect_execution_response(Ok(())),
+    )
+    .await
+    .map_err(|_| make_input_err!("execution_response blocked on action.cleanup()"))?;
+    assert_eq!(response.operation_id, "op-async-cleanup");
+    assert_eq!(
+        response.result,
+        Some(execute_result::Result::ExecuteResponse(
+            ActionStage::Completed(expected_result).into()
+        ))
+    );
+
+    // Cleanup still runs after the response has been delivered.
+    tokio::time::timeout(Duration::from_secs(2), running_action.cleanup(Ok(())))
+        .await
+        .map_err(|_| make_input_err!("post-response action.cleanup() was never invoked"))??;
+    Ok(())
+}
+
+/// A single-use worker still delivers `execution_response` before cleanup
+/// completes, and does not exit until that post-response cleanup finishes.
+#[nativelink_test]
+async fn single_use_worker_waits_for_post_response_cleanup_before_exit() -> Result<(), Error> {
+    let mut test_context = setup_local_worker_with_config(LocalWorkerConfig {
+        single_use: true,
+        worker_api_endpoint: EndpointConfig {
+            timeout: Some(10000.),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+    test_context
+        .client
+        .expect_connect_worker(Ok(streaming_response))
+        .await;
+
+    let worker_id = "foobar".to_string();
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::ConnectionResult(ConnectionResult {
+                    worker_id: worker_id.clone(),
+                    dispatch_ack: false,
+                    memory_property: String::new(),
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    let action_digest = DigestInfo::new([8u8; 32], 12);
+    let action_info = ActionInfo {
+        memory_reservation: None,
+        pre_fit_reservation: None,
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(5),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            execution_scope: None,
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::StartAction(StartExecute {
+                    request_metadata: None,
+                    execute_request: Some((&action_info).into()),
+                    operation_id: "op-single-use-cleanup".to_string(),
+                    queued_timestamp: None,
+                    platform: Some(Platform::default()),
+                    worker_id,
+                    attempt_deadline: None,
+                })),
+            })
+            .unwrap(),
+        ))
+        .await
+        .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+    let running_action = Arc::new(MockRunningAction::new());
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+    running_action.expect_prepare_action(Ok(())).await?;
+    running_action.expect_execute(Ok(())).await?;
+    running_action.upload_results(Ok(())).await?;
+    running_action
+        .get_finished_result(Ok(ActionResult::default()))
+        .await?;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        test_context.actions_manager.expect_cache_action_result(),
+    )
+    .await
+    .map_err(|_| make_input_err!("cache_action_result blocked on action.cleanup()"))?;
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        test_context.client.expect_execution_response(Ok(())),
+    )
+    .await
+    .map_err(|_| make_input_err!("execution_response blocked on action.cleanup()"))?;
+    assert_eq!(response.operation_id, "op-single-use-cleanup");
+
+    // While cleanup is still in flight, the single-use worker must NOT have
+    // sent GoingAway yet.
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        test_context.client.going_away_count.load(Ordering::Relaxed),
+        0,
+        "single-use worker must not exit before post-response cleanup finishes"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), running_action.cleanup(Ok(())))
+        .await
+        .map_err(|_| make_input_err!("post-response action.cleanup() was never invoked"))??;
+
+    let going_away = test_context.client.going_away_count.clone();
+    tokio::time::timeout(Duration::from_secs(5), test_context.finish())
+        .await
+        .map_err(|_| make_input_err!("Single-use worker did not exit after cleanup"))??;
+    assert_eq!(going_away.load(Ordering::Relaxed), 1);
     Ok(())
 }
